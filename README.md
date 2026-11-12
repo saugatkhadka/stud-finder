@@ -1,776 +1,615 @@
 # ripple
 
-Change impact analysis for Rails + React monorepos. For a set of changed
-files, ripple lists every file that depends on them, directly or through
-other files, and turns that blast radius into a risk level and a list of
-required actions using rules you write in `ripple.yml`.
+ripple is a fast, per-repository index for Rails + React codebases. Given a
+diff (or a file), it answers three questions:
 
-Dependencies come from:
+1. **What depends on the changed code?** Files that reference it through Ruby
+   constants and `require`, Rails conventions (associations, views, routes to
+   controllers), JS/TS imports, and frontend HTTP calls matched to Rails
+   routes.
+2. **How risky is each changed file?** Its size, complexity, churn (how often
+   it changed recently), test coverage (from reports you already have) and
+   its hotspot rank.
+3. **Which of your `ripple.yml` rules fire?** Each fired rule gives a reason
+   that names the files and numbers, a risk level and the actions it
+   requires (for example `human_review`).
 
-- Ruby constants and `require`
-- Rails conventions (associations, views, routes → controllers)
-- JS/TS imports
-- frontend HTTP calls matched to Rails routes
+It is meant for CI, for people reviewing a change, and for coding agents,
+through the `ripple` CLI and an agent skill (`skill/ripple/SKILL.md`).
+`ripple rank` replaces stud-finder's ranked hotspot list.
 
-ripple answers from a dependency graph that a per-repository background
-daemon keeps up to date as files change. A query usually takes tens of
-microseconds on the server.
+**What ripple is not:**
 
-```
-$ ripple impact --base main
-CRITICAL risk  1 changed, 5 impacted (depth ≤4), 1 test to run  gen 1
-  CRITICAL billing-touched Touches area billing: `app/models/billing/invoice.rb`
-  HIGH     critical-direct-dependency Reaches 1 file in billing (critical) within 1 hop
-           app/services/billing/charge_service.rb -> (ruby_constant `Billing::Invoice` line 4) app/models/billing/invoice.rb
-  MEDIUM   frontend-backend-contract Crosses the Ruby/JS boundary: 2 js files on the other side depend on the change
-           app/javascript/checkout/pay.ts -> (api_call `POST /api/charges → api/charges#create` line 2 inferred) app/controllers/api/charges_controller.rb -> ...
-require: frontend_review, human_review, payments_review
-...
-```
+- **Not a complete list of dependents.** It is static analysis. Against
+  real removals and renames it found about two thirds of the files that had
+  to change (see [Limitations and evidence](#limitations-and-evidence)). A
+  word search (`rg -w NAME`) finds more. ripple prints the search to run.
+- **Not test selection.** The `tests` section lists tests that depend on
+  the changed code. It is neither a minimal nor a sufficient set to run.
+- **Not a bug predictor.** Rules and ranks point at files worth a careful
+  look. We could not show that they do better than recent churn alone.
+- **Not a coverage tool.** It reads existing coverage reports. It never runs
+  tests.
 
-## Quickstart
+## Quick start
 
 ```sh
-cargo build --release -p ripple-cli          # binary: target/release/ripple
+cargo build --release -p ripple-cli     # binary: target/release/ripple
 cd your-rails-app
-ripple init                                  # writes a commented ripple.yml
-ripple config check                          # validates it and shows what each area matches
-ripple impact                                # working tree vs HEAD (untracked files included)
-ripple impact --base main                    # everything since merge-base(main, HEAD)
-ripple impact app/models/user.rb             # explicit files
-ripple dependents app/models/user.rb --depth 0
-ripple impact --files app/models/purchase.rb --scope refund!   # only what reaches Purchase#refund!
-ripple why app/javascript/checkout/pay.ts app/models/billing/invoice.rb
+ripple init                             # writes a commented starter ripple.yml
+ripple config check                     # validates it; shows what each area matches
+ripple impact                           # working tree vs HEAD, untracked files included
+ripple impact --base main               # everything since merge-base(main, HEAD)
+ripple dependents app/models/purchase.rb --scope refund!   # what uses Purchase#refund!
+ripple file app/models/purchase.rb      # one file's profile
+ripple rank                             # riskiest files first
 ```
 
-The first command starts the daemon for the repository. Later commands reuse
-it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
+The first command starts a background daemon for the repository (one per
+repository and config file). Later commands reuse it. CI runs without a
+daemon: see [`examples/github-workflow.yml`](examples/github-workflow.yml)
+and `ripple check`.
+
+Without a `ripple.yml`, ripple still reports dependents and metrics, but
+shows no risk section. Run `ripple init` to get one.
 
 ## Commands
 
+Every command takes the global flags `--root DIR` (`RIPPLE_ROOT`; default:
+the enclosing git work tree), `--config PATH` (`RIPPLE_CONFIG`; use this
+file instead of `<root>/ripple.yml`, served by its own daemon) and
+`--no-daemon` (index in this process; slower, no freshness wait). Paths may
+be relative to the current directory or absolute.
+
 | Command | What it does |
 |---|---|
-| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--all` (list everything), `--limit N` (cap every list but `changed`; counts stay exact), `--sync` (wait until every earlier edit is indexed, however long that takes), `--no-wait` (answer from the current index at once; may be marked stale), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
-| `check --base REF` | CI entry point. `--format github\|markdown\|json\|text` (github is the default under `GITHUB_ACTIONS`), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`, `--file-level`. Never starts a daemon, but uses one that is already running. |
-| `dependents FILE` | The `impact` report of FILE as if it had changed (same sections and budgets). `--scope NAME` (repeatable): as if only that method / action changed. `--depth N`, `--all`, `--limit N`, `--format text\|json`. |
-| `dependencies FILE` | Direct dependencies; `--depth N` (0 = all). |
-| `schema` | Print the JSON Schema of the report (`schema_version` 2). |
-| `why FROM TO` | Shortest dependency path between two files, in either direction. `--scope NAME`: only paths into that method / action of TO (says so when only a file-level path exists). |
-| `areas FILE` | How `ripple.yml` classifies a file: areas, test, global, language. |
-| `file FILE` | One file's profile in at most ~40 lines: language, areas / tier / owners, test and global flags, size and complexity, the 5 most complex methods with line ranges (and their coverage), churn, coverage and uncovered methods, dependents (count and the most depended-on few), dependencies, direct tests, co-change partners, hotspot rank and the state of every signal. `--format text\|json`. On a freshly started daemon it waits up to 5 s for git history, coverage and the ranking (`--no-wait`: answer at once); what is still not ready is named on a `not ready:` line. |
-| `rank` | Riskiest files first (see [Hotspot ranking](#hotspot-ranking)). `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`, `--format text\|json`. Each row says why it ranks where it does. Waits up to 5 s for git history and coverage to load (`--no-wait`: answer at once); with no ranking yet it says `ranking not ready: …` and exits 4. |
-| `stats` | Index size, scope ranges (`files_with_scopes`, `scopes`), per-phase timings, extractor counters, warnings, daemon info. |
-| `init [--force]`, `config check` | Starter config; validation plus how many files each area matches. |
-| `daemon status\|start\|stop`, `serve [--foreground]` | Manage the daemon. |
-| `history build`, `history status` | Build or update the git-history sidecar now (one-shot mode only reads it); show its state, size, and whether co-change is on. See [Git history in the daemon](#git-history-in-the-daemon). |
+| `impact [FILES]` | The report for a change. With no arguments: working tree vs HEAD plus untracked files. `--base REF`: since `merge-base(REF, HEAD)`, including uncommitted and untracked files. `--staged`: index vs HEAD. `--files A,B` or `FILES`: these files as wholly changed. `--scope NAME` (with one file): only that method or controller action changed. |
+| `dependents FILE` | The `impact` report of FILE as if it had changed. `--scope NAME` (repeatable) starts from those methods or actions. |
+| `file FILE` | One file's profile: language, areas, code lines, complexity, its 5 most complex methods, churn, coverage, dependents, dependencies, direct tests, co-change partners, hotspot rank, and the state of each signal. Waits up to 5 s for history, coverage and the ranking on a fresh daemon (`--no-wait`: answer at once). |
+| `rank` | Riskiest non-test Ruby and JS/TS files first, each with the reason. `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`. Waits up to 5 s for history and coverage (`--no-wait`: at once); with no ranking yet it prints `ranking not ready: …` and exits 4. |
+| `check --base REF` | CI entry point: `impact` of the branch, always with the risk section. `--format github\|markdown\|json\|text` (github under Actions), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`. Never starts a daemon. |
+| `history build` / `history status` | Build or update the git-history cache now; show its state. |
+| `schema` | Print the JSON Schema of the report (see [JSON output](#json-output)). |
+| `daemon status\|start\|stop` | Manage the daemon. `serve [--foreground]` runs it directly. |
+| `init [--force]` | Write a commented starter `ripple.yml`. `config check` validates it. |
+| `why FROM TO`, `dependencies FILE`, `areas FILE`, `stats` | Shortest dependency path between two files; what a file depends on; how `ripple.yml` classifies a file; index statistics. |
 
-Global flags: `--root DIR` (or `RIPPLE_ROOT`; default is the enclosing git
-work tree), `--config PATH` (or `RIPPLE_CONFIG`; use this file instead of
-`<root>/ripple.yml`; the file must exist, and a separate daemon, keyed by
-root and config path, serves it) and `--no-daemon` (index in this process).
+Flags shared by `impact` and `dependents`:
 
-Paths can be given relative to the current directory or as absolute paths.
-They are normalised to paths relative to the repository root.
-
-**Exit codes:**
-
-| Code | Meaning |
+| Flag | Meaning |
 |---|---|
-| 0 | Success |
-| 1 | `check` found a risk at or above the fail-on level |
-| 2 | Usage error, configuration error, bad git ref, file not in the index, or internal error |
-| 3 | `daemon status` found no daemon running |
-| 4 | `rank` has no ranking yet: git history or coverage was still loading after the wait (or at once with `--no-wait`); it prints `ranking not ready: …` (JSON: `"ready": false`, `"not_ready"`) instead of an empty list |
+| `--format text\|json` (`impact` also `markdown`) | Output format. Default text. |
+| `--depth N` | Hops to follow from a changed file (`0` = unlimited; default `query.max_depth`, 3). |
+| `--min-confidence exact\|inferred\|heuristic` | Ignore weaker edges. |
+| `--all` / `--limit N` | Do not cut the lists / cut each list at N (`changed` keeps at least its default 30). Counts are never cut. |
+| `--sync` | Wait until every file edit made before the command is indexed, however long that takes. |
+| `--no-wait` | Answer from the current index at once (the answer may be marked stale). |
+| `--file-level` (`impact`) | Treat each changed file as wholly changed (the wider answer). |
 
-### What `--base` compares
+**Exit codes:** 0 success; 1 `check` found risk at or above the fail-on
+level; 2 usage, config, git or internal error, or a file not in the index;
+3 `daemon status` found no daemon; 4 `rank` has no ranking yet.
 
-`--base REF` compares `merge-base(REF, HEAD)` with the working tree. It
-covers:
+## How to read the report
 
-- committed changes, including renames (detected with `-M`) and deletions
-- staged changes
-- unstaged changes
-- untracked files that are not ignored
-
-The default with no flags is HEAD compared with the working tree, plus
-untracked files. Every changed file is reported, including files that are not
-in the graph. Those get a warning, because their impact is unknown, not
-empty.
-
-## Configuration reference (`ripple.yml` or `.ripple.yml`)
-
-A missing file means built-in defaults. Unknown keys, invalid values and semantic
-problems are errors that name the key and the line. Semantic problems are
-collected and reported together:
+Example (`ripple dependents app/helpers/currency_helper.rb --scope string_to_price_cents`
+on Gumroad, shortened):
 
 ```
-ripple: ripple.yml: line 4, column 11: at `areas.billing.tier`: unknown variant `extreme`, expected one of `low`, `medium`, `high`, `critical`
-ripple: ripple.yml: invalid configuration:
-  - rules[0].when.touches[0] (line 3): unknown area `nope` (known areas: none defined); globs must contain `/`, `*` or `.`
-  - rules[1].id (line 6): duplicate rule id `a` (also rules[0])
+1 changed file; 4 direct dependents (+55 only inherit/include); 1 more mention the name with no edge; 1304 more at hops 2-3; 1457 tests depend on it; method-level (1410 if whole files changed); MEDIUM risk
+changed M app/helpers/currency_helper.rb  ruby  body string_to_price_cents  68 file dependents
+  cx 44 (max 5) · churn 0/90d
+dependents 4/4:
+  app/models/purchase.rb:3415  ruby_constant inherits CurrencyHelper  calls string_to_price_cents  [payments]
+  app/models/link.rb:737  ruby_constant inherits CurrencyHelper  calls string_to_price_cents
+  …
+inherits/includes, does not call it 55: app/business/payments/… +45 more (--all)
+also mentions `string_to_price_cents` (no dependency edge; receiver type unknown) 1 file, defined only here:
+  app/modules/base_price/shared.rb:14
+further 1304 files  hops 2:626 3:678  ruby:1041 js:144 template:119  areas auth:3 payments:28  notable 184
+  app/business/payments/charging/charge_processor.rb  hop 2 via …/paypal_charge_processor.rb  high_tier  [payments]
+  +1294 more (--all)
+tests that depend on it 1457: 1 direct
+  spec/helpers/currency_helper_spec.rb:41
+  +1456 more (--all)
+risk MEDIUM  rules impacted_over_200, reaches_critical_direct, crosses_boundary  owners @payments @security @web
+blind spots: methods matched by name; receivers untyped; JS/TS and send/try not checked; also run: rg -w string_to_price_cents
+not ready: coverage unavailable (no coverage report found in coverage/ …)
 ```
+
+Section by section, in the order they appear:
+
+- **Summary line.** Counts of each section below, whether the answer is
+  method-level, and the risk. "Impacted" means dependents at any depth,
+  excluding tests and the changed files.
+- **`REMOVED … still mentioned`** (`removed_methods`). Methods the diff
+  deleted or renamed that some file still mentions by name. These are the
+  most likely breakages.
+- **`INCOMPLETE`** (`incomplete`). Reasons the lists may be missing files:
+  `global_file` (a file like `Gemfile.lock` or an initializer that anything
+  may depend on), `not_in_graph`, `dynamic_dispatch` (the file uses `send`,
+  `method_missing` or `eval`), `unresolved_references`, `stale_index`.
+- **`changed`.** One line per changed file: status, language, what changed
+  (`body m` = only method `m`'s body, `added m`, `signature`, `class_body`,
+  or `whole file` with the reason), and its file-level dependent count. Under
+  each source file, one metrics line (see [Metrics](#metrics)).
+- **`dependents`.** Files one hop away, each with the line of the reference,
+  the edge kind and its confidence. For a method-level change, files that
+  call the changed method come first, with the line of the call. **Read each
+  call line and ask whether the call still fits the new behaviour.**
+- **`inherits/includes, does not call it`** (`inherit_only`). Subclasses and
+  includers that never mention the changed methods. Ruby could still
+  dispatch to them, so they stay in the impact.
+- **`also mentions NAME`** (`also_mentioned`). Files that mention the
+  changed method's name but have no dependency edge, because ripple cannot
+  tell the receiver's type (`purchase.charge.total`, views, mailers). Listed
+  only when the name is rare; otherwise only counted. For a rename, removal
+  or signature change, treat these like dependents.
+- **`relies on`** (`relies_on`). What the changed code itself uses (one hop
+  forward).
+- **`further`.** Files 2–3 hops away, as counts by depth, language and area,
+  plus up to 10 notable ones (high-tier area, crossing the Ruby/JS boundary,
+  inferred edge). Context, not a to-do list.
+- **`tests that depend on it`** (`tests`). Tests that reach the change
+  through the graph. Hop-1 tests are listed with the line that mentions the
+  method; the rest are counted. This is not coverage and not a list of tests
+  to run.
+- **`usually changes with (not in the diff)`** (`usually_changes_with`). Up
+  to 5 files outside the diff and its direct dependents that git history
+  shows changing with a changed file. Context only (see
+  [co-change](#co-change-usually-changes-with)).
+- **`risk`** (`policy`). The highest risk among the fired rules, the rule
+  ids, required actions and suggested owners. With `--format json` or
+  `check`, each rule has a message naming the files and numbers. Present when
+  `ripple.yml` defines rules or areas and a rule fired, and always in
+  `check`.
+- **`warning:`** lines. For example `global_file_changed`,
+  `changed_file_not_indexed`, `no_line_counts` (a rule needs diff line
+  counts and there is no diff), `rule_signal_not_ready`.
+- **`blind spots`.** For method-level answers: what ripple cannot see, and
+  the `rg -w` search that covers it. Run it.
+- **`not ready:`** Signals that are still building or unavailable (see
+  [signal states](#signal-states)).
+
+Each list is cut to a small budget (30 dependents, 10 tests, 10 further
+files, …) and ends with `+N more (--all)`. The counts in the summary are
+not cut.
+
+## Metrics
+
+Metrics are computed for changed source files (not tests, not deleted, not
+"other" files such as JSON or YAML). The text form is one line:
+`cx 433 (max 88) · churn 41/90d · cov 62% (changed lines 20%) · hotspot #3`.
+A part is left out when it is unknown or its signal is not ready.
+
+### Lines
+
+- **What:** code lines: lines with something other than whitespace or a
+  comment (templates: non-blank lines).
+- **Why:** size. Big files take longer to review and hide more.
+- **Read it:** as context for complexity. A 3,000-line model with complexity
+  1,200 is not unusual; a 100-line file with complexity 80 is dense.
+
+### Complexity and max method complexity
+
+- **What:** cyclomatic-style complexity. Each method scores `1 + decisions`
+  (`if`, `unless`, `case`/`when`, loops, `&&`/`||`, `&.`, `rescue`, iterator
+  blocks; for JS/TS, ESLint's "classic" rules). Ruby aims to match RuboCop's
+  `Metrics/CyclomaticComplexity`. **Complexity** (`cx`) is the file's sum
+  of method scores plus decisions outside methods. **Max method** (`max`) is
+  its most complex method.
+- **Why:** more paths through the code means more cases a change can break
+  and a test can miss.
+- **Read it:** `cx` grows with file size; `max` tells you whether there is
+  one knot. `ripple file` lists the 5 most complex methods with line ranges.
+  A rule like `max_method_complexity_over: 25` with `changed_lines_over: 10`
+  flags an edit to a file with a hard method in it.
+
+### Churn (total and last 90 days)
+
+- **What:** the number of commits that touched the file. `churn 41/90d` is
+  commits in the 90 days **before the newest commit in the history window**
+  (not before today: a repository with no commits this quarter still shows
+  its last quarter's activity). The total counts commits in the whole window
+  (the newest 20,000 commits by default, `history.max_commits`).
+- **Why:** code that changed often recently tends to change again, often to
+  fix something. In our replay, ranking by recent churn alone did about as
+  well as any weighted combination we tried at predicting which files later
+  fix commits touched.
+- **Read it:** high recent churn means the area is in motion: check for
+  concurrent work and recent fixes. Churn includes sweeps (mass renames,
+  formatting), so look at `git log` before drawing conclusions.
+
+### Coverage (percent, changed-lines coverage, stale, unknown)
+
+- **What:** from existing reports under `coverage/` (SimpleCov
+  `.resultset.json`, `lcov.info`, `lcov/*.lcov`, Istanbul
+  `coverage-final.json`; set `coverage.paths` for others). `cov 62%` is line
+  coverage of the file. `changed lines 20%` is coverage of the lines this
+  diff added or changed (needs a diff). `stale` means the report is older
+  than HEAD's commit or than `coverage.max_age_days`; line numbers may have
+  moved, so read it as approximate.
+- **Unknown is not zero.** A file in no report has no coverage value at all
+  (no `cov` part, no `coverage` field). It does not count as 0% in rules or
+  in the rank, unless a rule opts in with `uncovered_includes_unknown: true`.
+- **Why:** low coverage on changed lines means the change may ship untested.
+- **Read it:** compare `changed lines` with the file's percentage. Coverage
+  has so far been exercised only against synthetic reports; treat it as
+  unproven on your reports and check a few files by hand.
+
+### Hotspot rank, percentile, formula and weights
+
+- **What:** `ripple rank` scores every non-test Ruby and JS/TS file. Each
+  factor is turned into a percentile (the share of ranked files with a
+  strictly smaller value), so one huge value cannot dominate:
+
+  ```
+  score      = 100 * (3*churn + 1*complexity + 0.5*dependents + 1*uncovered) / (sum of the weights used)
+  churn      = percentile of (commits in the last 90 days, then total commits)
+  complexity = mean(percentile of file complexity, percentile of max method complexity)
+  dependents = percentile of direct non-test dependents
+  uncovered  = 1 - line coverage, only for files in a coverage report (else its weight is dropped;
+               churn's too when git history is unavailable)
+  hotspot    = rank <= ceil(files * rank.hotspot_percent / 100)    (top 1% by default)
+  ```
+
+  `rank --format json` prints this formula with the weights in effect.
+  `rank` is the position (1 = riskiest), `of` the number of ranked files,
+  `percentile` the share of files with a lower score. `hotspot #3` in the
+  metrics line appears only for hotspots; `ripple file` shows any file's
+  rank.
+- **Weights:** `rank.weights` in `ripple.yml` (defaults `churn: 3,
+  complexity: 1, dependents: 0.5, uncovered: 1`). Chosen by replaying ~300
+  commits each of Gumroad and Mastodon; the result is roughly on par with
+  ranking by churn alone (see [the table](#rank-vs-later-fix-commits)).
+- **Read it:** a hotspot is a file to review slowly, not a file that is
+  wrong.
+
+### Dependents counts
+
+- **What:** in `changed`, the file-level count of direct dependents (fan-in).
+  In the summary: direct dependents of the changed methods (method-level),
+  those that only inherit or include, mentions with no edge, files further
+  away, and tests. `impacted_file_level` in the JSON is what the impact
+  would be if each changed file were wholly changed.
+- **Why:** a rough blast radius.
+- **Read it:** a count of the references ripple found, not a complete count
+  (see [Limitations](#limitations-and-evidence)). In a dense Rails app, 2–3
+  hops reach a large part of the app, so read the `further` count as a rough
+  sketch, not a to-do list.
+
+### Co-change ("usually changes with")
+
+- **What:** files that changed in the same commits as a changed file, from
+  git history: `with X in 50 of its 63 commits (79%)`. Commits touching more
+  than 30 files are ignored as sweeps. Files already in the diff or directly
+  connected in the graph are left out.
+- **Why:** a usual partner missing from the diff can be a forgotten edit
+  (a locale file, a serializer, a spec).
+- **Read it:** as context. In the review trial below it never named a file
+  that a later fix touched. Co-change turns itself off when history is short
+  (under 300 commits) or mostly sweeps (over 25% of commits); see
+  [Limitations](#limitations-and-evidence).
+
+### Signal states
+
+Each signal (`complexity`, `churn`, `cochange`, `coverage`, `hotspot`) has a
+state, shown in `signals` (JSON) and on the `not ready:` line:
+
+| State | Meaning |
+|---|---|
+| `ready` | Data is loaded and current. |
+| `building` / `loading` | Being computed in the background (git history on a fresh daemon, coverage reports being read, the ranking waiting for them). Answers do not wait for it. |
+| `unavailable` | Cannot be computed; the reason says why (no coverage report, shallow clone, not a git repository, co-change off because of sweeps). |
+| `disabled` | Turned off in `ripple.yml` (`history.enabled: false`, `coverage.enabled: false`). |
+
+A rule that needs a signal that is not ready does not fire and adds one
+`rule_signal_not_ready` warning. The built-in metric rules skip quietly
+while signals load (but, like any rule using `changed_lines_over`, they add
+a `no_line_counts` warning when there is no diff, for example in
+`dependents`).
+
+## `ripple.yml`
+
+A missing file means no areas and the built-in rules (see below). Unknown
+keys and invalid values are errors that name the key and line.
+`ripple config check` validates the file and shows what each area matches.
+[`examples/ripple.yml`](examples/ripple.yml) uses every `when` key.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `version` | `1` | Must be 1. |
-| `ignore` | node_modules, vendor, tmp, log, public, coverage, dist, build | Globs that are never analysed or reported. These are in addition to `.gitignore`. |
-| `areas.<name>.paths` | — | Globs for the files in the area. |
-| `areas.<name>.tier` | required | One of `low`, `medium`, `high`, `critical`. |
-| `areas.<name>.owners` | `[]` | Suggested reviewers when a change touches or reaches the area. |
-| `areas.<name>.description` | — | Free text. |
-| `global_files` | initializers, application.rb, environments, boot.rb, Gemfile(.lock), package.json, lockfiles | Files that the whole app depends on in ways no static graph can see. A change to one is reported as "global: static impact is not reliable for this file". |
-| `tests` | `spec/**`, `test/**`, `__tests__`, `*.test.*`, `*.spec.*`, `*_spec.rb`, `*_test.rb`, `*.stories.*` | Test files. They go into "tests to run" and are never counted in the blast radius. |
-| `rules[]` | built-in defaults (below) | Each rule has `id`, `when` (required; `{}` always fires), `risk`, `require: [..]` and an optional `description`. The resulting risk is the highest risk among the rules that fired, and the `require` lists are merged. |
-| `query.max_depth` | `3` | How many hops to follow; `0` = unlimited. In a densely connected Rails app the unlimited closure of most files is most of the app. |
-| `query.min_confidence` | `heuristic` | Edges below this confidence are ignored. |
-| `ci.fail_on` | none | `check` exits 1 at or above this risk. |
-| `ci.github` | `true` | Write `$GITHUB_STEP_SUMMARY` under Actions. |
-| `ci.max_listed` | `50` | Files listed in the markdown and text output; it ends with "…and N more". |
-| `daemon.max_wait_ms` | `150` | How long a daemon query waits for pending edits to be indexed before it answers from the current index, marked stale (see [Daemon and freshness](#daemon-and-freshness)). `--sync` waits without a limit. |
-| `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
-| `history` | see right | Co-change from git history ("usually changes with this"), a separate signal that is never a graph edge and never feeds risk: `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`; bigger commits are sweeps), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). Defaults chosen by `ripple-eval` replay. |
-| `coverage` | see right | Existing test-coverage reports, read and never produced (ripple never runs tests): `enabled` (`true`), `paths` (`[]` = auto-detect `coverage/.resultset.json`, `coverage/lcov.info`, `coverage/lcov/*.lcov`, `coverage/coverage-final.json`; entries are files, directories or `*` globs in the last component), `max_age_days` (none; older reports are labelled stale, not hidden). |
-| `rank.hotspot_percent` | `1` | Files in this top share of `ripple rank` are hotspots (the `hotspot` rule condition, `metrics.hotspot.hotspot`). |
-| `rank.weights` | `churn: 3`, `complexity: 1`, `dependents: 0.5`, `uncovered: 1` | Weights of the factors of the `ripple rank` score (see [Hotspot ranking](#hotspot-ranking)); each 0 or more, `complexity` or `dependents` above 0. |
-| `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
+| `ignore` | node_modules, vendor, tmp, log, public, coverage, dist, build | Globs never analysed, in addition to `.gitignore`. |
+| `areas.<name>` | — | `paths` (globs), `tier` (`low`/`medium`/`high`/`critical`, required), `owners`, `description`. |
+| `global_files` | initializers, `application.rb`, environments, `boot.rb`, Gemfile(.lock), package.json, lockfiles | Files anything may depend on in ways a static graph cannot see. |
+| `tests` | `spec/**`, `test/**`, `__tests__`, `*.test.*`, `*.spec.*`, `*_spec.rb`, `*_test.rb`, `*.stories.*` | Test files: listed under "tests that depend on it", never counted as impacted. |
+| `rules[]` | built-in rules | `id`, `when` (`{}` always fires), `risk`, `require: [..]`, `description`. The change's risk is the highest risk among fired rules (low if none); `require` lists are merged. |
+| `query.max_depth` | `3` | Hops to follow; `0` = unlimited. |
+| `query.min_confidence` | `heuristic` | Ignore edges below this. |
+| `ci.fail_on` / `ci.github` / `ci.max_listed` | none / `true` / `50` | `check` exits 1 at or above this risk; write `$GITHUB_STEP_SUMMARY`; files listed in markdown. |
+| `daemon.max_wait_ms` | `150` | How long a query waits for pending edits (see [Freshness](#freshness)). |
+| `daemon.idle_timeout_minutes` | `30` | The daemon exits when idle this long; `0` = never. |
+| `history` | — | `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). |
+| `coverage` | — | `enabled` (`true`), `paths` (`[]` = auto-detect under `coverage/`), `max_age_days` (none). |
+| `rank.hotspot_percent` | `1` | Top share of `ripple rank` that counts as a hotspot. |
+| `rank.weights` | `churn: 3, complexity: 1, dependents: 0.5, uncovered: 1` | Rank weights (each ≥ 0; `complexity` or `dependents` above 0). |
+| `ruby`, `js`, `boundary` | — | Extractor settings (autoload roots, tsconfig, route files, HTTP callees). Changing them rebuilds the index. |
 
-**Globs** follow gitignore conventions:
+Globs follow gitignore rules: `*` stays in one directory, `**` crosses
+directories, a pattern without `/` matches at any depth, a leading `/`
+anchors to the root, a directory matches everything under it. In `touches`
+and `reaches`, a name that is an area means that area; anything with
+`/ * ? [ { .` is a glob.
 
-| Pattern | Matches |
-|---|---|
-| `*` | Stays within one directory |
-| `**` | Crosses directories |
-| A pattern without `/` | Any depth (`*.log`) |
-| A leading `/` | Anchored to the repository root (`/Gemfile`) |
-| A directory pattern | Everything under that directory (`app/models/billing`) |
-| A trailing `/` | Directories only |
+### `when` keys
 
-In `touches` and `reaches`, a name that matches an area refers to that area.
-Anything containing `/ * ? [ { .` is treated as a glob. Any other name is an
-"unknown area" error.
-
-### `when` conditions
-
-All the conditions in a rule must hold for it to fire. A rule with an empty
-`when` always fires. Every key is shown in
-[`examples/ripple.yml`](examples/ripple.yml).
+All keys in a rule must hold for it to fire.
 
 | Key | Holds when |
 |---|---|
-| `touches: [area\|glob]` | A changed file is in a listed area or matches a listed glob. For renames, the old path counts too. |
+| `touches: [area\|glob]` | A changed file is in a listed area or matches a glob (old path of a rename too). |
 | `touches_tier: T` | A changed file is in an area of tier T or higher. |
-| `reaches: [area\|glob]` | An impacted file (depth ≥ 1, not a test, not itself changed) is in a listed area or matches a listed glob. |
-| `reaches_tier: T` | The same, for an area of tier T or higher. When both `reaches` and `reaches_tier` are given, they are OR-ed. |
-| `within: N` | Limits `reaches` and `reaches_tier` to N hops. The default is `query.max_depth`. |
-| `impacted_files_over: N` | There are more than N impacted non-test files. Changed files are not counted. |
-| `changed_files_over: N` | There are more than N changed files, not counting ignored ones. |
-| `changed_lines_over: N` | There are more than N added plus deleted lines. Never fires without a diff (for example with `impact FILES`). Next to a per-file condition (below) or `untested: true`, it counts the lines of that same file: `{complexity_over: 300, changed_lines_over: 20}` skips a one-line edit to a huge file. |
-| `crosses_boundary: true\|false` | An impacted file is on the other side of the Ruby/JS boundary from the changed file it traces back to. Ruby files and templates are the server side; JS/TS files are the client side. |
+| `reaches: [area\|glob]` | An impacted file (not a test, not changed) is in a listed area or glob. |
+| `reaches_tier: T` | The same, for an area of tier T or higher. OR-ed with `reaches`. |
+| `within: N` | Limits `reaches`/`reaches_tier` to N hops. |
+| `min_confidence: C` | For this rule, ignore edges below C. |
+| `impacted_files_over: N` | More than N impacted non-test files. |
+| `changed_files_over: N` | More than N changed files. |
+| `changed_lines_over: N` | More than N added + deleted lines (needs a diff). Next to a per-file key: lines of that same file. |
+| `crosses_boundary: true\|false` | An impacted file is on the other side of the Ruby/JS boundary. |
 | `touches_global: true\|false` | A changed file matches `global_files`. |
-| `untested: true\|false` | A changed, non-deleted source file has no test among its transitive dependents. With `true` next to a per-file condition or `changed_lines_over`, it must be that same file (`{untested: true, changed_lines_over: 50}`: a source file with no tests got more than 50 changed lines). |
-| `min_confidence: C` | For this rule, ignores edges below C in `reaches*`, `impacted_files_over`, `crosses_boundary` and `untested`. |
-| `churn_over: N` | A changed source file (not a test, not deleted) changed in more than N commits in the last 90 days of the history window. |
-| `complexity_over: N` | A changed source file's complexity (sum of its methods' plus decisions outside methods) is above N. |
-| `max_method_complexity_over: N` | A changed source file has a method of complexity above N. |
-| `coverage_under: P` | A changed source file's line coverage is below P% (0–100). A file in no coverage report is unknown and never counts. |
-| `changed_lines_coverage_under: P` | The coverable lines the diff added or changed in a file are covered below P%. Needs a diff (a `no_line_counts` warning otherwise). |
-| `uncovered: true\|false` | A changed source file has known 0% coverage. With `uncovered_includes_unknown: true`, a file in no report counts too. |
-| `hotspot: true\|false` | A changed source file is in the top `rank.hotspot_percent` of `ripple rank`. |
-| `missing_cochange: true\|false` | A file outside the diff changed together with a changed file in at least `cochange_min_confidence` (0–1, default `0.5`) of that file's commits (from git history; graph neighbours count too). |
+| `untested: true\|false` | A changed source file has no test among its dependents. |
+| `missing_cochange: true\|false` | A file that changed with a changed file in at least `cochange_min_confidence` (default `0.5`) of its commits is not in the diff. |
+| `churn_over: N` | A changed source file had more than N commits in the last 90 days of history. |
+| `complexity_over: N` | A changed source file's complexity is above N. |
+| `max_method_complexity_over: N` | A changed source file has a method above N. |
+| `coverage_under: P` | A changed source file's line coverage is below P% (unknown never counts). |
+| `changed_lines_coverage_under: P` | Coverage of the lines the diff touched in a file is below P% (needs a diff). |
+| `uncovered: true\|false` | A changed source file has known 0% coverage (`uncovered_includes_unknown: true` counts files in no report). |
+| `hotspot: true\|false` | A changed source file is a hotspot. |
 
-**Per-file conditions.** `churn_over`, `complexity_over`,
-`max_method_complexity_over`, `coverage_under`, `changed_lines_coverage_under`,
-`uncovered: true` and `hotspot: true` (and, next to any of them,
-`untested: true` and `changed_lines_over`) must all hold on **the same**
-changed file: a churny file plus a different complex file does not satisfy
-`{churn_over: 20, complexity_over: 300}`. The reason names the files that
-satisfy all of them, for example
-`complexity above 300 and more than 20 changed lines in the same file: \`app/models/purchase.rb\` (complexity 433, 57 lines changed)`.
-`uncovered: false` and `hotspot: false` hold when no changed file is
-uncovered / a hotspot.
+**Per-file keys** (`churn_over`, `complexity_over`,
+`max_method_complexity_over`, `coverage_under`,
+`changed_lines_coverage_under`, `uncovered: true`, `hotspot: true`, and next
+to them `untested: true` and `changed_lines_over`) must all hold on **the
+same** changed file. Pairing a metric with `changed_lines_over` keeps a
+one-line edit to a big file from firing. The reason names the file:
+`complexity above 150 and more than 20 changed lines in the same file:
+app/models/purchase.rb (complexity 1186, 57 lines changed)`.
 
-The last eight read **signals** besides the graph: complexity (from the
-index), churn and co-change (git history), coverage (existing reports) and
-the hotspot rank. A rule that needs a signal that is not ready (history
-still building, no coverage report, signal disabled) does not fire and adds
-one `rule_signal_not_ready` warning naming the signal and why. Each fired
-rule's reason names the files and numbers, for example
-`changed in more than 20 commits in the last 90 days: \`app/models/purchase.rb\` (41 commits)`.
+### Starter rules
 
-**Built-in default rules**, used only when `rules` is absent or empty:
+These are the calibrated rules. `ripple init` writes them along with example
+areas, area rules and a `changed_files_over` rule for you to adapt. With no
+`rules:` key, the same thresholds apply as built-in `default.*` rules.
 
-| Rule | Condition | Risk | Requires |
-|---|---|---|---|
-| `default.touches_critical` | Touches an area of tier critical | critical | `human_review` |
-| `default.touches_high` | Touches an area of tier high or above | high | `human_review` |
-| `default.complex_file` | One changed file: complexity over 150 and over 20 changed lines | high | `human_review` |
-| `default.hotspot_churning` | One changed file: hotspot and churn over 10 | high | `human_review` |
-| `default.hotspot_change` | One changed file: hotspot and over 10 changed lines | high | `human_review` |
-| `default.impacted_over_1500` | More than 1500 impacted files | high | `run_full_suite` |
-| `default.impacted_over_200` | More than 200 impacted files | medium | — |
-| `default.reaches_critical_direct` | Reaches a critical area within 1 hop | medium | — |
-| `default.complex_method` | One changed file: a method over 25 and over 10 changed lines | medium | — |
-| `default.untested_change` | One changed file: no test reaches it and over 50 changed lines | medium | `add_tests` |
-| `default.reaches_critical` | Reaches a critical area at any depth | low | — |
-| `default.touches_global` | Touches a global file | low | `run_full_suite` |
-| `default.missing_cochange` | A usual co-change partner (confidence 0.7+) is missing | low | `check_cochange_partners` |
-| `default.crosses_boundary` | Crosses the Ruby/JS boundary | low | — |
-
-The built-in metric rules skip quietly (no warning) until history and
-metrics are ready. The thresholds come from replaying about 300 recent
-commits each of two Rails apps (Gumroad, Mastodon) with these thresholds
-(and medium-risk area rules): they put 21% of Gumroad's and 5% of Mastodon's commits
-at high or above, and those commits were followed by a fix to the same
-files about three times as often as the rest (63% vs 22%, 40% vs 7%).
-Global files and boundary crossings fire on a large share of ordinary
-commits (5–70%), so on their own they only add their required action.
-No single generic set put both apps in a 10–15% band; tune
-`complexity_over` and `impacted_files_over` to your codebase.
-
-If no rule fires, the risk is low.
-
-### Method-level analysis
-
-Extractors report, per file, the line ranges of its methods and controller
-actions (`Facts.scopes`), so a diff maps onto the methods it changed. The
-graph itself stays file-level. Two mechanisms narrow a change confined to
-named methods; both are conservative, so method-level results are always a
-subset of file-level ones:
-
-- **Controller actions.** Route, view, API-call and view-mount edges carry
-  `from_scope` (the action a reference sits in) and `to_scope` (the action an
-  edge targets). An edit inside `PostsController#show` reaches the views,
-  routes and JS callers of `show`, not those of `index`.
-- **Ruby mention filter (hop 1 only).** Ruby files also report which method
-  names each of their methods mentions (calls with or without a receiver,
-  symbols, `delegate`, templates included). For a seed changed only in
-  methods `M`, `M` first grows inside the file and its superclasses/mixins:
-  any method that mentions a name in `M` joins it. A direct dependent reached
-  through a Ruby constant, require, inferred-association or view edge is kept
-  only if it mentions a name in `M`. Matching is by name (Ruby has no static
-  types), so `record.total` keeps every file that calls any `total`.
-  Everything beyond the first hop is file-level, and dependents through
-  inheritance (subclasses, includers) are always kept and followed in full.
-  The seed is treated as wholly changed when a method in `M` is mentioned in
-  the class body (callbacks, validations, `delegate`), is invoked implicitly
-  (hooks such as `perform`/`call`/`to_s`/Pundit predicates, setters,
-  operators), is mentioned nowhere in the workspace (called by convention),
-  or when the file dispatches on `self` with a computed name (`send(x)`,
-  `method_missing`). A dependent that dispatches with a computed name on
-  another receiver (`record.public_send(x)`, any dynamic call in a template)
-  always passes. `ruby.method_level: false` turns the filter (and the
-  per-method scopes) off.
-- The diff is read with `git diff -U0`; only new-side hunks matter. A hunk
-  with new lines `[a, b]` belongs to method `m` iff `m.start < a` and
-  `b <= m.end` (the `def` line itself is not "inside": renaming or changing a
-  signature breaks callers by name). A pure deletion after new line `p`
-  belongs to `m` iff `m.start <= p` and `p + 1 <= m.end`. Nested methods: all
-  containing ranges are seeds.
-- The whole file is the seed when: the file was added, deleted or renamed; it
-  is binary or has no textual diff; it has no scope ranges; any hunk falls
-  outside every method (class body, between methods); a hunk contains a
-  method's `def` line; or the removed side of a hunk contains a `def` line (a
-  method was deleted or merged). `--files` without `--scope` is whole-file,
-  and so is `--staged` for files that also have unstaged edits (the line
-  numbers would not match the indexed working tree).
-- Hunks are computed by the client and mapped onto scopes by whoever holds the
-  index (the daemon or the in-process engine), so line numbers always match
-  what was indexed.
-- Every query uses the narrowed seeds: reach, `touches` of other files,
-  `untested` (a file counts as tested if a test reaches one of its changed
-  methods), `crosses_boundary`. The per-file `dependents` count stays the
-  file-level fan-in.
-- `--file-level` turns all of this off (seeds, edge scopes and the mention
-  filter). The report
-  always carries `counts.impacted_file_level`, and the markdown headline reads
-  e.g. "**212** impacted files (method-level; 1,362 if whole files are assumed
-  changed)". The footer states which mode was used.
-
-## Output (`schema_version: 2`)
-
-`impact`, `dependents` and `check --format json` all emit one report model.
-`ripple schema` prints its JSON Schema (draft 2020-12). The report is
-deterministic, apart from `timing`. Every list is cut to a small budget
-(see below) and its exact size is in `counts`. `--all` lists everything, and
-`--limit N` caps every list at N, except `changed`, which keeps at least
-its default budget (a larger N raises it).
-
-### JSON shape
-
-Abridged, from `dependents app/helpers/currency_helper.rb --scope string_to_price_cents` on Gumroad:
-
-```jsonc
-{
-  "schema_version": 2,
-  "summary": "1 changed file; 4 direct dependents (+55 only inherit/include); 1 more mention the name with no edge; 1197 more at hops 2-3; 1457 tests reach it; method-level (1300 if whole files changed); HIGH risk",
-  "counts": { "changed": 1, "dependents": 59, "inherit_only": 55, "also_mentioned": 1, "relies_on": 0,
-              "further": 1197, "further_notable": 182, "impacted": 1256, "impacted_file_level": 1300,
-              "tests": 1457, "tests_direct": 1, "removed_methods": 0 },
-  "truncated": true,                          // some list is shorter than its count (use --all)
-  "changed": [{ "path": "app/helpers/currency_helper.rb", "status": "modified",
-                "scopes": ["string_to_price_cents"],             // absent = the whole file
-                "change": { "kind": "body", "methods": ["string_to_price_cents"] },
-                "language": "ruby", "areas": [], "dependents": 62, "in_graph": true, "is_test": false, "is_global": false }],
-  "removed_methods": [{ "file": "…", "method": "formatted_disputed_amount", "mentions_total": 11, "other_definitions": 0,
-                        "mentions": [{ "file": "app/mailers/admin_mailer.rb", "line": 16, "how": "by_name" }] }],
-  "dependents": [{ "file": "app/models/purchase.rb", "line": 7, "kind": "ruby_constant", "detail": "CurrencyHelper",
-                   "confidence": "exact", "of": "app/helpers/currency_helper.rb", "inherit": true,
-                   "uses_methods": ["string_to_price_cents"], "mention_line": 3415,   // the call, not the constant
-                   "calls_on_constant": [96, 103],   // `Const.name(` call lines, when any (e.g. Link.fetch)
-                   "from_scope": "…", "to_scope": "…", "crosses_boundary": true,   // when known / true
-                   "language": "ruby", "areas": ["payments"] }],
-  "inherit_only": ["app/models/charge.rb"],   // heirs / includers that never mention the changed methods
-  "also_mentioned": [{ "name": "string_to_price_cents", "of": "…", "definitions": 1, "total": 1,
-                       "singleton": true,     // only when the changed method is `def self.x`
-                       "files": [{ "file": "app/modules/base_price/shared.rb", "line": 14, "how": "by_name" }] }],
-  "relies_on": [{ "file": "…", "of": "…", "line": 3, "kind": "ruby_constant", "detail": "…", "confidence": "exact" }],
-  "further": { "by_depth": { "2": 626, "3": 571 }, "by_language": { "ruby": 1041, "js": 142, "template": 14 },
-               "by_area": { "payments": 28 }, "by_tier": { "critical": 30 },
-               "files": [{ "file": "…", "depth": 2, "via": "…", "of": "…", "kind": "ruby_constant", "confidence": "exact",
-                           "language": "ruby", "areas": ["payments"], "notable": ["high_tier"] }] },
-  "tests": [{ "file": "spec/helpers/currency_helper_spec.rb", "depth": 1, "of": "…", "kind": "ruby_constant",
-              "line": 5, "detail": "CurrencyHelper", "mention_line": 41 }],
-  "incomplete": [{ "reason": "dynamic_dispatch", "file": "app/models/link.rb", "message": "…" }],
-  "blind_spots": ["methods matched by name; receivers untyped", "JS/TS and send/try not checked", "also run: rg -w string_to_price_cents"],
-  "policy": { "risk": "high", "reasons": [{ "rule": "…", "risk": "high", "message": "…", "require": [], "builtin": true, "evidence": { … } }],
-              "require": [], "owners": ["@payments"], "areas": [{ "area": "payments", "tier": "critical", "files": 38, "min_depth": 1, … }] },
-  "warnings": [{ "code": "global_file_changed", "message": "…", "file": "config/initializers/money.rb" }],
-  "query": { "max_depth": 3, "min_confidence": "heuristic", "file_level": false, "all": false },
-  "index": { "generation": 1, "nodes": 10150, "edges": 17783, "pending_changes": 0 },
-  "timing": { "refresh_us": 0, "query_us": 203, "evaluate_us": 1236 }
-}
+```yaml
+rules:
+  - id: complex-file
+    when: { complexity_over: 150, changed_lines_over: 20 }
+    risk: high
+    require: [human_review]
+  - id: hot-and-churning
+    when: { hotspot: true, churn_over: 10 }
+    risk: high
+    require: [human_review]
+  - id: hotspot-change
+    when: { hotspot: true, changed_lines_over: 10 }
+    risk: high
+    require: [human_review]
+  - id: huge-blast-radius
+    when: { impacted_files_over: 1500 }
+    risk: high
+    require: [run_full_suite]
+  - id: wide-blast-radius
+    when: { impacted_files_over: 200 }
+    risk: medium
+  - id: complex-method
+    when: { max_method_complexity_over: 25, changed_lines_over: 10 }
+    risk: medium
+  - id: untested-change
+    when: { untested: true, changed_lines_over: 50 }
+    risk: medium
+    require: [add_tests]
+  # Fire on a large share of ordinary commits, so they add an action, not risk.
+  - id: global-config
+    when: { touches_global: true }
+    risk: low
+    require: [run_full_suite]
+  - id: frontend-backend
+    when: { crosses_boundary: true }
+    risk: low
+  - id: forgot-a-partner
+    when: { missing_cochange: true, cochange_min_confidence: 0.7 }
+    risk: low
+    require: [check_cochange_partners]
 ```
 
-What each section means:
+The built-ins also include `touches_tier: critical` → critical,
+`touches_tier: high` → high, and reaching a critical area within 1 hop →
+medium (at any depth → low).
 
-- **`changed[].change.kind`**: `body` (only method bodies changed),
-  `method_added`, `signature` (a `def` line changed), `method_removed`,
-  `class_body` (code outside every method), or `whole_file` with a reason
-  (`added`, `deleted`, `renamed`, `no_diff`, `unsupported_language`).
-- **`removed_methods`**: methods that were deleted or renamed and are still
-  mentioned. The lookup covers the same file, the direct dependents, and every
-  file in the workspace that mentions the name. Files found only by name are
-  listed when the name is rare: fewer than 3 other files define it.
-  `other_definitions` says how common the name is. This appears in daemon and
-  one-shot mode alike.
-- **`dependents`**: hop 1 only, with one evidence line each. Order: files that
-  call the changed method on the constant itself (`Link.fetch`), then files
-  that mention the method, then files across the Ruby/JS boundary, then the
-  rest. A `config/routes.rb` dependent shows the route line of the changed
-  action. When there is no single action, `detail` reads `routes (N actions)`.
-- **`inherit_only`**: subclasses and includers that never mention the changed
-  methods. They stay in the impact (Ruby could dispatch to them), but are
-  kept apart from callers.
-- **`also_mentioned`**: files that mention the changed method's name but have
-  no dependency edge, because the receiver's type is unknown
-  (`purchase.charge.formatted_disputed_amount`, templates, mailers). This
-  only applies to method-scoped changes. Files already listed are excluded.
-  The files are listed only when the name is rare (`definitions` ≤ 2,
-  counting the changed file) and the method is not a singleton. Otherwise only
-  the count is given.
-- **`relies_on`**: what the changed code itself uses (hop 1 forward). For a
-  method-scoped change, only the edges inside those methods.
-- **`further`**: hops 2–3 as counts by depth, language, area and tier, plus
-  up to 10 notable files (high tier, crossing the boundary, inferred).
-- **`tests`**: tests at hop 1 are listed, with the line that mentions the
-  method. Tests further away are only counted (`counts.tests`).
-- **`incomplete`**: why the answer may be missing files. Reasons:
-  `global_file`, `not_in_graph`, `dynamic_dispatch`,
-  `unresolved_references`, `stale_index`.
-- **`blind_spots`**: present for method-scoped answers. It ends with the
-  `rg -w` command that covers what static analysis cannot.
-- **`policy`**: present only when `ripple.yml` defines rules or areas and a
-  rule fired, or always for `check`. Rule semantics and CI exit codes are as
-  described under Configuration.
-- **`changed[].metrics`** (source files: not tests, not deleted, not "other"; each part absent when
-  unknown or its signal is not ready):
-  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, of, percentile, hotspot}}`.
-  `coverage` is absent for a file in no report (unknown, not 0%); `hotspot`
-  is present only for a hotspot (`ripple file` shows any file's rank);
-  `changed_lines_percent` needs a diff; `stale` (only when true) means the
-  report predates HEAD or `coverage.max_age_days`.
-- **`signals`**: `{complexity, churn, cochange, coverage, hotspot}`, each
-  `{state: ready|building|loading|disabled|unavailable, reason?}`.
-- **`usually_changes_with`**: at most 5 files outside the diff and its direct
-  dependents that git history shows changing with a changed file:
-  `{path, together, of, why}` (`why` names the changed file). Absent when there are none or co-change
-  is not ready. (The daemon's envelope `history` keeps the raw data.)
+**How these were calibrated, and why you must tune them.** We replayed
+about 300 recent commits each of Gumroad and Mastodon (offline, from stored
+`impact` reports, with ripple's rule semantics and each repo's own areas). These rules put HIGH or above on ~21% of Gumroad's commits and ~5% of
+Mastodon's. Flagged commits were followed within 30 days by a fix commit
+touching the same files more often than the rest: 63% vs 22% (Gumroad) and
+40% vs 7% (Mastodon). No single set put both repositories in the same band,
+so tune for yours: replay your own recent commits and adjust
+`complexity_over`, `impacted_files_over` and `churn_over` until the share
+of HIGH+ commits is one your reviewers can act on.
 
-Changing `ripple.yml` itself does not count as a change to analyse. It gives
-one `ripple_config_changed` warning.
-
-### Budgets
-
-| List | Default size |
-|---|---|
-| `changed` | 30 |
-| `dependents` | 30 |
-| `inherit_only` | 10 |
-| `also_mentioned[].files`, `removed_methods[].mentions` | 15 |
-| `removed_methods` | 10 |
-| `relies_on` | 10 |
-| `further.files` | 10 |
-| `tests` | 10 |
-| `warnings` / `incomplete` per code | 5 |
-| `policy.reasons[].evidence.impacted` | 1 |
-
-The text format ends each cut list with `+N more (--all)`.
-
-### Text
-
-```
-1 changed file; 0 direct dependents (+2 only inherit/include); 11 more mention the name with no edge; 801 more at hops 2-3; 629 tests reach it; method-level (821 if whole files changed); HIGH risk
-changed M app/models/concerns/charge/disputable.rb  ruby  body formatted_disputed_amount  3 file dependents
-inherits/includes, does not call it 2: app/models/charge.rb app/models/purchase.rb
-also mentions `formatted_disputed_amount` (no dependency edge; receiver type unknown) 11 files, defined only here:
-  app/mailers/admin_mailer.rb:16
-  app/views/admin_mailer/chargeback_notify.html.erb:1
-  …
-further 801 files  hops 2:197 3:604  ruby:774 js:18 template:9  areas auth:4 payments:34 payouts:6  notable 63
-  app/models/user.rb  hop 2 via app/models/purchase.rb  high_tier  [auth]
-  +791 more (--all)
-tests (static reach) 629: 1 direct
-  spec/models/concerns/charge/disputable_spec.rb:216
-  +628 more (--all)
-risk HIGH  rules impacted_over_200, reaches_critical_direct, crosses_boundary  owners @payments @security
-blind spots: methods matched by name; receivers untyped; JS/TS and send/try not checked; also run: rg -w formatted_disputed_amount
+```sh
+git worktree add ../replay HEAD && cd ../replay && mkdir -p /tmp/replay
+for c in $(git rev-list --no-merges -n 300 HEAD | tail -r); do   # Linux: tac
+  git checkout -q --detach "$c"
+  until ripple history status | jq -e --arg c "$c" '.head == $c and .state == "ready"' >/dev/null; do sleep 0.2; done
+  ripple rank --limit 1 >/dev/null                                 # refresh the hotspot ranking
+  ripple impact --base "$c^" --sync --format json > "/tmp/replay/$c.json"
+done
+jq -r '.policy.risk // "low"' /tmp/replay/*.json | sort | uniq -c
+jq -r '.policy.reasons[]?.rule' /tmp/replay/*.json | sort | uniq -c | sort -rn   # which rules fire
 ```
 
-Each changed source file is followed by one metrics line, for example
-`cx 433 (max 88) · churn 41/90d · cov 62% (changed lines 20%) · hotspot #3` (the rank
-only for a hotspot).
+## Freshness
 
-The order is: summary, removed methods, incomplete, changed (with metrics),
-dependents, inherit-only, also-mentions, relies-on, further, tests,
-"usually changes with" (at most 5 lines), the one-line policy, warnings,
-blind spots, and one `not ready:` line naming signals that are building,
-loading or unavailable. The markdown format (for `check`) carries the same
-sections.
+The daemon watches the work tree and re-indexes changed files in the
+background. Before it answers, it makes sure it has seen every file event
+that happened before the request, then waits for pending edits to be
+indexed for **at most 150 ms** (`daemon.max_wait_ms`). If indexing is not
+done by then, it answers from the current index and **says so**: the answer
+carries `"stale": true` and the pending paths, and the report gets an
+`INCOMPLETE stale_index` line ("re-run with --sync to wait"). A changed file
+that is still pending is treated as wholly changed.
 
-Warning codes include:
-
-- `global_file_changed`
-- `changed_file_not_indexed`
-- `deleted_file_not_indexed`
-- `changed_file_ignored`
-- `no_line_counts`
-- `scope_unknown` (`--scope` names a method missing from the file's scope ranges)
-- `deleted_file_still_imported` (cold index only: JS/TS files whose imports of
-  a deleted file no longer resolve)
-- `ripple_config_changed`
-- `rule_signal_not_ready` (a rule needs churn, complexity, coverage, co-change or the hotspot rank and it is not ready)
-- `config_invalid`
-- extractor warnings about the changed files themselves
-
-## Daemon and freshness
-
-- **One daemon per repository.** It is started on demand by any command
-  except `check`. Autostart is off when `RIPPLE_NO_DAEMON=1`, `CI` or
-  `GITHUB_ACTIONS` is set; `--no-daemon` indexes in-process.
-  - The socket, lock file and log live in `$RIPPLE_SOCKET_DIR`, else
-    `$XDG_RUNTIME_DIR/ripple`, else `/tmp/ripple-$UID`. The directory has mode
-    0700 and must be owned by you. The files are named
-    `<fnv1a64(canonical root [+ NUL + --config path])>.sock|.lock|.log`. Socket paths are limited to
-    100 bytes; if the path would be longer, ripple says so and runs
-    in-process.
-  - An exclusive `flock` on the `.lock` file makes the daemon a singleton.
-    Because a running daemon always holds the lock, a socket left behind by a
-    killed daemon (`kill -9`) is recognised as stale, and the next daemon
-    removes it. SIGTERM, SIGINT and SIGHUP remove the socket before the
-    daemon exits.
-- **Indexing.**
-  - Files come from `git ls-files -c -o --exclude-standard` minus deleted
-    files; outside git, ripple walks the tree with the `ignore` crate.
-  - The extractors run in parallel, then the linkers, then the graph is
-    built. Each result is published as an immutable snapshot that readers
-    pick up atomically.
-  - File events from `notify` (FSEvents or inotify) are debounced: a batch is
-    indexed after 30 ms with no new events, or at most 300 ms after its first
-    event. Each batch goes through the extractors' incremental `update`.
-  - When `ripple.yml` changes, the policy is reloaded. If an extractor
-    setting changed, everything is rebuilt.
-- **Freshness contract.** Every answer reflects every file edit that
-  completed before the request was sent, or says which ones it does not.
-  Before the daemon answers a query, it:
-  1. writes a cookie file in `.git/` and waits for the watcher to report it,
-     so every earlier file event has been delivered (skipped with
-     `--no-wait`);
-  2. re-stats the files named in the request, using mtime against the time
-     each file was last examined;
-  3. moves the pending batch to the front of the debounce queue and waits for
-     it to be indexed, for at most `daemon.max_wait_ms` (default 150 ms). If
-     the pass that would include the edits is predicted, from the last
-     pass's duration, to end after that, it does not wait at all.
-
-  If the index has not caught up, the daemon answers from the current
-  snapshot and marks the response `"stale": true`, with `"pending"` (up to 50
-  paths, sorted) and `"pending_count"`. In a stale `impact` answer, a changed
-  file that is itself pending is treated as wholly changed: its diff hunks
-  are not mapped onto method ranges indexed from older contents. `--sync`
-  (`"sync": true`) waits without a time limit and is never stale.
-  `--no-wait` (`"no_wait": true`) never waits. `stats` never waits.
-
-  Edits are coalesced: each pass indexes every path delivered so far, so
-  many editors cost one pass per indexer cycle, not one per edit. A query
-  that names a file always sees that file's current contents once its answer
-  is not stale; this is tested with a 200-iteration edit-then-query loop
-  that has no sleeps.
-- **Watcher latency on macOS.** The kernel hands file events to `fseventsd`
-  at once only when about 16 or more are queued, otherwise after a 10 ms
-  timer, so a lone cookie took about 11 ms to come back. The daemon follows
-  each cookie with 24 `fchmod`s of it, which brings a round trip to about
-  0.4 ms (p50). Kicked this way, an edit's event occasionally arrives just
-  after a later cookie's, so the daemon does two round trips per sync. `ripple daemon stats` reports cookie round-trip percentiles
-  and how many answers were fresh, waited or stale.
-- **Diffs are computed in the daemon.** For `impact --base`, `--staged` and
-  the default work-tree diff, the client sends the diff spec (`"diff"`) and
-  the daemon answers it from a cache. It always writes a cookie first (even
-  with `--no-wait`), so every file event before the request is seen. Then it re-runs
-  git only for the paths that changed since the last answer: the watcher
-  reports work-tree paths, and the daemon reads `.git/index` itself to find
-  staged changes. Commits, checkouts, resets, stash and ref updates are
-  detected from `HEAD`, the refs and `packed-refs`, and the merge base is
-  cached per ref value. Changes to `.gitignore`, `.gitattributes`, git
-  config, `info/exclude`, or more than 1,000 paths at once, trigger a full
-  recompute. So does a watcher overflow. The result is the same as the
-  client-side `git diff`, which one-shot mode (`--no-daemon`, CI) still uses.
-  The daemon runs git with `GIT_OPTIONAL_LOCKS=0`, so it never rewrites the
-  index.
-- **Connections.** Each connection has its own thread (at most 128 at
-  once; more clients wait in the listen queue). A connection that sends
-  nothing for 10 minutes is closed.
-- **Deletions and renames.** While the daemon is running, a deleted file
-  keeps the edges from its former dependents (their `detail` is prefixed
-  `deleted:`). Its impact therefore still lists the files whose references
-  are now broken. A cold index (CI, `--no-daemon`) cannot know these edges.
-  It reports the deleted file with a `deleted_file_not_indexed` warning
-  instead of silently reporting no impact. A rename is a deletion plus an
-  addition. Both paths are seeds, and `touches` matches either one.
-- **Case-insensitive file systems** (macOS): a wrongly-cased name never
-  becomes a second workspace file.
-
-### Git history in the daemon
-
-Churn ("how often, and how recently, did this file change") and co-change
-("usually changes with") come from `git log`, which takes from a fraction of
-a second to over ten seconds on a large repository. The daemon therefore
-loads them on a background thread. It runs at low priority (macOS QoS
-utility, `nice 10` on Linux, and `nice 10` for the `git` it starts) and
-never blocks a query. Until it is done, impact
-replies say `"state": "building"` and carry no history data.
-
-- **States.** `disabled` (`history.enabled: false`: no thread, no file),
-  `building`, `ready`, `unavailable` (not a git repository, no commits,
-  shallow clone, or git failed; the reason is given). Churn and co-change
-  are flagged separately (`churn_available`, `cochange` +
-  `cochange_reason`).
-- **Sidecar.** `<git common dir>/ripple/history.bin` for the main work
-  tree and `history-<name>.bin` next to it for a linked worktree (`<name>`
-  as in `.git/worktrees/<name>`), written atomically (temporary file +
-  rename). Each work tree writes only its own file, so worktrees at
-  diverged HEADs do not overwrite each other's cache. A daemon starts from
-  its own file at once, or, if that is missing or unusable, from any
-  sibling's file whose head is an ancestor of its HEAD. If the file is
-  behind HEAD, it is updated incrementally (only the new commits are read);
-  with no usable file, it is rebuilt. An unreadable or corrupt file is
-  rebuilt. Files of removed worktrees are deleted on the next save.
-- **Updates.** HEAD moves are taken from the existing watcher (`HEAD`,
-  `refs/heads/*` and `packed-refs`) and from the diff cache's HEAD check.
-  They are debounced (500 ms), and deferred while a rebase, cherry-pick or
-  revert is in progress (up to 60 s). The answer in use stays until the new
-  one is ready (`updating: true` meanwhile). A newer HEAD move cancels an
-  update that is still running.
-- **Auto-off.** Co-change is switched off when the history is too short
-  (fewer than 300 commits below the sweep cap) or mostly sweeps (more than
-  25% of commits touch over `max_files_per_commit` files). In the `ripple-eval`
-  replay, a sweep-heavy history (GitLab, 41% sweeps) added about twice as
-  many wrong partners per right one as Mastodon (3% sweeps). Churn stays on.
-- **One-shot mode** (`--no-daemon`, CI) only reads the sidecar, even when it
-  is behind HEAD (`behind_head: true`), and never runs `git log`. Run
-  `ripple history build` to create or update it.
-
-Impact replies carry the result next to `result` (an additive field; old
-clients ignore it):
-
-```
-"history": {"state": "ready", "head": "…", "commits": 20000, "churn_available": true, "cochange": true,
-  "recent_days": 90,
-  "churn": {"app/models/user.rb": {"commits": 412, "recent_commits": 9, "last_changed": 1794400000}},
-  "usually_changes_with": [{"path": "spec/models/user_spec.rb", "via": "app/models/user.rb",
-    "together": 120, "of": 412, "score": 0.29, "lift": 6.1, "last_together": 1794400000, "seeds": 1}],
-  "lookup_us": 3}
-```
-
-`churn` lists every changed file. `usually_changes_with` leaves out the diff
-itself and the files directly connected to it in the graph, which the report
-already shows. `stats` has a `history` object with the state, build timings,
-sidecar size, memory and counters.
-
-### Coverage in the daemon
-
-Coverage reports are read, never produced. The daemon loads them on a
-low-priority background thread at start, then reloads only when
-`sources_changed` says a report file appeared, disappeared or changed. That
-check is a few `stat` calls, made on a watcher event under a report path or
-at most every 5 seconds on a query; a query never parses a report. The new
-coverage is swapped in as an `Arc`. States: `disabled` (`coverage.enabled:
-false`), `loading`, `ready`, `unavailable` (no report found: picked up as soon as
-one appears; a report that failed to parse is retried after 60 s). One-shot mode loads existing reports
-inline (Gumroad's 900 KB SimpleCov file: about 20 ms) and never runs tests.
-`stats` has a `coverage` object (state, reports, files, unmapped, load time,
-memory).
-
-### Hotspot ranking
-
-`ripple rank` scores non-test Ruby and JS/TS files of the index. The formula
-lives in one place, `rank_formula` in `crates/ripple-cli/src/signals.rs`, and
-`rank --format json` prints it with the weights in effect:
-
-```
-score = 100 * (3*churn + 1*complexity + 0.5*dependents + 1*uncovered) / (sum of the weights used)
-churn      = percentile of (commits in the last 90 days, then all commits in the window)
-complexity = mean(percentile of file complexity, percentile of the most complex method);
-             a file without methods counts 0 for both (the max-method guard)
-dependents = percentile of direct non-test dependents (fan-in)
-uncovered  = 1 - line coverage, only for files in a coverage report (else the weight is dropped;
-             churn's too when git history is unavailable)
-percentile(x) = share of ranked files with a strictly smaller value
-hotspot    = rank <= ceil(files * rank.hotspot_percent / 100)
-```
-
-Percentiles rather than raw products keep one huge value from dominating.
-The default weights (`rank.weights` in `ripple.yml`) come from a replay of 301
-commits each of Mastodon and Gumroad, scored by which files later fix commits
-touched: churn predicted best and dependents worst. With 3/1/0.5 the score
-finds as many fix-touched files as churn alone in the top 5% (Gumroad 37% vs
-34%, Mastodon 26% vs 26%) and more in the top 20% (69% vs 64%, 58% vs 53%);
-the previous 2/2/1 trailed churn alone at the top.
-The ranking is computed lazily, once per (index generation, history head,
-coverage load), and cached. `impact` never computes it: it uses the cached
-ranking and starts one background recompute when the cache is out of date
-(at most every 2 s), so `metrics.hotspot` may be missing for a moment after
-an edit. `ripple rank` waits for an up-to-date ranking; `ripple file` uses
-the cached one and computes it only when there is none. The hotspot percentile
-appears in `ripple file`, in `changed[].metrics.hotspot` and in the `hotspot`
-rule condition.
-
-### Protocol
-
-The protocol is newline-delimited JSON over the Unix socket. Each request
-gets one response line, in order, per connection:
-
-```
-→ {"id": 1, "method": "impact", "params": {"files": ["app/models/user.rb"], "format": "json", "limit": 50}}
-← {"id": 1, "ok": true, "generation": 7, "server_us": 41, "stale": false, "synced": true, "pending_count": 0, "result": { …report… }}
-← {"id": 2, "ok": false, "generation": 7, "server_us": 12, "error": {"code": "not_in_graph", "message": "…"}}
-```
-
-Methods:
-
-| Method | Params |
-|---|---|
-| `impact` | `files`, `changed` (entries may carry `hunks`: `[{start, count, removes_definition?}]`), `diff` (`{"base": "REF"}`, `{"staged": true}` or `{}` for the work tree; not combined with `files`/`changed`), `scopes`, `file_level`, `max_depth`, `min_confidence`, `format`, `color`, `limit`, `max_listed`, `sync`, `no_wait`, `max_wait_ms` |
-| `dependents`, `dependencies` | `file`, `scopes` (dependents only), `depth`, `min_confidence`, `sync`, `no_wait`, `max_wait_ms` |
-| `why` | `from`, `to`, `scopes`, `sync`, `no_wait`, `max_wait_ms` |
-| `areas` | `file`, `sync`, `no_wait`, `max_wait_ms` |
-| `file` | `file`, `sync`, `no_wait`, `max_wait_ms` (the result is JSON; the client renders text) |
-| `rank` | `limit`, `path` (globs), `area`, `by` (`score`\|`churn`\|`complexity`\|`coverage`), `sync`, `no_wait`, `max_wait_ms` |
-| `stats` | — |
-| `reload` | — |
-| `shutdown` | — |
-
-Every response carries `"protocol": 2`. A response without it comes from an
-older daemon, which ignores `diff`: the client then computes the diff itself
-and asks again with `changed`, and prints a hint to restart the daemon.
-
-The full description is in the module docs of
-`crates/ripple-cli/src/protocol.rs`.
+- `--sync` waits without a time limit and is never stale.
+- `--no-wait` never waits.
+- `file` and `rank` additionally wait up to 5 s for git history, coverage
+  and the ranking on a fresh daemon; `impact` never waits for them (it
+  reports them on the `not ready:` line instead).
+- Git history (churn, co-change) loads on a low-priority background thread
+  and is cached in `<git dir>/ripple/history.bin` (one file per worktree).
+  CI (`--no-daemon`) only reads that cache; run `ripple history build` to
+  create it.
+- The daemon's socket, lock and log live in `$RIPPLE_SOCKET_DIR`, else
+  `$XDG_RUNTIME_DIR/ripple`, else `/tmp/ripple-$UID`. Autostart is off when
+  `RIPPLE_NO_DAEMON=1`, `CI` or `GITHUB_ACTIONS` is set.
 
 ## Performance
 
-These numbers were measured on an Apple Silicon Mac with a release build, on
-the gitlabhq checkout: 61,037 files after ignores, plus 400,000 synthetic
-edges. The edges form a skewed acyclic graph (`ripple bench gen-edges`), of
-which 397,567 remain after deduplication. Only the edge-file extractor ran
-(`RIPPLE_EXTRACTORS=edge_file`), so these numbers measure ripple itself, not
-the language extractors.
+Measured on an Apple-silicon laptop that was under other load at the time,
+release build, daemon mode.
 
-| Measurement | Result |
-|---|---|
-| File listing (`git ls-files`, 10 runs) | p50 354 ms (the untracked-file scan is about 250 ms of it) |
-| Cold build: list + read edges + graph + classify | 815 ms (list 349, edge file 99, graph 347, classify 4.4) |
-| Incremental pass for 1 changed file | 423 ms (graph rebuild 308, edge-file reread 91) |
-| Daemon RSS after build | 219 MB |
-| `server_us`, small seeds (fan-in 1–3, median 6 impacted), 1000 queries | p50 24 µs, p99 91 µs |
-| `server_us`, hub seeds (about 41,700 impacted), 1000 queries, full JSON (17.6 MB) | p50 22.3 ms, p99 31.6 ms |
-| `server_us`, hub seeds, `limit: 50` | p50 2.7 ms, p99 4.1 ms |
-| End to end: `ripple impact --files X --format json`, small seed, 200 runs | p50 2.7 ms, p99 11.9 ms |
-| End to end: hub seed with `--limit 50`, 200 runs | p50 5.8 ms, p99 18.9 ms |
-| End to end: hub seed, full 17.6 MB JSON, 50 runs | p50 53 ms |
-| Autostart plus first answer (cold) | 0.77–1.07 s |
+| | Mastodon | Gumroad | GitLab |
+|---|---:|---:|---:|
+| Files in git (`git ls-files`) | 9,730 | 10,190 | 65,492 |
+| First call, including building the index | 240 ms | 740 ms | 2.6 s |
+| Warm `impact`, whole process, p50 / p95 | 4.6 / 5.3 ms | 4.1 / 4.8 ms | 25.6 / 27.1 ms ¹ |
+| Save a method-body edit → fresh answer, p50 | 33 ms | 41 ms | 136 ms |
+| Save an edit that adds or changes a constant reference or class structure → fresh answer | ~35 ms | ~71 ms | ~430 ms ² |
+| Daemon memory (footprint) | 86 MB | 138 MB | 713 MB |
 
-Text and markdown output build only the `max_listed` entries they show, so
-they are as cheap as `--limit`. The incremental pass cost is dominated by
-`Graph::build`, which rebuilds the whole graph on every pass.
+¹ A 30-file diff; about 20 ms of it is rule evaluation.
+² Bounded by the Rubydex resolver, which re-resolves constants for such edits.
 
-To reproduce, set `RIPPLE_SOCKET_DIR` to a short directory first:
+## JSON output
 
-```sh
-ripple --root $REPO bench list-files --runs 10
-ripple --root $REPO bench gen-edges --out /tmp/edges.txt --edges 400000
-export RIPPLE_EXTRACTORS=edge_file RIPPLE_EDGE_FILE=/tmp/edges.txt
-ripple --root $REPO bench build
-ripple --root $REPO daemon start
-ripple --root $REPO bench server --edges /tmp/edges.txt --queries 1000 [--limit 50]
-ripple --root $REPO bench e2e --file <path> --runs 200 [--limit 50]
-ripple --root $REPO bench query --file <path> [--limit 50]   # in-process: BFS / evaluate / render
-```
+`impact`, `dependents` and `check --format json` emit one report model.
+`ripple schema` prints its JSON Schema (draft 2020-12); the same file is
+published as [`docs/report.schema.json`](docs/report.schema.json) (a test
+keeps the two identical). Optional fields are omitted, never `null`. The
+report is deterministic apart from `timing`.
 
-### Extractors on real repositories
+**`schema_version` policy.** The report carries `"schema_version": 2`. The
+version goes up when a field is removed or renamed, or its type or meaning
+changes. New optional fields can appear without a bump. The published
+schema is strict (`additionalProperties: false`) and describes exactly the
+release it ships with: validate against the schema from the same release,
+and have consumers ignore fields they do not know.
 
-> **Placeholder.** These are to be filled in by the extractor owners. No
-> numbers below have been measured yet.
+`file --format json` and `rank --format json` are not covered by the
+schema and are not versioned yet; `rank` JSON has `ready` (false with
+`not_ready` when there is no ranking) and the `formula`.
 
-| Repo | Files | Edges | ruby (ms) | js (ms) | boundary (ms) | Cold build (ms) | Incremental, 1 file (ms) | RSS (MB) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| mastodon | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| gumroad | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| gitlabhq | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+## Limitations and evidence
 
-`ripple --no-daemon stats` prints all of these as `last pass:` timings and
-per-extractor counters.
+We measured what ripple gets right on real history. `crates/ripple-eval`
+reproduces the dependents numbers (`ripple-eval breaks`); the rank and rule
+numbers come from replay scripts kept outside this repository.
 
-## Limits
+**Dependents are not complete.** Oracle: commits that removed or renamed a
+Ruby method or constant, where other files of the same commit had to change
+(GitLab 344 cases, Gumroad 114, Mastodon 81).
 
-- Static analysis only. Metaprogramming, `send`, string-built constants,
-  dynamic imports and runtime configuration are invisible. `global_files`
-  covers the worst cases.
-- A cold index cannot list the dependents of a deleted file. Only a running
-  daemon keeps them, as tombstones. For JS/TS the cold report does list the
-  files whose imports of it no longer resolve (`deleted_file_still_imported`);
-  Ruby constant references to a deleted file are not recoverable cold.
-- Method-level narrowing is only as good as the scope data: files without
-  scope ranges count as whole-file. The Ruby mention filter matches by name
-  and applies to direct dependents only; a dependent that only `require`s the
-  file and reaches its methods by a convention (Thor subcommands, for
-  example) is dropped.
-- Each incremental pass rebuilds the whole graph. On a 400k-edge graph that
-  costs about 0.3 s. Queries that do not name a pending file are not blocked
-  during the pass.
-- A daemon from an older ripple binary keeps running until it is stopped or
-  its idle timeout passes.
-- Git submodules are not indexed. Symlinks are taken as git lists them.
-- Unix only (Unix sockets, `flock`).
+| Answer | Found at 1 hop | Within 3 hops |
+|---|---:|---:|
+| ripple, method-level | 64–67% | 75–81% |
+| ripple, whole file | 64–67% | 75–83% |
+| `rg -w NAME` | 100% | — |
+
+ripple misses templates and JS/TS that use a Ruby name (receiver type
+unknown), dynamic calls, and some unresolved constants. A word search finds
+everything that mentions the name, with much more noise. ripple's
+method-level answer prints the search to run (`also run: rg -w …`); run it.
+
+**No measured benefit for agents.** Two trials compared agents with and
+without ripple:
+
+- Six edit tasks on Gumroad (renames, a signature change, an endpoint
+  removal, a JSON key, nil handling): the two conditions produced identical
+  diffs on 5 of 6 tasks.
+- Review of 12 real commits that were later followed by a fix (6 Mastodon,
+  6 Gumroad), plus 3 controls: 5 hits with ripple, 5 without. In 7 of the
+  12, the file the later fix touched was not in ripple's output at all;
+  mostly code that follows the same pattern with no dependency edge to the
+  change.
+
+So we do not claim that ripple improves agent edits or reviews. An empty or
+short report says nothing about sibling code following the same pattern.
+
+**Co-change is context.** In the review trial, `usually changes with` never
+named a file that a later fix touched.
+
+<a id="rank-vs-later-fix-commits"></a>**Rank vs later fix commits.** Share
+of the files touched by later fix commits that were in the top 5/10/20% of
+the ranking, and how many of the top 50 they were (P@50):
+
+| | Top 5% | Top 10% | Top 20% | P@50 |
+|---|---:|---:|---:|---:|
+| Gumroad, shipped weights | .370 | .522 | .691 | .70 |
+| Gumroad, churn alone | .339 | .496 | .635 | .66 |
+| Mastodon, shipped weights | .255 | .396 | .583 | .56 |
+| Mastodon, churn alone | .260 | .383 | .532 | .64 |
+| Random (either) | ~.05 | ~.10 | ~.20 | ~.08 |
+
+Both are far better than random. The shipped score is roughly on par with
+ranking by recent churn alone, not better.
+
+**Starter rules need tuning.** HIGH+ on ~21% of Gumroad and ~5% of
+Mastodon commits; the follow-up-fix rate of flagged commits was 63% vs 22%
+and 40% vs 7% (see [Starter rules](#starter-rules)). Those are two
+repositories; your thresholds will differ.
+
+**Other limits.**
+
+- Coverage has only been exercised against synthetic reports.
+- On a history dominated by bot or sync commits (GitLab-style), churn and
+  co-change say little; co-change turns itself off there, churn stays on.
+- No test selection: `tests` lists tests that depend on the change. It is
+  not a minimal or a sufficient set to run.
+- Static analysis only: `send`, `method_missing`, string-built constants,
+  dynamic imports, hash keys, JSON keys and runtime configuration are
+  invisible. `global_files` and the `INCOMPLETE` lines mark the worst cases.
+- Method-level narrowing applies to Ruby methods and controller actions;
+  JS/TS changes are whole-file.
+- A cold index (CI) cannot list the dependents of a deleted Ruby file; a
+  running daemon keeps them.
+- Git submodules are not indexed. Unix only (Unix sockets, `flock`).
+
+## How ripple differs from stud-finder
+
+stud-finder is a Ruby gem that scores every file of a repository in one
+batch run (fan-in, fan-out, complexity, churn over a window, coverage,
+temporal coupling) and prints a ranked table, Ruby and JS/TS separately.
+
+| | stud-finder | ripple |
+|---|---|---|
+| Ranked list | Yes | `ripple rank`: one list across Ruby and JS/TS, with a reason per row |
+| Weights | Fixed weights over fan-in, fan-out, complexity, churn, coupling (and coverage when given) | Churn-heavy (3/1/0.5/1), from the replay above |
+| Churn | Commits in a time window | Commits in the last 90 days of history, then total |
+| Fan-out, temporal coupling in the score | Yes | No (co-change is reported per change instead) |
+| Diff impact, dependents, rules | No | Yes |
+| Running | One batch run over the repository | Daemon; milliseconds per query, kept fresh while you edit |
+
+On Gumroad, the two tools' top 30 Ruby files share 13 files. We have not
+measured whether either list predicts fixes better than the other.
 
 ## Environment
 
 | Variable | Effect |
 |---|---|
-| `RIPPLE_ROOT` | Repository root, the same as `--root`. |
-| `RIPPLE_CONFIG` | Config file, the same as `--config`. |
-| `RIPPLE_NO_DAEMON=1` | Disables daemon autostart. `CI` and `GITHUB_ACTIONS` do the same. |
-| `RIPPLE_SOCKET_DIR` | Directory for the socket, lock and log files. |
+| `RIPPLE_ROOT`, `RIPPLE_CONFIG` | Same as `--root`, `--config`. |
+| `RIPPLE_NO_DAEMON=1` | No daemon autostart (also when `CI` or `GITHUB_ACTIONS` is set). |
+| `RIPPLE_SOCKET_DIR` | Directory for the daemon's socket, lock and log. |
 | `NO_COLOR` | Plain text output. |
-| `RIPPLE_EDGE_FILE` | Extra edges from a file: `FROM TO [KIND [CONF [LINE [DETAIL]]]]` per line; either endpoint may be `path#method` (`#@body` = class body); `@inherit FROM TO ...` adds an inheritance edge; `@scope FILE NAME START END` declares a method's line range. `#` after whitespace starts a comment. For tests, benchmarks and custom integrations. |
-| `RIPPLE_EXTRACTORS` | Comma list of the extractors and linkers to run, by name. For debugging and benchmarks. |
-| `RIPPLE_DEBUG` | Logs watcher events and indexing batches to the daemon log. |
+| `RIPPLE_EDGE_FILE`, `RIPPLE_EXTRACTORS`, `RIPPLE_DEBUG` | Extra edges from a file, extractor selection, daemon debug log (for tests and debugging). |
