@@ -36,6 +36,7 @@
 
 use crate::git::{self, DiffSpec, EMPTY_TREE};
 use ripple_core::RelPath;
+use ripple_core::store::StrTable;
 use ripple_policy::{ChangedFile, FileStatus};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::os::unix::fs::MetadataExt;
@@ -202,10 +203,13 @@ fn is_hex_oid(s: &str) -> bool {
 // The index, as far as change detection needs it
 
 /// Path -> fingerprint of its index entries (stage, mode, object id, and the
-/// assume-unchanged / skip-worktree / intent-to-add flags).
+/// assume-unchanged / skip-worktree / intent-to-add flags), as two sorted
+/// columns (a large repository's index has ~100k entries; a map of
+/// `String`s costs twice as much).
 #[derive(Default)]
 struct IndexMap {
-    entries: HashMap<RelPath, u64>,
+    paths: StrTable,
+    fps: Vec<u64>,
     /// Submodule paths: changes inside them are reported by the watcher as
     /// `sub/file` but show up in a diff as `sub`.
     gitlinks: Vec<RelPath>,
@@ -231,7 +235,8 @@ fn parse_index(data: &[u8], oid_len: usize, prefix: &str) -> Option<IndexMap> {
         return None;
     }
     let count = be32(8)? as usize;
-    let mut map = IndexMap { entries: HashMap::with_capacity(count), gitlinks: Vec::new() };
+    let mut gitlinks = Vec::new();
+    let mut cols = Columns::default();
     let mut pos = 12;
     let mut prev: Vec<u8> = Vec::new();
     for _ in 0..count {
@@ -287,10 +292,9 @@ fn parse_index(data: &[u8], oid_len: usize, prefix: &str) -> Option<IndexMap> {
         fnv(&mut h, &(flags & 0xb000).to_be_bytes()); // assume-valid, stage
         fnv(&mut h, &(ext & 0x6000).to_be_bytes()); // skip-worktree, intent-to-add
         if mode & 0o170000 == 0o160000 {
-            map.gitlinks.push(path.clone());
+            gitlinks.push(path.clone());
         }
-        // Several stages of one path combine into one fingerprint.
-        map.entries.entry(path).and_modify(|f| *f = f.wrapping_mul(31).wrapping_add(h)).or_insert(h);
+        cols.push(&path, h);
     }
     // Extensions, up to the trailing checksum.
     let end = data.len().checked_sub(oid_len)?;
@@ -301,13 +305,86 @@ fn parse_index(data: &[u8], oid_len: usize, prefix: &str) -> Option<IndexMap> {
         }
         pos += 8 + be32(pos + 4)? as usize;
     }
-    Some(map)
+    let (paths, fps) = cols.finish();
+    Some(IndexMap { paths, fps, gitlinks })
 }
 
-/// Paths whose entries differ between two index maps.
+/// Builds the columns of an [`IndexMap`] from entries in index order.
+#[derive(Default)]
+struct Columns {
+    bytes: Vec<u8>,
+    ends: Vec<u32>,
+    fps: Vec<u64>,
+    /// Entries so far were in strictly increasing path order.
+    unsorted: bool,
+}
+
+impl Columns {
+    fn last(&self) -> Option<&[u8]> {
+        let n = self.ends.len();
+        (n > 0).then(|| &self.bytes[if n == 1 { 0 } else { self.ends[n - 2] as usize }..self.ends[n - 1] as usize])
+    }
+
+    fn push(&mut self, path: &str, h: u64) {
+        match self.last().map(|l| l.cmp(path.as_bytes())) {
+            // Several stages of one path combine into one fingerprint.
+            Some(std::cmp::Ordering::Equal) => {
+                let f = self.fps.last_mut().expect("an entry");
+                *f = f.wrapping_mul(31).wrapping_add(h);
+                return;
+            }
+            Some(std::cmp::Ordering::Greater) => self.unsorted = true,
+            _ => {}
+        }
+        self.bytes.extend_from_slice(path.as_bytes());
+        self.ends.push(self.bytes.len() as u32);
+        self.fps.push(h);
+    }
+
+    fn finish(self) -> (StrTable, Vec<u64>) {
+        let table = StrTable::new_checked(self.ends.into(), self.bytes.into()).expect("built from strings");
+        if !self.unsorted {
+            return (table, self.fps);
+        }
+        // Not in path order (git always writes it sorted): sort and combine.
+        let mut v: Vec<(&str, u64)> = table.iter().zip(self.fps.iter().copied()).collect();
+        v.sort_by(|a, b| a.0.cmp(b.0));
+        let mut again = Columns::default();
+        for (p, h) in v {
+            again.push(p, h);
+        }
+        again.finish()
+    }
+}
+
+/// Paths whose entries differ between two index maps (a merge of the sorted columns).
 fn index_delta(old: &IndexMap, new: &IndexMap) -> BTreeSet<RelPath> {
-    let mut out: BTreeSet<RelPath> = old.entries.iter().filter(|(p, f)| new.entries.get(*p) != Some(f)).map(|(p, _)| p.clone()).collect();
-    out.extend(new.entries.keys().filter(|p| !old.entries.contains_key(*p)).cloned());
+    let mut out = BTreeSet::new();
+    let (mut i, mut j) = (0, 0);
+    while i < old.fps.len() || j < new.fps.len() {
+        let ord = match (i < old.fps.len(), j < new.fps.len()) {
+            (true, true) => old.paths.get(i).cmp(new.paths.get(j)),
+            (true, false) => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Greater,
+        };
+        match ord {
+            std::cmp::Ordering::Less => {
+                out.insert(old.paths.get(i).to_string());
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.insert(new.paths.get(j).to_string());
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if old.fps[i] != new.fps[j] {
+                    out.insert(old.paths.get(i).to_string());
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
     out
 }
 
@@ -406,6 +483,8 @@ pub struct GitTracker {
     head_hook: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// FNV of the last HEAD seen (0: none yet).
     last_head: AtomicU64,
+    /// Specs asked for recently, newest last (a daemon resuming from sleep prewarms them).
+    recent: Mutex<Vec<DiffSpec>>,
 }
 
 /// Resolves the git binary once: `git --exec-path`/git skips wrappers such
@@ -454,6 +533,19 @@ impl GitTracker {
             inner: Mutex::new(Inner::default()),
             head_hook: OnceLock::new(),
             last_head: AtomicU64::new(0),
+            recent: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The specs asked for recently, newest last.
+    pub fn recent_specs(&self) -> Vec<DiffSpec> {
+        lock(&self.recent).clone()
+    }
+
+    /// Computes the results for `specs` now so later requests find them cached.
+    pub fn prewarm_specs(&self, specs: &[DiffSpec]) {
+        for s in specs {
+            let _ = self.changed(s);
         }
     }
 
@@ -671,6 +763,13 @@ impl GitTracker {
 
     /// The changed files for `spec`; identical to [`git::changed_files`].
     pub fn changed(&self, spec: &DiffSpec) -> Result<Vec<ChangedFile>, String> {
+        {
+            let mut r = lock(&self.recent);
+            r.retain(|s| s != spec);
+            r.push(spec.clone());
+            let n = r.len().saturating_sub(MAX_DIFFS / 2);
+            r.drain(..n);
+        }
         let t = Instant::now();
         let mut inner = lock(&self.inner);
         let r = self.changed_locked(&mut inner, spec);

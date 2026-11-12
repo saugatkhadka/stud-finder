@@ -33,7 +33,7 @@
 //! time, at most every [`RANK_MIN_INTERVAL`]). `rank` computes in the
 //! foreground when the cache is out of date; `file` only when there is none.
 
-use crate::engine::Snapshot;
+use crate::engine::{FileSet, Snapshot};
 use crate::historyd::{HistoryInfo, State as HistState, View};
 use ripple_core::config::{CoverageConfig, RankWeights};
 use ripple_coverage::Coverage;
@@ -109,12 +109,12 @@ impl CovView {
 
     /// Reads the reports `cfg` points at (no thread; one-shot mode and the
     /// daemon's loader). Cheap when there are none.
-    pub fn load(root: &Path, cfg: &CoverageConfig, known: &HashSet<String>, load_id: u64) -> Self {
+    pub fn load(root: &Path, cfg: &CoverageConfig, known: &FileSet, load_id: u64) -> Self {
         if !cfg.enabled {
             return Self::disabled();
         }
         let t = Instant::now();
-        let mut v = match Coverage::load(root, cfg, known.iter().map(String::as_str)) {
+        let mut v = match Coverage::load(root, cfg, known.iter()) {
             Ok(c) if c.reports().is_empty() => {
                 let where_ = if cfg.paths.is_empty() { "coverage/, tmp/coverage/, {spec,test,frontend,client,web}/coverage/, app/{javascript,frontend}/coverage/ (.resultset.json, lcov.info, lcov/*.lcov, coverage-final.json)".to_string() } else { format!("coverage.paths ({})", cfg.paths.join(", ")) };
                 Self { coverage: Some(Arc::new(c)), ..Self::new(CovState::Unavailable(format!("no coverage report found in {where_}"))) }
@@ -177,7 +177,7 @@ fn head_commit_time(root: &Path) -> Option<i64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-type FilesFn = Box<dyn Fn() -> Option<Arc<HashSet<String>>> + Send + Sync>;
+type FilesFn = Box<dyn Fn() -> Option<FileSet> + Send + Sync>;
 
 struct CovCtl {
     cfg: CoverageConfig,

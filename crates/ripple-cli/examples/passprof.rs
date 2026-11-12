@@ -62,7 +62,7 @@ fn main() {
     let t = Instant::now();
     let (mut eng, snap) = Engine::open(&root, Pipeline::standard()).unwrap();
     println!("cold open: {} ms ({} nodes, {} edges)", t.elapsed().as_millis(), snap.graph.node_count(), snap.graph.edge_count());
-    let mut rb: Vec<String> = snap.files.iter().filter(|f| f.ends_with(".rb") && (f.starts_with("app/") || f.starts_with("lib/")) && !f.contains("routes")).cloned().collect();
+    let mut rb: Vec<String> = snap.files.iter().filter(|f| f.ends_with(".rb") && (f.starts_with("app/") || f.starts_with("lib/")) && !f.contains("routes")).map(String::from).collect();
     rb.sort();
     drop(snap);
 

@@ -363,8 +363,8 @@ fn incremental_matches_cold_build() {
         let warm: BTreeSet<_> = edges_of(&snap).into_iter().collect();
         let cold_e = edges_of(&cold);
         assert!(cold_e.is_subset(&warm), "after {name}: cold {cold_e:?} warm {warm:?}");
-        let mut wf: Vec<_> = snap.files.iter().cloned().collect();
-        let mut cf: Vec<_> = cold.files.iter().cloned().collect();
+        let mut wf: Vec<_> = snap.files.iter().map(String::from).collect();
+        let mut cf: Vec<_> = cold.files.iter().map(String::from).collect();
         wf.sort();
         cf.sort();
         assert_eq!(wf, cf, "after {name}");

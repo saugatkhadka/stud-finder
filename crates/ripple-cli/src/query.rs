@@ -64,7 +64,7 @@ pub fn changed_list(snap: &Snapshot, p: &ImpactParams) -> Vec<ChangedFile> {
         .map(|mut c| {
             c.path = clean(&c.path);
             if c.scopes.is_none() {
-                c.scopes = scopes_for_hunks(c.status, c.hunks.as_deref(), snap.scopes_of(&c.path));
+                c.scopes = scopes_for_hunks(c.status, c.hunks.as_deref(), snap.scopes_of(&c.path).as_deref());
             }
             c
         })
@@ -104,7 +104,7 @@ fn change_of(snap: &Snapshot, c: &ChangedFile) -> ripple_policy::Change {
         .then(|| std::fs::read_to_string(snap.root.join(&c.path)).ok())
         .flatten()
         .map(|t| def_names(&t));
-    classify_change(c, snap.scopes_of(&c.path), new_defs.as_deref())
+    classify_change(c, snap.scopes_of(&c.path).as_deref(), new_defs.as_deref())
 }
 
 /// Requested scope names a file's scope table does not know (only checked
@@ -580,7 +580,7 @@ pub fn stats(snap: &Snapshot) -> Value {
         "listing": snap.listing,
         "tombstones": snap.tombstones,
         "files_with_scopes": snap.scopes.len(),
-        "scopes": snap.scopes.values().map(Vec::len).sum::<usize>(),
+        "scopes": snap.scopes.total(),
         "built_at_unix_ms": built,
         "timings_us": snap.timings,
         "extractors": snap.stats,

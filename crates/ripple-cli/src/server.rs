@@ -16,6 +16,23 @@
 //! replace the `Arc`, and the pending-change bookkeeping is a separate mutex
 //! held only for bookkeeping. See [`crate::protocol`] for the freshness contract.
 //!
+//! **Sleep.** After `daemon.sleep_after_seconds` without requests or file
+//! events (and with nothing pending), the indexer writes the current
+//! snapshot to disk ([`crate::snapfile`]) and continues from a memory-mapped
+//! copy of it, dropping the engine (extractor state, edge lists, the heap
+//! graph). Memory freed inside a process mostly stays with the allocator,
+//! so the binary instead re-executes itself (`execve`, same pid), handing
+//! the listening socket and the lock file to the new image, which maps the
+//! snapshot and serves from it. Clients queued meanwhile wait in the listen
+//! backlog. The new image's watcher starts after the old one stopped; the
+//! gap is covered by a stat sweep ([`Snapshot::sweep`]) of every workspace
+//! file and directory against the sleep time (minus [`SLEEP_MARGIN`]).
+//! While asleep, changed paths are resolved against the mapped snapshot:
+//! if none is relevant (ignored or unindexed files) nothing happens;
+//! otherwise the daemon wakes: a full index (as at start), during which
+//! queries get the usual freshness treatment (stale answers after
+//! `max_wait_ms`).
+//!
 //! Edits are coalesced: the indexer takes every path delivered so far as
 //! one batch, so N editors x M edits cost one pass per indexer cycle, not
 //! N x M passes. A waiting request only skips the debounce.
@@ -33,7 +50,8 @@
 //! arrive just after a later cookie's, so it does [`COOKIE_ROUNDS`] round
 //! trips (see there).
 
-use crate::engine::{Engine, Pipeline, Snapshot};
+use crate::engine::{Engine, Pipeline, Snapshot, resolve_paths};
+use crate::git::DiffSpec;
 use crate::gitd::GitTracker;
 use crate::historyd::{self, HistoryD};
 use crate::paths::DaemonPaths;
@@ -48,9 +66,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Quiet period after the last watcher event before an unprompted re-index.
 pub const DEBOUNCE: Duration = Duration::from_millis(30);
@@ -83,6 +102,11 @@ static DAEMON_SEQ: AtomicU64 = AtomicU64::new(0);
 pub const MAX_CONNECTIONS: usize = 128;
 /// A connection with no request for this long is closed (frees its slot).
 const CONN_IDLE: Duration = Duration::from_secs(600);
+/// The post-sleep sweep re-checks files written this long before the
+/// snapshot was saved (events still in flight then, coarse mtimes).
+pub const SLEEP_MARGIN: Duration = Duration::from_secs(2);
+/// Environment variable carrying [`Resume`] into the re-executed image.
+const RESUME_ENV: &str = "RIPPLE_DAEMON_RESUME";
 
 #[derive(Default)]
 struct State {
@@ -103,6 +127,8 @@ struct State {
     /// Cookies requests are waiting for -> reported by the watcher yet.
     cookies: HashMap<String, bool>,
     shutdown: bool,
+    /// The idle timer asks the indexer to go to sleep.
+    sleep_requested: bool,
     fatal: Option<String>,
     /// When the running pass started.
     pass_started: Option<Instant>,
@@ -154,13 +180,132 @@ pub struct Shared {
     coverage: Arc<CoverageD>,
     /// The cached hotspot ranking.
     rank: Arc<RankD>,
-    /// Milliseconds after `started` of the last request.
+    /// Milliseconds after `started` of the last request (the idle timeout).
     last_request_ms: AtomicU64,
+    /// The same, not counting `stats` (the sleep timer: monitoring a daemon
+    /// does not keep its index in memory).
+    last_use_ms: AtomicU64,
     in_flight: AtomicUsize,
     /// Open connections, bounded by [`MAX_CONNECTIONS`].
     conns: Mutex<usize>,
     conns_cv: Condvar,
     idle_timeout: Option<Duration>,
+    sleep: SleepCtl,
+}
+
+/// Sleep bookkeeping (see the module docs).
+struct SleepCtl {
+    /// Overrides `daemon.sleep_after_seconds` (tests). `Some(ZERO)` = never.
+    after: Option<Duration>,
+    /// Sleep by re-executing the binary (else in this process).
+    reexec: bool,
+    path: PathBuf,
+    asleep: AtomicBool,
+    /// Listening socket and lock file descriptors handed to the next image.
+    listener_fd: std::sync::atomic::AtomicI32,
+    lock_fd: RawFd,
+    /// Times slept / woken over the daemon's life (across re-executions).
+    sleeps: AtomicU64,
+    wakes: AtomicU64,
+    /// `(last_request_ms, delivered)` when a sleep last failed: not retried
+    /// until something happens.
+    failed_at: Mutex<Option<(u64, u64)>>,
+    /// `(requests, delivered)` when free memory was last handed back while asleep.
+    released: Mutex<Option<(u64, u64)>>,
+    /// Size of the snapshot file, sweep findings and duration of the last sleep / resume.
+    last: Mutex<Value>,
+}
+
+/// What a daemon that re-executes itself to sleep passes to the new image.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Resume {
+    listener: RawFd,
+    lock: RawFd,
+    since_ns: u64,
+    idle_ms: u64,
+    specs: Vec<String>,
+    sleeps: u64,
+    wakes: u64,
+}
+
+impl Resume {
+    /// Reads and clears the variable (children must not see it).
+    fn take() -> Option<Self> {
+        let v = std::env::var(RESUME_ENV).ok()?;
+        // SAFETY: called at daemon start, before this process starts threads of its own.
+        unsafe { std::env::remove_var(RESUME_ENV) };
+        serde_json::from_str(&v).map_err(|e| eprintln!("ripple: ignoring bad {RESUME_ENV}: {e}")).ok()
+    }
+}
+
+/// macOS: re-executes this process with `MallocSpaceEfficient=1` unless it
+/// is set. The default allocator configuration keeps per-CPU magazines and
+/// freed large blocks; with it the daemon's footprint on a large repository
+/// is ~40% lower (GitLab: ~690 -> ~400 MB awake) at the same indexing speed,
+/// and a sleeper stays small after loading. It must be in the environment
+/// when the process starts, hence the re-execution (binary only).
+fn space_efficient_malloc() {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+        const VAR: &str = "MallocSpaceEfficient";
+        if std::env::var_os(VAR).is_some() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let e = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env(VAR, "1").exec();
+        eprintln!("ripple: could not re-execute with {VAR}=1: {e}");
+    }
+}
+
+/// Returns free allocator pages to the system (best effort).
+fn release_free_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone means all zones; goal 0 means as much as possible.
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: no preconditions.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+fn encode_spec(s: &DiffSpec) -> String {
+    match s {
+        DiffSpec::WorkingTree => "w".into(),
+        DiffSpec::Staged => "s".into(),
+        DiffSpec::Base(r) => format!("b:{r}"),
+    }
+}
+
+fn decode_spec(s: &str) -> Option<DiffSpec> {
+    match s {
+        "w" => Some(DiffSpec::WorkingTree),
+        "s" => Some(DiffSpec::Staged),
+        _ => s.strip_prefix("b:").map(|r| DiffSpec::Base(r.to_string())),
+    }
+}
+
+fn set_cloexec(fd: RawFd, on: bool) -> bool {
+    // SAFETY: fcntl on a descriptor this process owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFD, if on { flags | libc::FD_CLOEXEC } else { flags & !libc::FD_CLOEXEC }) == 0
+    }
+}
+
+/// Where the sleeping daemon's snapshot goes: next to the history sidecar
+/// in the git directory when there is one (never in the work tree), else
+/// next to the socket.
+fn snapshot_path(root: &Path, paths: &DaemonPaths) -> PathBuf {
+    let stem = paths.socket.file_stem().and_then(|s| s.to_str()).unwrap_or("index").to_string();
+    let dir = crate::gitd::GitLayout::discover(root).map(|l| l.common.join("ripple")).unwrap_or_else(|| paths.dir.clone());
+    dir.join(format!("index-{stem}.snap"))
 }
 
 impl Shared {
@@ -221,12 +366,47 @@ pub struct ServeOptions {
     pub idle_timeout: Option<Duration>,
     /// Holds every git-history build / update this long (tests).
     pub history_hold: Duration,
+    /// Overrides `daemon.sleep_after_seconds` (tests). `Some(ZERO)` = never.
+    pub sleep_after: Option<Duration>,
+    /// Sleep by re-executing the current binary with the same arguments,
+    /// which returns the indexer's memory to the system (binary only: it
+    /// replaces the whole process). Otherwise sleep happens in-process.
+    pub reexec: bool,
 }
 
 /// Runs the daemon until a `shutdown` request. Fails fast if another daemon
 /// holds the lock for this root.
 pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOptions) -> Result<()> {
+    if opts.reexec {
+        space_efficient_malloc();
+    }
     paths.create_dir()?;
+    let snap_path = snapshot_path(root, &paths);
+    let resume = if opts.reexec { Resume::take() } else { None };
+    // A re-executed sleeper: the lock and the socket are already ours.
+    let (lock, listener) = match &resume {
+        // SAFETY: descriptors handed over by the previous image of this process.
+        Some(r) => unsafe { (std::fs::File::from_raw_fd(r.lock), Some(UnixListener::from_raw_fd(r.listener))) },
+        None => (acquire_lock(root, &paths)?, None),
+    };
+    set_cloexec(lock.as_raw_fd(), true);
+    if let Some(l) = &listener {
+        set_cloexec(l.as_raw_fd(), true);
+    }
+    // ... and its snapshot (if it cannot be used: index from scratch).
+    let t = Instant::now();
+    let resumed: Option<Arc<Snapshot>> = resume.as_ref().and_then(|_| match crate::snapfile::load(&snap_path, root) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            eprintln!("ripple: not resuming from {}: {e}", snap_path.display());
+            None
+        }
+    });
+    let load_ms = t.elapsed().as_secs_f64() * 1000.0;
+    serve_with(root, pipeline, paths, opts, lock, listener, snap_path, resume, resumed, load_ms)
+}
+
+fn acquire_lock(root: &Path, paths: &DaemonPaths) -> Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&paths.lock).with_context(|| format!("opening {}", paths.lock.display()))?;
     // A daemon that is exiting (idle timeout) still holds the lock for a
     // moment after it stops accepting connections: wait for it briefly.
@@ -245,6 +425,22 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     }
     lock.set_len(0)?;
     (&lock).write_all(format!("{}\n", std::process::id()).as_bytes())?;
+    Ok(lock)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_with(
+    root: &Path,
+    pipeline: Pipeline,
+    paths: DaemonPaths,
+    opts: ServeOptions,
+    lock: std::fs::File,
+    listener: Option<UnixListener>,
+    snap_path: PathBuf,
+    resume: Option<Resume>,
+    resumed: Option<Arc<Snapshot>>,
+    load_ms: f64,
+) -> Result<()> {
 
     let config = ripple_policy::load_config(root).map(|l| l.config).unwrap_or_default();
     let history = HistoryD::start_with_hold(root, &config, opts.history_hold);
@@ -267,11 +463,32 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
         coverage,
         rank: RankD::new(),
         last_request_ms: AtomicU64::new(0),
+        last_use_ms: AtomicU64::new(0),
         in_flight: AtomicUsize::new(0),
         conns: Mutex::new(0),
         conns_cv: Condvar::new(),
         idle_timeout: opts.idle_timeout,
+        sleep: SleepCtl {
+            after: opts.sleep_after,
+            reexec: opts.reexec,
+            path: snap_path,
+            asleep: AtomicBool::new(false),
+            listener_fd: std::sync::atomic::AtomicI32::new(-1),
+            lock_fd: lock.as_raw_fd(),
+            sleeps: AtomicU64::new(resume.as_ref().map_or(0, |r| r.sleeps)),
+            wakes: AtomicU64::new(resume.as_ref().map_or(0, |r| r.wakes)),
+            failed_at: Mutex::new(None),
+            released: Mutex::new(None),
+            last: Mutex::new(Value::Null),
+        },
     });
+    // A resumed daemon has been idle since before the re-execution.
+    let mut shared = shared;
+    if let Some(r) = &resume
+        && let Some(s) = Instant::now().checked_sub(Duration::from_millis(r.idle_ms))
+    {
+        Arc::get_mut(&mut shared).expect("not shared yet").started = s;
+    }
 
     {
         let h = shared.history.clone();
@@ -285,13 +502,47 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     // Git results are only cached while the watcher reports changes.
     // (Also: whether there is a watcher to sync with.)
     shared.git.watching.store(_watcher.is_some(), Ordering::SeqCst);
+    if let Some(snap) = &resumed {
+        // Serve the mapped snapshot; what changed while no watcher ran is
+        // found by the sweep and goes through the indexer like any event.
+        shared.set_current(snap.clone());
+        shared.sleep.asleep.store(true, Ordering::SeqCst);
+        let since = UNIX_EPOCH + Duration::from_nanos(resume.as_ref().map_or(0, |r| r.since_ns));
+        let t = Instant::now();
+        let found = snap.sweep(since.checked_sub(SLEEP_MARGIN).unwrap_or(UNIX_EPOCH));
+        let sweep_ms = t.elapsed().as_secs_f64() * 1000.0;
+        *shared.sleep.last.lock().unwrap_or_else(|p| p.into_inner()) = json!({"resumed": true, "load_ms": load_ms, "sweep_ms": sweep_ms, "sweep_found": found.len()});
+        if std::env::var_os("RIPPLE_DEBUG").is_some() {
+            eprintln!("ripple: resumed; sweep found {:?}", found.iter().take(20).collect::<Vec<_>>());
+        }
+        if !found.is_empty() {
+            shared.deliver(found);
+        }
+    }
     {
         let shared = shared.clone();
-        std::thread::Builder::new().name("ripple-indexer".into()).spawn(move || indexer(shared, pipeline))?;
+        let resumed = resumed.is_some();
+        std::thread::Builder::new().name("ripple-indexer".into()).spawn(move || indexer(shared, pipeline, resumed))?;
     }
-    if _watcher.is_some() && crate::files::in_git_repo(root) {
+    let git_prewarm = _watcher.is_some() && crate::files::in_git_repo(root);
+    if git_prewarm || resumed.is_some() {
         let shared = shared.clone();
-        std::thread::Builder::new().name("ripple-git-prewarm".into()).spawn(move || shared.git.prewarm())?;
+        let specs: Option<Vec<DiffSpec>> = resume.as_ref().map(|r| r.specs.iter().filter_map(|s| decode_spec(s)).collect());
+        std::thread::Builder::new().name("ripple-git-prewarm".into()).spawn(move || {
+            match specs {
+                Some(s) if git_prewarm => shared.git.prewarm_specs(&s),
+                None if git_prewarm => shared.git.prewarm(),
+                _ => {}
+            }
+            if shared.sleep.asleep.load(Ordering::SeqCst) {
+                // A resumed sleeper: once history is loaded, hand back what loading freed.
+                let t = Instant::now();
+                while shared.history.busy() && t.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                release_free_memory();
+            }
+        })?;
     }
     {
         let shared = shared.clone();
@@ -301,17 +552,26 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     // Bind only once the watcher is running: a client that can connect can
     // rely on every later file change being observed.
     // We hold the lock, so any existing socket is left over from a dead daemon.
-    if paths.socket.exists() {
-        std::fs::remove_file(&paths.socket).with_context(|| format!("removing stale socket {}", paths.socket.display()))?;
-    }
-    let listener = UnixListener::bind(&paths.socket).with_context(|| format!("binding {}", paths.socket.display()))?;
-    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
+    let listener = match listener {
+        Some(l) => l,
+        None => {
+            if paths.socket.exists() {
+                std::fs::remove_file(&paths.socket).with_context(|| format!("removing stale socket {}", paths.socket.display()))?;
+            }
+            let l = UnixListener::bind(&paths.socket).with_context(|| format!("binding {}", paths.socket.display()))?;
+            std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
+            l
+        }
+    };
+    shared.sleep.listener_fd.store(listener.as_raw_fd(), Ordering::SeqCst);
     if opts.signals {
         install_signal_handlers(&paths.socket);
     }
 
 
-    eprintln!("ripple: serving {} on {}", root.display(), paths.socket.display());
+    if resumed.is_none() {
+        eprintln!("ripple: serving {} on {}", root.display(), paths.socket.display());
+    }
     for stream in listener.incoming() {
         if shared.lock().shutdown {
             break;
@@ -423,21 +683,25 @@ fn relative(roots: &[PathBuf], p: &Path) -> Option<String> {
     roots.iter().find_map(|r| p.strip_prefix(r).ok()).and_then(|r| r.to_str()).map(str::to_string)
 }
 
-fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
-    let start_seq = shared.lock().delivered;
-    let mut engine = match Engine::open(&shared.root, pipeline) {
-        Ok((engine, snap)) => {
-            shared.set_current(snap);
-            engine
+fn indexer(shared: Arc<Shared>, pipeline: Pipeline, resumed: bool) {
+    // Asleep: `engine` is `None`, the published snapshot is mapped from
+    // disk, and `pipeline` waits for the next wake.
+    let mut pipeline = Some(pipeline);
+    let mut engine: Option<Engine> = None;
+    if !resumed {
+        let start_seq = shared.lock().delivered;
+        match Engine::open(&shared.root, pipeline.take().expect("pipeline")) {
+            Ok((e, snap)) => {
+                shared.set_current(snap);
+                engine = Some(e);
+            }
+            Err(e) => {
+                let mut st = shared.lock();
+                st.fatal = Some(format!("initial index failed: {e:#}"));
+                shared.cv.notify_all();
+                return;
+            }
         }
-        Err(e) => {
-            let mut st = shared.lock();
-            st.fatal = Some(format!("initial index failed: {e:#}"));
-            shared.cv.notify_all();
-            return;
-        }
-    };
-    {
         let mut st = shared.lock();
         st.applied = start_seq;
         shared.cv.notify_all();
@@ -449,7 +713,7 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
             if st.shutdown {
                 return;
             }
-            if st.reload_requested > st.reload_done {
+            if st.reload_requested > st.reload_done || st.sleep_requested {
                 break;
             }
             if !st.dirty.is_empty() {
@@ -463,6 +727,13 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
                 continue;
             }
             st = shared.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+        if std::mem::take(&mut st.sleep_requested) {
+            if engine.is_some() && st.dirty.is_empty() && st.reload_requested == st.reload_done {
+                drop(st);
+                go_to_sleep(&shared, &mut engine, &mut pipeline);
+            }
+            continue;
         }
         let reload = (st.reload_requested > st.reload_done).then_some(st.reload_requested);
         // Everything delivered so far is one batch (edits coalesce).
@@ -478,7 +749,14 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
         if debug {
             eprintln!("ripple: indexing {} path(s){}: {:?}", batch.len(), if reload.is_some() { " (full reload)" } else { "" }, batch.iter().take(20).collect::<Vec<_>>());
         }
-        let result = if reload.is_some() { engine.full_build() } else { engine.apply_paths(&batch) };
+        let result = match engine.as_mut() {
+            Some(e) if reload.is_some() => e.full_build(),
+            Some(e) => e.apply_paths(&batch),
+            None => match asleep_pass(&shared, &batch, reload.is_some()) {
+                Some(snap) => Ok(snap),
+                None => wake(&shared, &mut engine, &mut pipeline),
+            },
+        };
         let took = started.elapsed();
         match result {
             Ok(snap) => shared.set_current(snap),
@@ -498,6 +776,113 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
         }
         shared.cv.notify_all();
     }
+}
+
+/// While asleep: the current (mapped) snapshot if none of `batch` changes
+/// what it indexed (records them as seen, like an incremental pass that
+/// finds nothing to do); `None` when the daemon has to wake.
+fn asleep_pass(shared: &Shared, batch: &BTreeSet<RelPath>, reload: bool) -> Option<Arc<Snapshot>> {
+    if reload {
+        return None;
+    }
+    let snap = shared.current()?;
+    let pass_start = SystemTime::now();
+    let (changes, config) = resolve_paths(&shared.root, &snap.files, &snap.policy, batch);
+    if config || !changes.is_empty() {
+        return None;
+    }
+    if let Ok(mut seen) = snap.seen.write() {
+        for p in batch {
+            seen.insert(p.clone(), pass_start);
+        }
+    }
+    Some(snap)
+}
+
+/// Leaves sleep: a full index, as at start.
+fn wake(shared: &Shared, engine: &mut Option<Engine>, pipeline: &mut Option<Pipeline>) -> Result<Arc<Snapshot>> {
+    let generation = shared.generation();
+    let p = pipeline.take().context("no pipeline to wake with")?;
+    let (e, snap) = Engine::open_after(&shared.root, p, generation)?;
+    *engine = Some(e);
+    shared.sleep.asleep.store(false, Ordering::SeqCst);
+    shared.sleep.wakes.fetch_add(1, Ordering::Relaxed);
+    Ok(snap)
+}
+
+/// Writes the snapshot and continues from the mapped copy: by re-executing
+/// (see the module docs) or, failing that / in-process, by dropping the engine.
+fn go_to_sleep(shared: &Shared, engine: &mut Option<Engine>, pipeline: &mut Option<Pipeline>) {
+    let Some(snap) = shared.current() else { return };
+    let mark = || Some((shared.last_use_ms.load(Ordering::SeqCst), shared.lock().delivered));
+    let since = SystemTime::now();
+    let t = Instant::now();
+    let bytes = match crate::snapfile::save(&snap, &shared.sleep.path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("ripple: not sleeping: {e}");
+            *shared.sleep.failed_at.lock().unwrap_or_else(|p| p.into_inner()) = mark();
+            return;
+        }
+    };
+    let save_ms = t.elapsed().as_secs_f64() * 1000.0;
+    shared.sleep.sleeps.fetch_add(1, Ordering::Relaxed);
+    if shared.sleep.reexec {
+        let e = reexec(shared, since);
+        eprintln!("ripple: could not re-execute to sleep ({e}); sleeping in-process");
+    }
+    match crate::snapfile::load(&shared.sleep.path, &shared.root) {
+        Ok(m) => {
+            shared.set_current(Arc::new(m));
+            drop(snap);
+            *pipeline = engine.take().map(Engine::into_pipeline);
+            shared.sleep.asleep.store(true, Ordering::SeqCst);
+            release_free_memory();
+            *shared.sleep.last.lock().unwrap_or_else(|p| p.into_inner()) = json!({"resumed": false, "save_ms": save_ms, "bytes": bytes});
+        }
+        Err(e) => {
+            eprintln!("ripple: not sleeping: reading back {}: {e}", shared.sleep.path.display());
+            shared.sleep.sleeps.fetch_sub(1, Ordering::Relaxed);
+            *shared.sleep.failed_at.lock().unwrap_or_else(|p| p.into_inner()) = mark();
+        }
+    }
+}
+
+/// Replaces this process with a fresh image of the same binary, which
+/// resumes from the snapshot just written. Returns only on failure.
+fn reexec(shared: &Shared, since: SystemTime) -> String {
+    use std::os::unix::process::CommandExt;
+    let listener = shared.sleep.listener_fd.load(Ordering::SeqCst);
+    let lock = shared.sleep.lock_fd;
+    if listener < 0 {
+        return "no listening socket yet".into();
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return e.to_string(),
+    };
+    let last = Duration::from_millis(shared.last_request_ms.load(Ordering::SeqCst));
+    let resume = Resume {
+        listener,
+        lock,
+        since_ns: since.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0),
+        idle_ms: shared.started.elapsed().saturating_sub(last).as_millis() as u64,
+        specs: shared.git.recent_specs().iter().map(encode_spec).collect(),
+        sleeps: shared.sleep.sleeps.load(Ordering::Relaxed),
+        wakes: shared.sleep.wakes.load(Ordering::Relaxed),
+    };
+    let Ok(json) = serde_json::to_string(&resume) else { return "encoding the resume state".into() };
+    if !(set_cloexec(listener, false) && set_cloexec(lock, false)) {
+        set_cloexec(listener, true);
+        set_cloexec(lock, true);
+        return "could not pass the socket on".into();
+    }
+    let mut args = std::env::args_os();
+    let _argv0 = args.next();
+    let err = std::process::Command::new(exe).args(args).env(RESUME_ENV, json).exec();
+    set_cloexec(listener, true);
+    set_cloexec(lock, true);
+    err.to_string()
 }
 
 /// Outcome of the freshness step for one request.
@@ -685,15 +1070,21 @@ fn eta(st: &State, now: Instant) -> Option<Instant> {
     })
 }
 
-/// Stops the daemon after the configured time without requests. The
-/// timeout comes from the current snapshot's `daemon.idle_timeout_minutes`.
+/// Stops the daemon after the configured time without requests, and asks
+/// the indexer to sleep after `daemon.sleep_after_seconds` without requests
+/// or file events. Both come from the current snapshot's config.
 fn idle_timer(shared: Arc<Shared>) {
     loop {
-        let timeout = shared.idle_timeout.or_else(|| shared.current().map(|s| Duration::from_secs(s.policy.config.daemon.idle_timeout_minutes.saturating_mul(60))));
-        let check = match timeout {
-            Some(t) if !t.is_zero() => (t / 4).clamp(Duration::from_millis(10), Duration::from_secs(30)),
-            _ => Duration::from_secs(30),
-        };
+        let cfg = shared.current().map(|s| s.policy.config.daemon.clone());
+        let timeout = shared.idle_timeout.or_else(|| cfg.as_ref().map(|d| Duration::from_secs(d.idle_timeout_minutes.saturating_mul(60))));
+        let sleep_after = shared.sleep.after.or_else(|| cfg.as_ref().map(|d| Duration::from_secs(d.sleep_after_seconds)));
+        let check = [timeout, sleep_after]
+            .into_iter()
+            .flatten()
+            .filter(|t| !t.is_zero())
+            .map(|t| (t / 4).clamp(Duration::from_millis(10), Duration::from_secs(30)))
+            .min()
+            .unwrap_or(Duration::from_secs(30));
         {
             let st = shared.lock();
             if st.shutdown {
@@ -701,13 +1092,49 @@ fn idle_timer(shared: Arc<Shared>) {
             }
             let _ = shared.cv.wait_timeout(st, check);
         }
-        let Some(timeout) = timeout.filter(|t| !t.is_zero()) else { continue };
-        let last = Duration::from_millis(shared.last_request_ms.load(Ordering::SeqCst));
-        let idle = shared.started.elapsed().saturating_sub(last);
-        if idle >= timeout && shared.in_flight.load(Ordering::SeqCst) == 0 {
+        let since_start = shared.started.elapsed();
+        let idle = since_start.saturating_sub(Duration::from_millis(shared.last_request_ms.load(Ordering::SeqCst)));
+        let use_ms = shared.last_use_ms.load(Ordering::SeqCst);
+        let unused = since_start.saturating_sub(Duration::from_millis(use_ms));
+        // Asleep: after any activity has settled, return the memory it freed
+        // (allocators keep freed pages; this is what keeps a sleeper small).
+        if shared.sleep.asleep.load(Ordering::SeqCst) && shared.in_flight.load(Ordering::SeqCst) == 0 && !shared.history.busy() {
+            let mark = Some((shared.requests.load(Ordering::Relaxed), shared.lock().delivered));
+            let mut released = shared.sleep.released.lock().unwrap_or_else(|p| p.into_inner());
+            if *released != mark {
+                *released = mark;
+                drop(released);
+                release_free_memory();
+            }
+        }
+        if let Some(timeout) = timeout.filter(|t| !t.is_zero())
+            && idle >= timeout
+            && shared.in_flight.load(Ordering::SeqCst) == 0
+        {
             eprintln!("ripple: no requests for {}s; exiting", idle.as_secs());
             begin_shutdown(&shared);
             return;
+        }
+        if let Some(after) = sleep_after.filter(|t| !t.is_zero())
+            && unused >= after
+            && !shared.sleep.asleep.load(Ordering::SeqCst)
+            && shared.in_flight.load(Ordering::SeqCst) == 0
+            && !shared.history.busy()
+            && (!shared.sleep.reexec || *shared.conns.lock().unwrap_or_else(|p| p.into_inner()) == 0)
+        {
+            let mut st = shared.lock();
+            let quiet = st.dirty.is_empty()
+                && st.in_progress.is_none()
+                && st.applied == st.delivered
+                && st.reload_done == st.reload_requested
+                && st.cookies.is_empty()
+                && st.fatal.is_none()
+                && st.last_event.is_none_or(|t| t.elapsed() >= after);
+            let failed = *shared.sleep.failed_at.lock().unwrap_or_else(|p| p.into_inner()) == Some((use_ms, st.delivered));
+            if quiet && !failed && !st.sleep_requested {
+                st.sleep_requested = true;
+                shared.cv.notify_all();
+            }
         }
     }
 }
@@ -740,11 +1167,25 @@ fn handle_conn(stream: UnixStream, shared: &Arc<Shared>) {
             continue;
         }
         let start = Instant::now();
+        // `stats` is monitoring, not use: it does not hold off sleep.
+        #[derive(serde::Deserialize)]
+        struct Method<'a> {
+            #[serde(borrow)]
+            method: std::borrow::Cow<'a, str>,
+        }
+        let counts = serde_json::from_str::<Method>(&line).map_or(true, |m| m.method != "stats");
+        let touch = || {
+            let now = shared.started.elapsed().as_millis() as u64;
+            shared.last_request_ms.store(now, Ordering::SeqCst);
+            if counts {
+                shared.last_use_ms.store(now, Ordering::SeqCst);
+            }
+        };
         shared.in_flight.fetch_add(1, Ordering::SeqCst);
-        shared.last_request_ms.store(shared.started.elapsed().as_millis() as u64, Ordering::SeqCst);
+        touch();
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle_line(shared, &line, start)))
             .unwrap_or_else(|_| err_line(&Value::Null, shared.generation(), 0, &ErrorBody::new("internal", "request handler panicked")));
-        shared.last_request_ms.store(shared.started.elapsed().as_millis() as u64, Ordering::SeqCst);
+        touch();
         shared.in_flight.fetch_sub(1, Ordering::SeqCst);
         if writer.write_all(out.as_bytes()).and_then(|_| writer.write_all(b"\n")).and_then(|_| writer.flush()).is_err() {
             break;
@@ -855,6 +1296,13 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
                 "pending_changes": st.dirty.len() + st.in_progress.as_ref().map_or(0, |b| b.len()),
                 "indexing": st.in_progress.is_some(),
                 "connections": *shared.conns.lock().unwrap_or_else(|p| p.into_inner()),
+                "sleep": {
+                    "asleep": shared.sleep.asleep.load(Ordering::Relaxed),
+                    "sleeps": shared.sleep.sleeps.load(Ordering::Relaxed),
+                    "wakes": shared.sleep.wakes.load(Ordering::Relaxed),
+                    "snapshot": shared.sleep.path,
+                    "last": shared.sleep.last.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+                },
                 "git": {
                     "watching": shared.git.watching.load(Ordering::Relaxed),
                     "cache_hits": shared.git.counters.hits.load(Ordering::Relaxed),

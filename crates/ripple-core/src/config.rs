@@ -406,11 +406,16 @@ pub struct DaemonConfig {
     /// answers from the current index, marked `stale` with the pending paths.
     /// `--sync` waits without limit, `--no-wait` not at all.
     pub max_wait_ms: u64,
+    /// After this many seconds without requests or file changes the daemon
+    /// writes its index to disk and continues from a memory-mapped copy,
+    /// releasing the in-memory indexer state (a relevant edit wakes it with
+    /// a full re-index). 0 = never.
+    pub sleep_after_seconds: u64,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        Self { idle_timeout_minutes: 30, max_wait_ms: DEFAULT_MAX_WAIT_MS }
+        Self { idle_timeout_minutes: 30, max_wait_ms: DEFAULT_MAX_WAIT_MS, sleep_after_seconds: 300 }
     }
 }
 

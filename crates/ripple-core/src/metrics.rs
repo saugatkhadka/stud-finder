@@ -58,9 +58,11 @@
 //! 64-bit hash of the path ([`path_hash`]) rather than the path, so a table
 //! costs 20 bytes per file plus 8 per method and holds no strings.
 
+use crate::store::{Pod, SectionFile, SectionWriter, Slab};
 use std::sync::Arc;
 
 /// Size and complexity of one file. 12 bytes.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FileMetrics {
     /// Code lines (see the module docs).
@@ -74,6 +76,7 @@ pub struct FileMetrics {
 }
 
 /// One method of a file (Ruby only: the outermost `def`s). 8 bytes.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct MethodMetric {
     /// 1-based line of the `def`.
@@ -83,6 +86,11 @@ pub struct MethodMetric {
     /// `1 + decisions`, saturating.
     pub complexity: u16,
 }
+
+// SAFETY: integers only, no padding (asserted below).
+unsafe impl Pod for FileMetrics {}
+unsafe impl Pod for MethodMetric {}
+const _: () = assert!(std::mem::size_of::<FileMetrics>() == 12 && std::mem::size_of::<MethodMetric>() == 8);
 
 impl MethodMetric {
     /// 1-based line of the closing `end`, inclusive.
@@ -129,14 +137,14 @@ const BASE_EVERY: usize = 32;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricsTable {
     /// [`path_hash`] per file, sorted, unique.
-    hashes: Box<[u64]>,
+    hashes: Slab<u64>,
     /// Parallel to `hashes`.
-    files: Box<[FileMetrics]>,
+    files: Slab<FileMetrics>,
     /// Per-method metrics, file after file in `hashes` order; file `i` owns
     /// `files[i].methods` of them. Empty when the extractor reports none.
-    methods: Box<[MethodMetric]>,
+    methods: Slab<MethodMetric>,
     /// Offset into `methods` of file `k * BASE_EVERY`.
-    method_base: Box<[u32]>,
+    method_base: Slab<u32>,
 }
 
 impl MetricsTable {
@@ -218,9 +226,41 @@ impl MetricsTable {
         self.hashes.iter().copied().zip(self.files.iter().copied())
     }
 
-    /// Heap bytes held by the table.
+    /// Heap bytes held by the table (0 when mapped).
     pub fn heap_bytes(&self) -> usize {
-        self.hashes.len() * 8 + self.files.len() * 12 + self.methods.len() * 8 + self.method_base.len() * 4
+        self.hashes.heap_bytes() + self.files.heap_bytes() + self.methods.heap_bytes() + self.method_base.heap_bytes()
+    }
+
+    /// Saves the table as sections `base..base + 4`.
+    pub fn save(&self, w: &mut SectionWriter, base: u32) {
+        w.put(base, &self.hashes);
+        w.put(base + 1, &self.files);
+        w.put(base + 2, &self.methods);
+        w.put(base + 3, &self.method_base);
+    }
+
+    /// A table saved by [`MetricsTable::save`], mapped, after checking
+    /// what lookups rely on.
+    pub fn load(f: &SectionFile, base: u32) -> Result<Self, String> {
+        let t = Self { hashes: f.slab(base)?, files: f.slab(base + 1)?, methods: f.slab(base + 2)?, method_base: f.slab(base + 3)? };
+        if t.files.len() != t.hashes.len() || t.hashes.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("metrics table is malformed".into());
+        }
+        if t.has_methods() {
+            let mut at = 0usize;
+            for (i, f) in t.files.iter().enumerate() {
+                if i % BASE_EVERY == 0 && t.method_base.get(i / BASE_EVERY).copied() != Some(at as u32) {
+                    return Err("metrics method offsets are malformed".into());
+                }
+                at += usize::from(f.methods);
+            }
+            if at != t.methods.len() || t.method_base.len() != t.files.len().div_ceil(BASE_EVERY) {
+                return Err("metrics method offsets are malformed".into());
+            }
+        } else if !t.methods.is_empty() {
+            return Err("metrics table is malformed".into());
+        }
+        Ok(t)
     }
 }
 

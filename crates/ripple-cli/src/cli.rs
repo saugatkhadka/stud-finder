@@ -1188,7 +1188,7 @@ fn daemon_cmd(root: &Path, cmd: DaemonCmd) -> Result<u8> {
 fn serve(root: &Path, foreground: bool) -> Result<u8> {
     let paths = DaemonPaths::for_root(root)?;
     if foreground {
-        server::serve(root, Pipeline::standard(), paths, ServeOptions { signals: true, ..Default::default() })?;
+        server::serve(root, Pipeline::standard(), paths, ServeOptions { signals: true, reexec: true, ..Default::default() })?;
         return Ok(0);
     }
     if Client::connect(&paths).is_some() {

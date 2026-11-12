@@ -321,25 +321,22 @@ pub struct PolicyIndex {
 
 impl PolicyIndex {
     pub fn build(policy: &Policy, graph: &Graph) -> Self {
-        let paths = graph.paths();
+        let n = graph.node_count();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
-        let chunk = paths.len().div_ceil(threads).max(1024);
+        let chunk = n.div_ceil(threads).max(1024);
         let parts: Vec<(Vec<FileClass>, Vec<u32>, Vec<u32>, Vec<u32>, usize)> = std::thread::scope(|s| {
-            let handles: Vec<_> = paths
-                .chunks(chunk)
-                .enumerate()
-                .map(|(ci, part)| {
+            let handles: Vec<_> = (0..n)
+                .step_by(chunk)
+                .map(|a| {
                     s.spawn(move || {
                         let (mut cx, mut mm, mut fi, mut non_test) = (Vec::new(), Vec::new(), Vec::new(), 0);
-                        let classes: Vec<FileClass> = part
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| {
-                                let c = policy.classify(p);
+                        let classes: Vec<FileClass> = (a..(a + chunk).min(n))
+                            .map(|i| {
+                                let node = i as NodeId;
+                                let c = policy.classify(graph.path(node));
                                 if !c.test {
                                     non_test += 1;
                                     if c.language.is_source() {
-                                        let node = (ci * chunk + i) as NodeId;
                                         fi.push(graph.fan_in(node) as u32);
                                         if let Some(m) = graph.metrics(node) {
                                             cx.push(m.complexity);

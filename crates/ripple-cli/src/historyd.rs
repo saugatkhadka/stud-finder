@@ -667,6 +667,13 @@ impl HistoryD {
         }
     }
 
+    /// Whether a build or update is running or a HEAD move is waiting out
+    /// its debounce (the daemon does not sleep then).
+    pub fn busy(&self) -> bool {
+        let c = lock(&self.ctl);
+        c.job.is_some() || (c.first_pending.is_some() && !c.disabled)
+    }
+
     /// Whether the background thread is running (tests).
     pub fn thread_running(&self) -> bool {
         lock(&self.ctl).thread.as_ref().is_some_and(|t| !t.is_finished())

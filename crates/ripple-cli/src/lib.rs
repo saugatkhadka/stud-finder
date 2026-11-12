@@ -21,3 +21,4 @@ pub mod query;
 pub mod server;
 pub mod signals;
 pub mod skill;
+pub mod snapfile;
