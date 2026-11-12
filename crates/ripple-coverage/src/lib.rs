@@ -128,19 +128,8 @@ impl Format {
     /// By file name: `*resultset*.json` SimpleCov, other `*.json` Istanbul,
     /// anything else LCOV.
     pub fn detect(path: &Path) -> Format {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        if name.ends_with(".json") {
-            if name.contains("resultset") {
-                Format::SimpleCov
-            } else {
-                Format::Istanbul
-            }
-        } else {
-            Format::Lcov
-        }
+        let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if name.ends_with(".json") { if name.contains("resultset") { Format::SimpleCov } else { Format::Istanbul } } else { Format::Lcov }
     }
 }
 
@@ -223,15 +212,7 @@ const UNMAPPED_SAMPLE: usize = 20;
 impl Coverage {
     /// No coverage data.
     pub fn empty(cfg: &CoverageConfig) -> Self {
-        Self {
-            cfg: cfg.clone(),
-            names: String::new(),
-            files: Vec::new(),
-            bits: Vec::new(),
-            reports: Vec::new(),
-            sources: Vec::new(),
-            unmapped_sample: Vec::new(),
-        }
+        Self { cfg: cfg.clone(), names: String::new(), files: Vec::new(), bits: Vec::new(), reports: Vec::new(), sources: Vec::new(), unmapped_sample: Vec::new() }
     }
 
     /// Reads all reports `cfg` points at (auto-detected in `coverage/` when
@@ -242,11 +223,7 @@ impl Coverage {
     /// A report that cannot be parsed is skipped and listed with its
     /// [`Report::error`]; this fails only when reports exist and none of them
     /// could be read. No reports, or `enabled: false`, is an empty `Coverage`.
-    pub fn load<'k>(
-        root: &Path,
-        cfg: &CoverageConfig,
-        known_files: impl IntoIterator<Item = &'k str>,
-    ) -> Result<Coverage> {
+    pub fn load<'k>(root: &Path, cfg: &CoverageConfig, known_files: impl IntoIterator<Item = &'k str>) -> Result<Coverage> {
         let mut cov = Coverage::empty(cfg);
         if !cfg.enabled {
             return Ok(cov);
@@ -260,26 +237,12 @@ impl Coverage {
         for (path, stamp) in &cov.sources {
             let format = Format::detect(path);
             let mtime = (stamp.nanos / 1_000_000_000) as i64;
-            let mut rep = Report {
-                path: path.clone(),
-                format,
-                mtime,
-                size: stamp.size,
-                measured_at: mtime,
-                entries: 0,
-                mapped: 0,
-                unmapped: 0,
-                ambiguous: 0,
-                malformed: 0,
-                error: None,
-            };
-            let parsed = std::fs::read(path)
-                .map_err(anyhow::Error::from)
-                .and_then(|bytes| match format {
-                    Format::SimpleCov => formats::parse_simplecov(&bytes),
-                    Format::Lcov => formats::parse_lcov(&bytes),
-                    Format::Istanbul => formats::parse_istanbul(&bytes),
-                });
+            let mut rep = Report { path: path.clone(), format, mtime, size: stamp.size, measured_at: mtime, entries: 0, mapped: 0, unmapped: 0, ambiguous: 0, malformed: 0, error: None };
+            let parsed = std::fs::read(path).map_err(anyhow::Error::from).and_then(|bytes| match format {
+                Format::SimpleCov => formats::parse_simplecov(&bytes),
+                Format::Lcov => formats::parse_lcov(&bytes),
+                Format::Istanbul => formats::parse_istanbul(&bytes),
+            });
             let parsed = match parsed {
                 Ok(p) => p,
                 Err(e) => {
@@ -328,11 +291,7 @@ impl Coverage {
             cov.reports.push(rep);
         }
         if cov.reports.iter().all(|r| r.error.is_some()) {
-            let errs: Vec<String> = cov
-                .reports
-                .iter()
-                .map(|r| format!("{}: {}", r.path.display(), r.error.as_deref().unwrap_or("")))
-                .collect();
+            let errs: Vec<String> = cov.reports.iter().map(|r| format!("{}: {}", r.path.display(), r.error.as_deref().unwrap_or(""))).collect();
             bail!("no coverage report could be read: {}", errs.join("; "));
         }
         cov.finish(merged);
@@ -342,12 +301,8 @@ impl Coverage {
     fn finish(&mut self, merged: HashMap<String, (LineBits, u32)>) {
         let mut all: Vec<(String, (LineBits, u32))> = merged.into_iter().collect();
         all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let words: usize = all
-            .iter()
-            .map(|(_, (b, _))| b.cov.len().min(b.hit.len()) * 2)
-            .sum();
-        self.names
-            .reserve_exact(all.iter().map(|(p, _)| p.len()).sum());
+        let words: usize = all.iter().map(|(_, (b, _))| b.cov.len().min(b.hit.len()) * 2).sum();
+        self.names.reserve_exact(all.iter().map(|(p, _)| p.len()).sum());
         self.bits.reserve_exact(words);
         self.files.reserve_exact(all.len());
         for (path, (mut b, report)) in all {
@@ -360,15 +315,7 @@ impl Coverage {
             self.bits.extend_from_slice(&b.hit[..n]);
             let coverable = b.cov.iter().map(|w| w.count_ones()).sum();
             let covered = b.hit.iter().map(|w| w.count_ones()).sum();
-            self.files.push(FileRec {
-                name_off,
-                name_len: path.len() as u32,
-                bits_off,
-                words: n as u32,
-                covered,
-                coverable,
-                report,
-            });
+            self.files.push(FileRec { name_off, name_len: path.len() as u32, bits_off, words: n as u32, covered, coverable, report });
         }
     }
 
@@ -377,10 +324,7 @@ impl Coverage {
     }
 
     fn rec(&self, path: &str) -> Option<&FileRec> {
-        self.files
-            .binary_search_by(|r| self.name(r).cmp(path))
-            .ok()
-            .map(|i| &self.files[i])
+        self.files.binary_search_by(|r| self.name(r).cmp(path)).ok().map(|i| &self.files[i])
     }
 
     fn words(&self, r: &FileRec) -> (&[u64], &[u64]) {
@@ -390,10 +334,7 @@ impl Coverage {
 
     /// Whole-file coverage. `None` = the file is in no report: UNKNOWN, not 0%.
     pub fn file(&self, path: &str) -> Option<FileCoverage> {
-        self.rec(path).map(|r| FileCoverage {
-            covered: r.covered,
-            coverable: r.coverable,
-        })
+        self.rec(path).map(|r| FileCoverage { covered: r.covered, coverable: r.coverable })
     }
 
     /// Coverage of the lines in `ranges` (1-based, inclusive, in the line
@@ -442,16 +383,11 @@ impl Coverage {
             return Some(LineState::NotCoverable);
         };
         let (w, b) = (i / 64, 1u64 << (i % 64));
-        Some(
-            match (
-                cov.get(w).is_some_and(|x| x & b != 0),
-                hit.get(w).is_some_and(|x| x & b != 0),
-            ) {
-                (false, _) => LineState::NotCoverable,
-                (true, true) => LineState::Covered,
-                (true, false) => LineState::Uncovered,
-            },
-        )
+        Some(match (cov.get(w).is_some_and(|x| x & b != 0), hit.get(w).is_some_and(|x| x & b != 0)) {
+            (false, _) => LineState::NotCoverable,
+            (true, true) => LineState::Covered,
+            (true, false) => LineState::Uncovered,
+        })
     }
 
     /// Uncovered coverable lines within `ranges` (1-based, inclusive), ascending.
@@ -474,25 +410,12 @@ impl Coverage {
 
     /// Files with coverage, sorted by path.
     pub fn iter(&self) -> impl Iterator<Item = (&str, FileCoverage)> {
-        self.files.iter().map(|r| {
-            (
-                self.name(r),
-                FileCoverage {
-                    covered: r.covered,
-                    coverable: r.coverable,
-                },
-            )
-        })
+        self.files.iter().map(|r| (self.name(r), FileCoverage { covered: r.covered, coverable: r.coverable }))
     }
 
     /// Sum over all files.
     pub fn totals(&self) -> FileCoverage {
-        self.files
-            .iter()
-            .fold(FileCoverage::default(), |a, r| FileCoverage {
-                covered: a.covered + r.covered,
-                coverable: a.coverable + r.coverable,
-            })
+        self.files.iter().fold(FileCoverage::default(), |a, r| FileCoverage { covered: a.covered + r.covered, coverable: a.coverable + r.coverable })
     }
 
     pub fn file_count(&self) -> usize {
@@ -539,20 +462,14 @@ impl Coverage {
 
     /// When the coverage of `path` was measured: the newest report with it.
     pub fn file_measured_at(&self, path: &str) -> Option<i64> {
-        self.rec(path)
-            .map(|r| self.reports[r.report as usize].measured_at)
+        self.rec(path).map(|r| self.reports[r.report as usize].measured_at)
     }
 
     /// Freshness of the whole data set (`path = None`, using
     /// [`Coverage::measured_at`]) or of one file. `head_commit_time` is the
     /// HEAD commit's committer time and `now` the current time, unix seconds.
     /// `None` = no data (or the file is unknown).
-    pub fn freshness(
-        &self,
-        path: Option<&str>,
-        head_commit_time: Option<i64>,
-        now: i64,
-    ) -> Option<Freshness> {
+    pub fn freshness(&self, path: Option<&str>, head_commit_time: Option<i64>, now: i64) -> Option<Freshness> {
         let measured_at = match path {
             Some(p) => self.file_measured_at(p)?,
             None => self.measured_at()?,
@@ -561,10 +478,7 @@ impl Coverage {
             measured_at,
             age_secs: (now - measured_at).max(0),
             older_than_head: head_commit_time.is_some_and(|h| measured_at < h),
-            older_than_max_age: self
-                .cfg
-                .max_age_days
-                .is_some_and(|d| now - measured_at > i64::from(d) * 86_400),
+            older_than_max_age: self.cfg.max_age_days.is_some_and(|d| now - measured_at > i64::from(d) * 86_400),
         })
     }
 
@@ -583,23 +497,11 @@ impl Coverage {
             + self.files.capacity() * std::mem::size_of::<FileRec>()
             + self.bits.capacity() * 8
             + self.reports.capacity() * std::mem::size_of::<Report>()
-            + self
-                .reports
-                .iter()
-                .map(|r| r.path.capacity() + r.error.as_ref().map_or(0, String::capacity))
-                .sum::<usize>()
+            + self.reports.iter().map(|r| r.path.capacity() + r.error.as_ref().map_or(0, String::capacity)).sum::<usize>()
             + self.sources.capacity() * std::mem::size_of::<(PathBuf, Stamp)>()
-            + self
-                .sources
-                .iter()
-                .map(|(p, _)| p.capacity())
-                .sum::<usize>()
+            + self.sources.iter().map(|(p, _)| p.capacity()).sum::<usize>()
             + self.unmapped_sample.capacity() * std::mem::size_of::<String>()
-            + self
-                .unmapped_sample
-                .iter()
-                .map(String::capacity)
-                .sum::<usize>()
+            + self.unmapped_sample.iter().map(String::capacity).sum::<usize>()
             + self.cfg.paths.iter().map(String::capacity).sum::<usize>()
     }
 }
@@ -635,14 +537,8 @@ fn count_range(words: &[u64], s: u32, e: u32) -> u32 {
 fn project_dir(root: &Path, report: &Path) -> String {
     let rel = report.strip_prefix(root).unwrap_or(report);
     let dir = rel.parent().unwrap_or(Path::new(""));
-    let comps: Vec<String> = dir
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let cut = comps
-        .iter()
-        .rposition(|c| c == "coverage")
-        .unwrap_or(comps.len());
+    let comps: Vec<String> = dir.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    let cut = comps.iter().rposition(|c| c == "coverage").unwrap_or(comps.len());
     comps[..cut].join("/")
 }
 
@@ -651,18 +547,11 @@ const DEFAULT_NAMES: [&str; 2] = [".resultset.json", "lcov.info"];
 /// Report files `cfg` points at, sorted, deduplicated.
 fn discover(root: &Path, cfg: &CoverageConfig) -> Vec<PathBuf> {
     let default = ["coverage".to_string()];
-    let entries: &[String] = if cfg.paths.is_empty() {
-        &default
-    } else {
-        &cfg.paths
-    };
+    let entries: &[String] = if cfg.paths.is_empty() { &default } else { &cfg.paths };
     let mut out = Vec::new();
     for e in entries {
         let full = root.join(e);
-        let name = full
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if name.contains('*') {
             glob_dir(full.parent().unwrap_or(root), &name, &mut out);
         } else if full.is_dir() {
@@ -723,25 +612,13 @@ fn stamp_all(paths: &[PathBuf]) -> Vec<(PathBuf, Stamp)> {
         .iter()
         .filter_map(|p| {
             let m = std::fs::metadata(p).ok()?;
-            let nanos = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos());
-            Some((
-                p.clone(),
-                Stamp {
-                    nanos,
-                    size: m.len(),
-                },
-            ))
+            let nanos = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+            Some((p.clone(), Stamp { nanos, size: m.len() }))
         })
         .collect()
 }
 
 /// Current time, unix seconds (for [`Coverage::freshness`]).
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }

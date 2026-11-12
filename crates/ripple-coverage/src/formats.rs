@@ -112,14 +112,9 @@ pub(crate) fn parse_lcov(bytes: &[u8]) -> Result<Parsed> {
             };
             let mut it = rest.split(|&b| b == b',');
             let ln = it.next().and_then(parse_u32);
-            let hits = it
-                .next()
-                .map(|h| h.trim_ascii())
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| h.parse::<f64>().ok());
+            let hits = it.next().map(|h| h.trim_ascii()).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| h.parse::<f64>().ok());
             match (ln, hits) {
-                (Some(ln), Some(h))
-                    if p.entries.get_mut(path.as_str()).unwrap().set(ln, h > 0.0) => {}
+                (Some(ln), Some(h)) if p.entries.get_mut(path.as_str()).unwrap().set(ln, h > 0.0) => {}
                 _ => p.malformed += 1,
             }
         } else if line.trim_ascii() == b"end_of_record" {
@@ -283,16 +278,11 @@ impl<'de> Visitor<'de> for Files<'_> {
         f.write_str("a map of file -> coverage")
     }
     fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
-        let Parsed {
-            entries, malformed, ..
-        } = &mut *self.0;
+        let Parsed { entries, malformed, .. } = &mut *self.0;
         while let Some(k) = m.next_key::<Str>()? {
             let before = *malformed;
             let slot = Parsed::slot(entries, k.0.clone());
-            m.next_value_seed(FileCov {
-                slot,
-                malformed: &mut *malformed,
-            })?;
+            m.next_value_seed(FileCov { slot, malformed: &mut *malformed })?;
             // A malformed entry that added nothing is not an entry (it must
             // not read as "in the report, nothing coverable").
             if *malformed > before && entries.get(k.0.as_ref()).is_some_and(|b| b.cov.is_empty()) {
@@ -322,19 +312,12 @@ impl<'de> Visitor<'de> for FileCov<'_> {
         f.write_str("a line array or an object with \"lines\"")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, a: A) -> Result<(), A::Error> {
-        Lines {
-            slot: self.slot,
-            malformed: self.malformed,
-        }
-        .visit_seq(a)
+        Lines { slot: self.slot, malformed: self.malformed }.visit_seq(a)
     }
     fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
         while let Some(k) = m.next_key::<Str>()? {
             if k.0 == "lines" {
-                m.next_value_seed(Lines {
-                    slot: &mut *self.slot,
-                    malformed: &mut *self.malformed,
-                })?;
+                m.next_value_seed(Lines { slot: &mut *self.slot, malformed: &mut *self.malformed })?;
             } else {
                 m.next_value::<IgnoredAny>()?;
             }

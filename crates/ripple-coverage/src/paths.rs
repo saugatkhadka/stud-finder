@@ -1,6 +1,7 @@
 //! Mapping report paths (absolute, relative to a CI checkout, relative to a
 //! JS package) onto repo-relative paths. See the crate docs for the rule.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -11,16 +12,8 @@ pub(crate) fn normalize(raw: &str) -> (bool, String) {
     let s = raw.trim();
     let s = s.strip_prefix("file://").unwrap_or(s);
     let b = s.as_bytes();
-    let abs = s.starts_with('/')
-        || s.starts_with('\\')
-        || (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic());
-    let simple = !s.contains('\\')
-        && !s.contains("//")
-        && !s.contains("./")
-        && !s.ends_with('/')
-        && !s.ends_with("/.")
-        && s != "."
-        && s != "..";
+    let abs = s.starts_with('/') || s.starts_with('\\') || (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic());
+    let simple = !s.contains('\\') && !s.contains("//") && !s.contains("./") && !s.ends_with('/') && !s.ends_with("/.") && s != "." && s != "..";
     if simple {
         return (abs, s.strip_prefix('/').unwrap_or(s).to_string());
     }
@@ -57,10 +50,7 @@ fn strip_components<'a>(p: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// Number of equal trailing `/`-components.
 fn common_suffix(a: &str, b: &str) -> usize {
-    a.rsplit('/')
-        .zip(b.rsplit('/'))
-        .take_while(|(x, y)| x == y)
-        .count()
+    a.rsplit('/').zip(b.rsplit('/')).take_while(|(x, y)| x == y).count()
 }
 
 /// Byte index where the last `n` components of `p` start (0 = all of it).
@@ -96,22 +86,16 @@ enum Suffix<'k> {
 
 pub(crate) struct Mapper<'k> {
     known: HashSet<&'k str>,
-    by_name: HashMap<&'k str, Vec<&'k str>>,
+    /// File name -> known files with it. Built on first use (only relative
+    /// report paths need it).
+    by_name: OnceCell<HashMap<&'k str, Vec<&'k str>>>,
     /// Normalized repo root (as given, and canonicalized), without leading `/`.
     roots: Vec<String>,
 }
 
 impl<'k> Mapper<'k> {
     pub(crate) fn new(root: &Path, known_files: impl IntoIterator<Item = &'k str>) -> Self {
-        let known: HashSet<&'k str> = known_files.into_iter().collect();
-        let mut by_name: HashMap<&'k str, Vec<&'k str>> = HashMap::with_capacity(known.len());
-        for &f in &known {
-            let name = f.rsplit('/').next().unwrap_or(f);
-            by_name.entry(name).or_default().push(f);
-        }
-        for v in by_name.values_mut() {
-            v.sort_unstable();
-        }
+        let known: HashSet<&'k str> = known_files.into_iter().filter(|f| !f.is_empty()).collect();
         let mut roots = vec![normalize(&root.to_string_lossy()).1];
         if let Ok(c) = root.canonicalize() {
             let c = normalize(&c.to_string_lossy()).1;
@@ -120,11 +104,17 @@ impl<'k> Mapper<'k> {
             }
         }
         roots.retain(|r| !r.is_empty());
-        Self {
-            known,
-            by_name,
-            roots,
-        }
+        Self { known, by_name: OnceCell::new(), roots }
+    }
+
+    fn by_name(&self) -> &HashMap<&'k str, Vec<&'k str>> {
+        self.by_name.get_or_init(|| {
+            let mut m: HashMap<&'k str, Vec<&'k str>> = HashMap::with_capacity(self.known.len());
+            for &f in &self.known {
+                m.entry(f.rsplit('/').next().unwrap_or(f)).or_default().push(f);
+            }
+            m
+        })
     }
 
     /// No known files were given: accept any path under the root.
@@ -136,30 +126,45 @@ impl<'k> Mapper<'k> {
         !p.is_empty() && (self.trusting() || self.known.contains(p))
     }
 
-    fn suffix(&self, norm: &str) -> Suffix<'k> {
-        let name = norm.rsplit('/').next().unwrap_or(norm);
-        let Some(cands) = self.by_name.get(name) else {
-            return Suffix::None;
-        };
-        let report_len = norm.split('/').count();
-        let (mut best, mut best_n, mut tie) = (None, 0, false);
-        for &c in cands {
-            let n = common_suffix(norm, c);
-            // One path must be entirely a suffix of the other: `/ci/app/x.rb`
-            // fits `app/x.rb` but not `ee/app/x.rb`.
-            if n != report_len && n != c.split('/').count() {
-                continue;
+    fn known_ref(&self, p: &str) -> Option<&'k str> {
+        self.known.get(p).copied()
+    }
+
+    /// Best suffix match. One path must be entirely a component-wise suffix
+    /// of the other: `/ci/app/x.rb` fits `app/x.rb` but not `ee/app/x.rb`.
+    /// The longest match wins; equally long ones are ambiguous.
+    fn suffix(&self, norm: &str, abs: bool) -> Suffix<'k> {
+        // A relative report path that is the tail of longer repo paths
+        // (`src/x.js` of `packages/web/src/x.js`): those are longer than any
+        // repo path that is a tail of the report path.
+        if !abs {
+            let name = norm.rsplit('/').next().unwrap_or(norm);
+            let report_len = norm.split('/').count();
+            let mut found = None;
+            for &c in self.by_name().get(name).map(Vec::as_slice).unwrap_or(&[]) {
+                if c.len() > norm.len() && common_suffix(norm, c) == report_len {
+                    if found.is_some() {
+                        return Suffix::Ambiguous;
+                    }
+                    found = Some(c);
+                }
             }
-            if n > best_n {
-                (best, best_n, tie) = (Some(c), n, false);
-            } else if n == best_n {
-                tie = true;
+            if let Some(c) = found {
+                return Suffix::Unique(c, report_len);
             }
         }
-        match best {
-            None => Suffix::None,
-            Some(_) if tie => Suffix::Ambiguous,
-            Some(c) => Suffix::Unique(c, best_n),
+        // The longest repo path that is a tail of the report path: drop
+        // leading components until one is known (unique by construction).
+        let mut i = 0;
+        loop {
+            let tail = &norm[i..];
+            if let Some(k) = self.known_ref(tail) {
+                return Suffix::Unique(k, tail.split('/').count());
+            }
+            match tail.find('/') {
+                Some(j) => i += j + 1,
+                None => return Suffix::None,
+            }
         }
     }
 
@@ -173,15 +178,14 @@ impl<'k> Mapper<'k> {
         }
         let mut pending = Vec::with_capacity(raws.len());
         let mut votes: HashMap<(String, String), u32> = HashMap::new();
+        // The rewrite of the previous unique match, tried first: one lookup
+        // per entry for the common case of one foreign checkout root.
+        let mut last: Option<(String, String)> = None;
         for raw in raws {
             let (abs, norm) = normalize(raw);
             if abs {
                 if let Some(rel) = self.roots.iter().find_map(|r| strip_components(&norm, r)) {
-                    let o = if self.is_known(rel) {
-                        Outcome::Mapped(rel.to_string())
-                    } else {
-                        Outcome::Unmapped
-                    };
+                    let o = if self.is_known(rel) { Outcome::Mapped(rel.to_string()) } else { Outcome::Unmapped };
                     pending.push(Pending::Done(o));
                     continue;
                 }
@@ -200,25 +204,31 @@ impl<'k> Mapper<'k> {
                 pending.push(Pending::Done(Outcome::Unmapped));
                 continue;
             }
-            let s = self.suffix(&norm);
+            if let Some(ab) = &last
+                && let Some(rest) = strip_components(&norm, &ab.0)
+                && let Some(k) = self.known_ref(&join(&ab.1, rest))
+            {
+                // Same as `suffix` would find unless a longer match exists,
+                // which the final pass (rule first) would override anyway.
+                *votes.entry(ab.clone()).or_default() += 1;
+                let n = rest.split('/').count();
+                pending.push(Pending::Later(norm, Suffix::Unique(k, n)));
+                continue;
+            }
+            let s = self.suffix(&norm, abs);
             if let Suffix::Unique(c, n) = s {
                 // Learn "strip A, prepend B" from unique matches: `A` is the
                 // other checkout's root, `B` a package directory.
                 let a = norm[..tail_start(&norm, n)].trim_end_matches('/');
                 let b = c[..tail_start(c, n)].trim_end_matches('/');
-                *votes.entry((a.to_string(), b.to_string())).or_default() += 1;
+                let ab = (a.to_string(), b.to_string());
+                *votes.entry(ab.clone()).or_default() += 1;
+                last = Some(ab);
             }
             pending.push(Pending::Later(norm, s));
         }
-        // The most frequent transform; ties go to the longest stripped prefix.
-        let rule = votes
-            .into_iter()
-            .max_by(|x, y| {
-                x.1.cmp(&y.1)
-                    .then(x.0.0.len().cmp(&y.0.0.len()))
-                    .then(y.0.cmp(&x.0))
-            })
-            .map(|(k, _)| k);
+        // The most frequent rewrite; ties go to the longest stripped prefix.
+        let rule = votes.into_iter().max_by(|x, y| x.1.cmp(&y.1).then(x.0.0.len().cmp(&y.0.0.len())).then(y.0.cmp(&x.0))).map(|(k, _)| k);
         pending
             .into_iter()
             .map(|p| match p {
@@ -256,10 +266,7 @@ mod tests {
     fn normalize_forms() {
         assert_eq!(normalize("/a/b/c.rb"), (true, "a/b/c.rb".into()));
         assert_eq!(normalize("./a//b/../c.rb"), (false, "a/c.rb".into()));
-        assert_eq!(
-            normalize("C:\\ci\\app\\x.rb"),
-            (true, "C:/ci/app/x.rb".into())
-        );
+        assert_eq!(normalize("C:\\ci\\app\\x.rb"), (true, "C:/ci/app/x.rb".into()));
         assert_eq!(normalize("file:///w/app/x.rb"), (true, "w/app/x.rb".into()));
         assert_eq!(normalize("src/x.js"), (false, "src/x.js".into()));
     }
