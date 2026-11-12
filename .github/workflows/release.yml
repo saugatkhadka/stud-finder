@@ -1,0 +1,78 @@
+name: release
+
+# Builds ripple for macOS and Linux and attaches the binaries to a GitHub
+# release when a tag like ripple-v0.1.0 is pushed.
+on:
+  push:
+    tags: ["ripple-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach binaries to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p ripple-cli --bin ripple --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip ripple || true
+          tar -czf "$GITHUB_WORKSPACE/ripple-${{ matrix.target }}.tar.gz" ripple
+          cd "$GITHUB_WORKSPACE"
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "ripple-${{ matrix.target }}.tar.gz" > "ripple-${{ matrix.target }}.tar.gz.sha256"
+          else
+            sha256sum "ripple-${{ matrix.target }}.tar.gz" > "ripple-${{ matrix.target }}.tar.gz.sha256"
+          fi
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: target/${{ matrix.target }}/release/ripple --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ripple-${{ matrix.target }}
+          path: |
+            ripple-${{ matrix.target }}.tar.gz
+            ripple-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber ripple-*.tar.gz ripple-*.tar.gz.sha256
