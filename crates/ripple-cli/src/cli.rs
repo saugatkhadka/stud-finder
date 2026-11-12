@@ -172,9 +172,13 @@ struct ImpactArgs {
     /// List at most N impacted files / tests (counts stay complete).
     #[arg(long)]
     limit: Option<usize>,
-    /// Ask the daemon to wait until every file event before this command is indexed.
-    #[arg(long)]
+    /// Wait until every file change made before this command is indexed
+    /// (default: wait at most `daemon.max_wait_ms`, then answer marked stale).
+    #[arg(long, conflicts_with = "no_wait")]
     sync: bool,
+    /// Answer from the current index at once (may be marked stale).
+    #[arg(long)]
+    no_wait: bool,
     /// Only this method / controller action of the one file given changed
     /// (repeatable): "what depends on Purchase#refund!".
     #[arg(long = "scope", value_name = "NAME")]
@@ -387,6 +391,7 @@ fn impact(root: &Path, a: ImpactArgs, mut backend: Backend) -> Result<u8> {
     p.color = a.format == Format::Text && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     p.limit = a.limit;
     p.sync = a.sync;
+    p.no_wait = a.no_wait;
     let reply = call_impact(root, &mut backend, &mut p)?;
     let out = result_of(reply)?;
     match a.format {

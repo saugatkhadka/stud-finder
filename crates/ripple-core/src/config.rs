@@ -263,11 +263,15 @@ pub struct DaemonConfig {
     /// The daemon exits after this many minutes without a request (the next
     /// command starts a new one). 0 = never.
     pub idle_timeout_minutes: u64,
+    /// How long a query waits for pending changes to be indexed before it
+    /// answers from the current index, marked `stale` with the pending paths.
+    /// `--sync` waits without limit, `--no-wait` not at all.
+    pub max_wait_ms: u64,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        Self { idle_timeout_minutes: 30 }
+        Self { idle_timeout_minutes: 30, max_wait_ms: DEFAULT_MAX_WAIT_MS }
     }
 }
 
@@ -299,3 +303,6 @@ impl Default for HistoryConfig {
         Self { enabled: true, max_commits: 20000, max_age_days: None, max_files_per_commit: 30, min_together: 3, min_confidence: 0.3, min_lift: 2.0, limit: 5 }
     }
 }
+
+/// Default of [`DaemonConfig::max_wait_ms`].
+pub const DEFAULT_MAX_WAIT_MS: u64 = 150;

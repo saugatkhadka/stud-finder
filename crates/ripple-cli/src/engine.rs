@@ -187,6 +187,11 @@ impl Engine {
         &self.root
     }
 
+    /// The method-mention facts of the last pass, if an extractor reports them.
+    pub fn mention_table(&self) -> Option<Arc<ripple_core::mentions::MentionTable>> {
+        self.outputs.iter().find_map(|o| o.facts.mentions.clone())
+    }
+
     /// Re-lists files, reloads the config and rebuilds everything.
     pub fn full_build(&mut self) -> Result<Arc<Snapshot>> {
         let start = Instant::now();
