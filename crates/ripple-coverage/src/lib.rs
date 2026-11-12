@@ -544,9 +544,20 @@ fn project_dir(root: &Path, report: &Path) -> String {
 
 const DEFAULT_NAMES: [&str; 2] = [".resultset.json", "lcov.info"];
 
+/// Where reports are looked for when `coverage.paths` is empty: SimpleCov
+/// and Jest/Vitest write `coverage/` in their project directory.
+pub const AUTO_DIRS: [&str; 9] =
+    ["coverage", "tmp/coverage", "spec/coverage", "test/coverage", "frontend/coverage", "client/coverage", "web/coverage", "app/javascript/coverage", "app/frontend/coverage"];
+
+/// Report files `cfg` points at (auto-detected in [`AUTO_DIRS`] when it
+/// names none), sorted, deduplicated.
+pub fn discover_reports(root: &Path, cfg: &CoverageConfig) -> Vec<PathBuf> {
+    discover(root, cfg)
+}
+
 /// Report files `cfg` points at, sorted, deduplicated.
 fn discover(root: &Path, cfg: &CoverageConfig) -> Vec<PathBuf> {
-    let default = ["coverage".to_string()];
+    let default: Vec<String> = AUTO_DIRS.iter().map(|d| d.to_string()).collect();
     let entries: &[String] = if cfg.paths.is_empty() { &default } else { &cfg.paths };
     let mut out = Vec::new();
     for e in entries {

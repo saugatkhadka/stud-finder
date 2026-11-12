@@ -270,7 +270,11 @@ fn dependents(snap: &Arc<Snapshot>, p: &FileParams, src: &Sources) -> QueryResul
         limit: p.limit,
         ..Default::default()
     };
-    impact_result(snap, &ip, 0, 0, src).map(|(body, _)| body)
+    // A file is not a diff: rules about changed lines simply do not apply,
+    // which is not worth a warning here.
+    let (mut report, _) = impact_report(snap, &ip, 0, 0, src);
+    report.warnings.retain(|w| w.code != "no_line_counts");
+    to_json(&report)
 }
 
 fn neighbours(snap: &Snapshot, p: &FileParams, forward: bool) -> QueryResult {
@@ -589,6 +593,8 @@ pub fn stats(snap: &Snapshot) -> Value {
             "rules": snap.policy.rules().map(|r| r.id.clone()).collect::<Vec<_>>(),
             "areas": snap.policy.areas().iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
         },
+        // `ripple config show`: the configuration in effect in this index.
+        "effective": crate::effective::show(snap),
     })
 }
 

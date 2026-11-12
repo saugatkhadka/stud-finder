@@ -453,7 +453,9 @@ pub struct CoverageConfig {
     /// Report files or directories, repo-relative. A `*` wildcard is allowed
     /// in the last component (`coverage/lcov/*.lcov`). A directory is
     /// searched for the default report names. Empty = auto-detect in
-    /// `coverage/`: `.resultset.json` (SimpleCov), `lcov.info`,
+    /// `coverage/`, `tmp/coverage/`, `spec/coverage/`, `test/coverage/`,
+    /// `frontend/`, `client/`, `web/`, `app/javascript/` and
+    /// `app/frontend/` `coverage/`: `.resultset.json` (SimpleCov), `lcov.info`,
     /// `lcov/*.lcov`, `coverage-final.json` (Istanbul; only when there is no
     /// `lcov.info` next to it).
     pub paths: Vec<String>,

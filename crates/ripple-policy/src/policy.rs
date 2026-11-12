@@ -19,6 +19,7 @@ pub struct CompiledArea {
     pub description: Option<String>,
     /// One of the built-in areas (see [`crate::defaults::default_areas`]).
     pub builtin: bool,
+    pub paths: Vec<String>,
 }
 
 /// A `touches` / `reaches` list split into area references and globs.
@@ -132,7 +133,14 @@ impl Policy {
         let area_names: Vec<String> = merged.keys().cloned().collect();
         let areas: Vec<CompiledArea> = merged
             .iter()
-            .map(|(name, (a, builtin))| CompiledArea { name: name.clone(), tier: a.tier, owners: a.owners.clone(), description: a.description.clone(), builtin: *builtin })
+            .map(|(name, (a, builtin))| CompiledArea {
+                name: name.clone(),
+                tier: a.tier,
+                owners: a.owners.clone(),
+                description: a.description.clone(),
+                builtin: *builtin,
+                paths: a.paths.clone(),
+            })
             .collect();
         let area_globs = Patterns::build(
             merged.iter().enumerate().flat_map(|(ai, (name, (a, builtin)))| {

@@ -7,7 +7,11 @@
 # The rules below turn that "blast radius" into a risk level
 # (low / medium / high / critical) plus required actions.
 #
+# This block is a reference: a full example, independent of the built-in
+# areas and rules (it turns them off under `defaults:`).
+#
 # Check this file with:   ripple config check
+# See what is in effect:  ripple config show
 # Try it on your changes: ripple impact            (working tree vs HEAD)
 #                         ripple impact --base main
 #
@@ -17,6 +21,14 @@
 # everything under it (`app/models/billing`).
 
 version: 1
+
+# The built-in areas and rules apply in addition to this file unless turned
+# off; an area or rule with the same name / id replaces the built-in one.
+defaults:
+  areas: false                    # built-in areas (payments, auth, migrations, api, ...)
+  rules: false                    # built-in default.* rules
+  codeowners: true                # owners from CODEOWNERS join the report
+  disable: []                     # or turn off single built-ins: [complex_file, jobs]
 
 # Never analysed and never reported (in addition to .gitignore).
 # Setting this replaces the defaults (node_modules, vendor, tmp, log, public, coverage, dist, build).
@@ -60,15 +72,16 @@ areas:
 #   - Gemfile.lock
 
 # Test files are listed under "tests that depend on it" and never count toward the blast radius.
-# Setting this replaces the defaults (spec/**, test/**, __tests__, *.test.*, *.spec.*, *_spec.rb, *_test.rb, *.stories.*).
+# Setting this replaces the defaults (RSpec, Minitest, Jest, Vitest, Cypress, Storybook:
+# spec/**, test/**, **/spec/**, **/test/**, __tests__, __mocks__, *.test.*, *.spec.*, *.cy.*,
+# *_spec.rb, *_test.rb, *.stories.*, cypress/**).
 # tests:
 #   - spec/**
 #   - "**/*.test.ts"
 
 # Rules. Every condition under `when` must hold for the rule to fire; the
 # change's risk is the highest risk among fired rules (low if none fired) and
-# the `require` lists are merged. Remove `rules:` entirely to use ripple's
-# built-in defaults (see the README).
+# the `require` lists are merged.
 rules:
   - id: billing-change
     description: Anything touching billing needs a payments engineer
@@ -118,7 +131,8 @@ rules:
 
   - id: wide-blast-radius
     when:
-      impacted_files_over: 200
+      impacted_files_over_percent: 5   # more than 5% of the repository's non-test files...
+      impacted_files_over: 25          # ...and more than 25 files
     risk: medium
 
   - id: big-diff
@@ -158,6 +172,29 @@ rules:
   - id: complex-method
     when:
       max_method_complexity_over: 25   # its most complex method
+      changed_lines_over: 10
+    risk: medium
+
+  # Relative thresholds: rank within this repository's non-test source files,
+  # so the same rule fits any codebase size (`ripple config show` prints the
+  # cut-offs in effect).
+  - id: among-the-most-complex
+    when:
+      complexity_top_percent: 2              # top 2% by file complexity
+      changed_lines_over: 30
+    risk: high
+    require: [human_review]
+
+  - id: among-the-most-complex-methods
+    when:
+      max_method_complexity_top_percent: 2   # top 2% by most complex method
+      changed_lines_over: 10
+    risk: medium
+
+  - id: widely-used
+    when:
+      dependents_top_percent: 1              # top 1% by direct dependents...
+      dependents_over: 10                    # ...and more than 10 of them
       changed_lines_over: 10
     risk: medium
 
@@ -206,6 +243,6 @@ query:
   min_confidence: heuristic       # exact | inferred | heuristic
 
 ci:
-  fail_on: critical               # `ripple check` exits 1 at or above this risk; omit to never fail
+  fail_on: critical               # `ripple check` / `impact --fail-on` default; omit to never fail
   github: true
   max_listed: 50                  # impacted files listed in the markdown report
