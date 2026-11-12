@@ -348,7 +348,7 @@ spec/purchase_spec.txt app/purchase.txt#charge!
 ";
 
 fn scoped_env() -> Env {
-    let cfg = "version: 1\nareas:\n  auth:\n    tier: critical\n    paths: [app/session.txt]\nci:\n  fail_on: critical\n";
+    let cfg = "version: 1\ndefaults: {areas: false}\nareas:\n  auth:\n    tier: critical\n    paths: [app/session.txt]\nci:\n  fail_on: critical\n";
     let files = [
         ("app/purchase.txt", PURCHASE),
         ("app/svc.txt", "s\n"),

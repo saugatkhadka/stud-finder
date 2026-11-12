@@ -132,6 +132,16 @@ pub fn validate(config: &Config, src: Option<&str>) -> Vec<Issue> {
                 issues.push(Issue::new(format!("rules[{i}].when.{key}"), "a percentage from 0 to 100"));
             }
         }
+        for (key, v) in [
+            ("complexity_top_percent", w.complexity_top_percent),
+            ("max_method_complexity_top_percent", w.max_method_complexity_top_percent),
+            ("dependents_top_percent", w.dependents_top_percent),
+            ("impacted_files_over_percent", w.impacted_files_over_percent),
+        ] {
+            if v.is_some_and(|v| !(v > 0.0 && v <= 100.0)) {
+                issues.push(Issue::new(format!("rules[{i}].when.{key}"), "a percentage above 0, at most 100"));
+            }
+        }
         if w.cochange_min_confidence.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
             issues.push(Issue::new(format!("rules[{i}].when.cochange_min_confidence"), "a share from 0 to 1"));
         }
@@ -270,7 +280,7 @@ areas:
 rules:
   - id: one
     risk: high
-    when: { touches: [payments] }
+    when: { touches: [nowhere] }
   - id: one
     risk: low
     when: { within: 2 }
@@ -279,7 +289,7 @@ rules:
         let PolicyError::Invalid { issues, .. } = &e else { panic!("{e}") };
         let text = e.to_string();
         assert!(text.contains("areas.billing.paths[0]") && text.contains("invalid glob"), "{text}");
-        assert!(text.contains("rules[0].when.touches[0]") && text.contains("unknown area `payments`"), "{text}");
+        assert!(text.contains("rules[0].when.touches[0]") && text.contains("unknown area `nowhere`"), "{text}");
         assert!(text.contains("duplicate rule id `one`"), "{text}");
         assert!(text.contains("rules[1].when.within"), "{text}");
         let dup = issues.iter().find(|i| i.message.contains("duplicate")).unwrap();

@@ -9,6 +9,8 @@
 //!   non-test file (depth >= 1, never a changed file) satisfies the same test,
 //!   at depth <= `within` (default `query.max_depth`, 0 = unlimited).
 //! * `impacted_files_over`: impacted non-test files (excluding changed) > N.
+//! * `impacted_files_over_percent: P`: the same count is more than P% of the
+//!   repository's non-test files.
 //! * `changed_files_over`: changed files (after `ignore`) > N.
 //! * `changed_lines_over`: sum of added + deleted lines > N. Never fires when
 //!   no changed file carries line counts (no diff available). Next to a
@@ -36,6 +38,12 @@
 //!     last 90 days of the history window.
 //!   * `complexity_over: N` / `max_method_complexity_over: N`: a candidate's
 //!     file complexity / most complex method is above N.
+//!   * `complexity_top_percent: P` / `max_method_complexity_top_percent: P`
+//!     / `dependents_top_percent: P`: a candidate's complexity / most complex
+//!     method / number of direct dependents ranks in the top P% of the
+//!     repository's non-test source files (ties share a rank; 0 never
+//!     counts). The distributions are computed once per index generation.
+//!   * `dependents_over: N`: a candidate has more than N direct dependents.
 //!   * `coverage_under: P`: a candidate with known coverage is below P%.
 //!     Unknown coverage (the file is in no report) never counts.
 //!   * `changed_lines_coverage_under: P`: the coverable lines a candidate's
@@ -238,7 +246,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
         if !blocked.is_empty() {
             // Built-in metric rules are opportunistic: without history or
             // metrics they stay quiet (the `signals` block says why).
-            if !ctx.changed.is_empty() && !policy.uses_default_rules() {
+            if !ctx.changed.is_empty() && !r.builtin {
                 let what: Vec<String> = blocked
                     .iter()
                     .map(|(name, st)| match &st.reason {
@@ -250,7 +258,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             }
             continue;
         }
-        if r.rule.when.changed_lines_coverage_under.is_some() && !has_lines && !ctx.changed.is_empty() {
+        // Built-in rules are quiet about missing line counts too: without a
+        // diff they simply do not fire.
+        if r.rule.when.changed_lines_coverage_under.is_some() && !has_lines && !ctx.changed.is_empty() && !r.builtin {
             warnings.push(Warning::new(
                 "no_line_counts",
                 format!("rule `{}` uses changed_lines_coverage_under but no diff was provided (use --base or --staged)", r.rule.id),
@@ -263,11 +273,11 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
                 message,
                 description: r.rule.description.clone(),
                 require: r.rule.require.clone(),
-                builtin: policy.uses_default_rules(),
+                builtin: r.builtin,
                 evidence,
             });
         }
-        if r.rule.when.changed_lines_over.is_some() && !has_lines && !ctx.changed.is_empty() {
+        if r.rule.when.changed_lines_over.is_some() && !has_lines && !ctx.changed.is_empty() && !r.builtin {
             warnings.push(Warning::new(
                 "no_line_counts",
                 format!("rule `{}` uses changed_lines_over but no diff line counts were provided (use --base or --staged)", r.rule.id),
@@ -281,12 +291,12 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     // `impacted_over_200` > `impacted_over_50`, ...). When a higher rung fired,
     // the lower one says nothing new: keep the top of each ladder only.
     // Risk and `require` above were computed before this, so nothing is lost.
-    if policy.uses_default_rules() {
-        const LADDERS: [&str; 3] = ["default.touches_critical|default.touches_high", "default.impacted_over_", "default.reaches_critical"];
+    {
+        const LADDERS: [&str; 3] = ["default.touches_critical|default.touches_high|default.touches_medium", "default.impacted_over_", "default.reaches_critical"];
         let ladder = |id: &str| LADDERS.iter().position(|l| l.split('|').any(|p| id.starts_with(p)));
         let mut seen = BTreeSet::new();
         // `reasons` is sorted highest risk first.
-        reasons.retain(|r| match ladder(&r.rule) {
+        reasons.retain(|r| match ladder(&r.rule).filter(|_| r.builtin) {
             Some(l) => seen.insert(l),
             None => true,
         });
@@ -740,7 +750,14 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     }
     let mut areas_reached: Vec<AreaReached> = areas.into_values().collect();
     areas_reached.sort_by(|a, b| (std::cmp::Reverse(a.tier), &a.area).cmp(&(std::cmp::Reverse(b.tier), &b.area)));
-    let owners: Vec<String> = areas_reached.iter().flat_map(|a| a.owners.iter().cloned()).collect::<BTreeSet<_>>().into_iter().collect();
+    // Area owners, plus the CODEOWNERS owners of the changed files.
+    let owners: Vec<String> = areas_reached
+        .iter()
+        .flat_map(|a| a.owners.iter().cloned())
+        .chain(ctx.changed.iter().flat_map(|c| policy.owners_of(&c.file.path).iter().cloned()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     warnings.sort_by(|a, b| (&a.code, &a.file, &a.message).cmp(&(&b.code, &b.file, &b.message)));
     warnings.dedup();
@@ -748,14 +765,14 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
         warnings = group_capped(warnings, |w| w.code.clone(), |code, n| Warning::new(&code, format!("+{n} more files like this (--all)")));
     }
 
-    let configured = !policy.uses_default_rules() || !policy.areas().is_empty();
-    let show_policy = opts.policy || (configured && !reasons.is_empty());
+    // The policy section (risk, required actions) is always there: the
+    // built-in rules and areas make it meaningful without a ripple.yml.
     if !full {
         for r in &mut reasons {
             r.evidence.impacted.truncate(budget::EVIDENCE);
         }
     }
-    let policy_result = show_policy.then(|| PolicyResult { risk, reasons, require, owners, areas: areas_reached });
+    let policy_result = Some(PolicyResult { risk, reasons, require, owners, areas: areas_reached });
 
     let mut report = Report {
         schema_version: SCHEMA_VERSION,
@@ -935,7 +952,11 @@ fn tier_word(r: Risk) -> &'static str {
 pub(crate) fn per_file_group(w: &ripple_core::config::When) -> (bool, bool, bool) {
     let metric = w.churn_over.is_some()
         || w.complexity_over.is_some()
+        || w.complexity_top_percent.is_some()
         || w.max_method_complexity_over.is_some()
+        || w.max_method_complexity_top_percent.is_some()
+        || w.dependents_top_percent.is_some()
+        || w.dependents_over.is_some()
         || w.coverage_under.is_some()
         || w.changed_lines_coverage_under.is_some()
         || w.uncovered == Some(true)
@@ -943,6 +964,11 @@ pub(crate) fn per_file_group(w: &ripple_core::config::When) -> (bool, bool, bool
     let untested = w.untested == Some(true) && (metric || w.changed_lines_over.is_some());
     let lines = w.changed_lines_over.is_some() && (metric || w.untested == Some(true));
     (metric, untested, lines)
+}
+
+/// " (at least N)" for a top-percent condition's cut-off.
+fn at_least(t: Option<u32>) -> String {
+    t.map(|t| format!(" (at least {t})")).unwrap_or_default()
 }
 
 fn list(items: &[String], max: usize) -> String {
@@ -989,7 +1015,11 @@ impl Ctx<'_> {
             }
         };
         need(w.churn_over.is_some(), "churn", &st.churn);
-        need(w.complexity_over.is_some() || w.max_method_complexity_over.is_some(), "complexity", &st.complexity);
+        need(
+            w.complexity_over.is_some() || w.max_method_complexity_over.is_some() || w.complexity_top_percent.is_some() || w.max_method_complexity_top_percent.is_some(),
+            "complexity",
+            &st.complexity,
+        );
         need(w.coverage_under.is_some() || w.changed_lines_coverage_under.is_some() || w.uncovered.is_some(), "coverage", &st.coverage);
         need(w.hotspot.is_some(), "hotspot", &st.hotspot);
         need(w.missing_cochange.is_some(), "cochange", &st.cochange);
@@ -1047,6 +1077,37 @@ impl Ctx<'_> {
                 fm(c).filter(|m| m.methods > 0 && u32::from(m.max_method) > n).map(|m| (f64::from(m.max_method), format!("a method of complexity {}", m.max_method)))
             });
             conds.push((format!("a method more complex than {n}"), Some("max_method_complexity"), t));
+        }
+        if let Some(p) = w.complexity_top_percent {
+            let d = &self.index.complexity;
+            let t: Test = Box::new(move |c| {
+                fm(c).filter(|m| d.in_top(m.complexity, p)).map(|m| (f64::from(m.complexity), format!("complexity {}, #{} of {}", m.complexity, d.rank(m.complexity), d.len())))
+            });
+            conds.push((format!("complexity in the top {}% of the repository{}", crate::signals::fmt_pct(p), at_least(d.threshold(p))), Some("complexity"), t));
+        }
+        if let Some(p) = w.max_method_complexity_top_percent {
+            let d = &self.index.max_method;
+            let t: Test = Box::new(move |c| {
+                fm(c).filter(|m| d.in_top(u32::from(m.max_method), p)).map(|m| (f64::from(m.max_method), format!("a method of complexity {}, #{} of {}", m.max_method, d.rank(u32::from(m.max_method)), d.len())))
+            });
+            conds.push((format!("a method in the top {}% by complexity{}", crate::signals::fmt_pct(p), at_least(d.threshold(p))), Some("max_method_complexity"), t));
+        }
+        if let Some(n) = w.dependents_over {
+            let g = self.graph;
+            let t: Test = Box::new(move |c| {
+                let d = g.fan_in(c.node?) as u32;
+                (d > n).then(|| (f64::from(d), format!("{d} dependents")))
+            });
+            conds.push((format!("more than {n} direct dependents"), Some("dependents"), t));
+        }
+        if let Some(p) = w.dependents_top_percent {
+            let d = &self.index.dependents;
+            let g = self.graph;
+            let t: Test = Box::new(move |c| {
+                let n = g.fan_in(c.node?) as u32;
+                d.in_top(n, p).then(|| (f64::from(n), format!("{n} dependents, #{} of {}", d.rank(n), d.len())))
+            });
+            conds.push((format!("dependents in the top {}% of the repository{}", crate::signals::fmt_pct(p), at_least(d.threshold(p))), Some("dependents"), t));
         }
         if let Some(pct) = w.coverage_under {
             let t: Test = Box::new(move |c| {
@@ -1222,7 +1283,7 @@ impl Ctx<'_> {
     }
 
     fn target_desc(&self, entries: &[String]) -> String {
-        let names: Vec<String> = entries.iter().map(|e| if self.policy.config.areas.contains_key(e) { format!("area {e}") } else { format!("`{e}`") }).collect();
+        let names: Vec<String> = entries.iter().map(|e| if self.policy.areas().iter().any(|a| &a.name == e) { format!("area {e}") } else { format!("`{e}`") }).collect();
         names.join(", ")
     }
 
@@ -1370,6 +1431,21 @@ impl Ctx<'_> {
                 return None;
             }
             parts.push(format!("{count} files impacted (more than {n})"));
+            ev.counts.insert("impacted_files".into(), count);
+        }
+        if let Some(pct) = w.impacted_files_over_percent {
+            let reach = &self.reaches[self.reach_idx(conf, self.eff.max_depth)];
+            let count = self.impacted(reach, self.eff.max_depth).count();
+            let base = self.index.non_test_files.max(1);
+            if (count as f64) <= base as f64 * pct / 100.0 {
+                return None;
+            }
+            let share = count as f64 * 100.0 / base as f64;
+            parts.push(format!(
+                "{count} files impacted, {}% of the repository's {base} (more than {}%)",
+                crate::signals::fmt_pct(crate::round1(share)),
+                crate::signals::fmt_pct(pct)
+            ));
             ev.counts.insert("impacted_files".into(), count);
         }
         if let Some(n) = w.changed_files_over {
