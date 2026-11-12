@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+ripple-core = { path = "crates/ripple-core" }
+ripple-ruby = { path = "crates/ripple-ruby" }
+ripple-js = { path = "crates/ripple-js" }
+ripple-boundary = { path = "crates/ripple-boundary" }
+ripple-policy = { path = "crates/ripple-policy" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = false
