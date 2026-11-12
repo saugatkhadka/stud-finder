@@ -188,6 +188,26 @@ pub fn summary(sel: &Selection, commits: &[CommitResult]) -> String {
         );
     }
 
+    // Which changed tests the reference variant misses, by directory.
+    let mut dirs: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for c in commits {
+        for v in c.variants.iter().filter(|v| v.variant == reference) {
+            let Some(t) = &v.tests else { continue };
+            for test in c.tests.iter() {
+                let dir = test.split('/').take(2).collect::<Vec<_>>().join("/");
+                let e = dirs.entry(dir).or_default();
+                e.0 += 1;
+                e.1 += usize::from(t.missed_d3.contains(test));
+            }
+        }
+    }
+    let mut dirs: Vec<(String, (usize, usize))> = dirs.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(&b.0)));
+    let shown: Vec<String> = dirs.iter().filter(|d| d.1.1 > 0).take(6).map(|(d, (n, m))| format!("`{d}` {m}/{n}")).collect();
+    if !shown.is_empty() {
+        let _ = writeln!(s, "\nMissed within 3 hops (`{reference}`), by directory, missed/changed: {}.", shown.join(", "));
+    }
+
     // Buckets.
     let _ = writeln!(s, "\n## Recall by kind of target file (`{reference}`)\n");
     let _ = writeln!(s, "| bucket | cases | dependent ≤3 | either ≤1 | either ≤3 | misses ≤3 |");

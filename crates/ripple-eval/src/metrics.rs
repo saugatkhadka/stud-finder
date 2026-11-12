@@ -64,6 +64,8 @@ pub struct TestsCase {
     /// Test files among the dependents within depth 3 / at any depth.
     pub size_d3: u32,
     pub size_all: u32,
+    /// Changed test files not among the tests reaching the change within depth 3.
+    pub missed_d3: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,7 +176,8 @@ pub fn measure(ctx: &Ctx, truth: &Truth, pred: &dyn Predictor) -> VariantResult 
         let reached = |depth: u32| -> Vec<NodeId> { pred.predict(ctx, targets, depth).dependents.into_iter().map(|(n, _)| n).filter(|&n| index.is_test(n)).collect() };
         let (d3, all) = (reached(3), reached(0));
         let count = |set: &[NodeId]| truth.tests.iter().filter(|t| set.contains(t)).count() as u32;
-        TestsCase { changed: truth.tests.len() as u32, reached_d3: count(&d3), reached_all: count(&all), size_d3: d3.len() as u32, size_all: all.len() as u32 }
+        let missed_d3 = truth.tests.iter().filter(|t| !d3.contains(t)).map(|&t| index.path(t).to_string()).collect();
+        TestsCase { changed: truth.tests.len() as u32, reached_d3: count(&d3), reached_all: count(&all), size_d3: d3.len() as u32, size_all: all.len() as u32, missed_d3 }
     });
 
     VariantResult { variant: pred.name().to_string(), loo, single, tests }
@@ -256,7 +259,7 @@ mod tests {
         let a = r.single.iter().find(|s| s.file == "app/a.rb").unwrap();
         assert_eq!((a.size, a.hits, a.others), ([3, 4, 5], [0, 1, 1], 2));
         // Tests: a_spec and c_spec both reach; a_spec was changed.
-        assert_eq!(r.tests, Some(TestsCase { changed: 1, reached_d3: 1, reached_all: 1, size_d3: 2, size_all: 2 }));
+        assert_eq!(r.tests, Some(TestsCase { changed: 1, reached_d3: 1, reached_all: 1, size_d3: 2, size_all: 2, missed_d3: vec![] }));
     }
 
     #[test]
