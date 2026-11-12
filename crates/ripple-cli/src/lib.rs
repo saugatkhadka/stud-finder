@@ -6,6 +6,8 @@
 pub mod bench;
 pub mod cli;
 pub mod client;
+pub mod doctor;
+pub mod effective;
 pub mod edgefile;
 pub mod engine;
 pub mod files;
@@ -18,3 +20,4 @@ pub mod protocol;
 pub mod query;
 pub mod server;
 pub mod signals;
+pub mod skill;

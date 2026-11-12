@@ -989,13 +989,37 @@ fn print_summary(h: &History, bytes: u64) {
 }
 
 /// `ripple history status`: the daemon's view if one is running, else the sidecar's.
-pub fn cli_status(root: &Path, daemon: Option<&Value>) -> Result<u8> {
+/// With `json`, one JSON object on stdout: the daemon's `history` object,
+/// or `{"daemon": false, "state", "reason", "behind_head", "sidecar", "commits", "files"}`.
+pub fn cli_status(root: &Path, daemon: Option<&Value>, json: bool) -> Result<u8> {
     if let Some(v) = daemon {
-        println!("{}", serde_json::to_string_pretty(v)?);
+        if json {
+            let mut v = v.clone();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("daemon".into(), Value::Bool(true));
+            }
+            println!("{}", serde_json::to_string(&v)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(v)?);
+        }
         return Ok(0);
     }
     let cfg = load_config(root);
     let view = oneshot_view(root, &cfg);
+    if json {
+        let h = view.history.as_ref().filter(|_| matches!(view.state, State::Ready));
+        let v = serde_json::json!({
+            "daemon": false,
+            "state": view.state.name(),
+            "reason": view.state.reason(),
+            "behind_head": view.behind_head,
+            "sidecar": view.sidecar,
+            "commits": h.map(|h| assess(h).commits),
+            "files": h.map(|h| h.file_count()),
+        });
+        println!("{}", serde_json::to_string(&v)?);
+        return Ok(0);
+    }
     match &view.state {
         State::Ready => {
             let h = view.history.as_ref().expect("ready has a history");

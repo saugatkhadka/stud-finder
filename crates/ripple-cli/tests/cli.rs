@@ -292,6 +292,15 @@ fn init_and_config_check() {
     let o = env.run(&["config", "check"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let text = String::from_utf8_lossy(&o.stdout);
+    // The written file is all comments: the built-ins apply, and only those
+    // matching files here are listed.
+    assert!(text.contains("area payments") && text.contains("(built-in)") && !text.contains("matches no files") && !text.contains("area jobs"), "{text}");
+    assert!(text.contains("default.touches_high"), "{text}");
+    let o = env.run(&["init", "--stdout"]);
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("#   payments:"));
+    env.repo.write("ripple.yml", "version: 1\nareas:\n  billing: {tier: high, paths: [nowhere/**]}\n");
+    let text = String::from_utf8_lossy(&env.run(&["config", "check"]).stdout).to_string();
     assert!(text.contains("area billing") && text.contains("matches no files"), "{text}");
     env.repo.write("ripple.yml", "version: 1\nrules:\n  - id: x\n    when: { touches: [nope] }\n    risk: high\n");
     let o = env.run(&["config", "check"]);
