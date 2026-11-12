@@ -337,6 +337,20 @@ fn resolve_all(pool: &rayon::ThreadPool, resolver: &ModuleResolver, parsed: &BTr
     pool.install(|| entries.par_iter().map(|(f, p)| ((*f).clone(), edges::file_result(resolver, f, p))).collect::<Vec<_>>()).into_iter().collect()
 }
 
+/// Debugging aid: `(start line, complexity)` of every function in `src`
+/// (parsed as `rel`), sorted, as counted for [`ripple_core::metrics`].
+#[doc(hidden)]
+pub fn function_complexities(rel: &str, src: &str) -> Vec<(u32, u32)> {
+    let cfg = CallSiteConfig { callees: Vec::new(), prefixes: Vec::new() };
+    let mut out = parse::Collected { trace: Some(Vec::new()), ..parse::Collected::default() };
+    if let Some(st) = parse::source_type_for(rel) {
+        parse::parse_block(src, st, 0, rel, &cfg, &mut out);
+    }
+    let mut v = out.trace.unwrap_or_default();
+    v.sort_unstable();
+    v
+}
+
 #[cfg(test)]
 mod metrics_tests {
     use super::*;

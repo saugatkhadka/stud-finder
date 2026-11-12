@@ -16,14 +16,19 @@
 //!   each `in` of a `case ... in`; a `begin`/`def`/block body with `rescue`
 //!   clauses counts **once** however many clauses it has, and `x rescue y`
 //!   once; `&&`, `||`, `and`, `or`; `||=` and `&&=` (any target); every `&.`
-//!   call; a block (`do`/`{}` or `&blk`/`&:sym`) passed to a known
+//!   call, except a repeated `&.` on a local variable already `&.`-called
+//!   in the same method and not reassigned since (RuboCop's repeated-csend
+//!   discount); a block (`do`/`{}` or `&blk`/`&:sym`) passed to a known
 //!   iterating method (`each`, `map`, `select`, `each_with_object`, ... the
-//!   RuboCop list in [`RUBY_ITERATING_METHODS`]). Not counted: `case`
-//!   itself, `else`, `ensure`, `loop`, `retry`/`next`/`break`, pattern guards.
-//!   Differences from RuboCop: no discount for repeated `&.` on the same
-//!   local variable; a `def` nested in another `def` and the body of a
-//!   `define_method` block count towards the enclosing method (or top level)
-//!   instead of being their own method.
+//!   RuboCop list in [`RUBY_ITERATING_METHODS`]), unless the block uses
+//!   numbered parameters or `it` (RuboCop does not count those); `x&.map { }`
+//!   counts twice. `while`/`until` in the `begin ... end while` form are not
+//!   counted (RuboCop's `while_post`).
+//!   Not counted: `case` itself, `else`, `ensure`, `loop`,
+//!   `retry`/`next`/`break`, pattern guards. Differences from RuboCop: a
+//!   `def` nested in another `def` and the body of a `define_method` block
+//!   count towards the enclosing method (or top level) instead of being
+//!   their own method; RuboCop does not score code outside methods at all.
 //! - JS/TS (aimed at ESLint `complexity`, default "classic" variant): `if`
 //!   (each `else if` is another `if`), `?:`, each `case` with a test (not
 //!   `default`), `for`, `for...in`, `for...of`, `while`, `do...while`,
@@ -95,20 +100,20 @@ pub fn path_hash(path: &str) -> u64 {
     h
 }
 
-/// Methods RuboCop treats as iterating (`Metrics::Utils::IteratingBlock`):
-/// a block or block-pass given to one is a decision. Sorted.
+/// Methods RuboCop treats as iterating (`Metrics::Utils::IteratingBlock`,
+/// RuboCop 1.88, verbatim including its `d_permutation`): a block or
+/// block-pass given to one is a decision. Sorted.
 pub const RUBY_ITERATING_METHODS: &[&str] = &[
     "all?", "any?", "bsearch", "bsearch_index", "chain", "chunk", "chunk_while", "collect", "collect!",
-    "collect_concat", "combination", "count", "cycle", "delete_if", "detect", "drop", "drop_while", "each",
-    "each_cons", "each_entry", "each_index", "each_key", "each_pair", "each_slice", "each_value",
-    "each_with_index", "each_with_object", "entries", "fetch", "fetch_values", "filter", "filter_map", "find",
-    "find_all", "find_index", "first", "flat_map", "grep", "grep_v", "group_by", "has_key?", "inject",
-    "keep_if", "lazy", "map", "map!", "max", "max_by", "merge", "merge!", "min", "min_by", "minmax",
+    "collect_concat", "combination", "count", "cycle", "d_permutation", "delete_if", "detect", "drop",
+    "drop_while", "each", "each_cons", "each_entry", "each_index", "each_key", "each_pair", "each_slice",
+    "each_value", "each_with_index", "each_with_object", "entries", "fetch", "fetch_values", "filter",
+    "filter_map", "find", "find_all", "find_index", "flat_map", "grep", "grep_v", "group_by", "has_key?",
+    "inject", "keep_if", "lazy", "map", "map!", "max", "max_by", "merge", "merge!", "min", "min_by", "minmax",
     "minmax_by", "none?", "one?", "partition", "permutation", "product", "reduce", "reject", "reject!",
-    "repeat", "repeated_combination", "repeated_permutation", "reverse_each", "select", "select!",
-    "slice_after", "slice_before", "slice_when", "sort", "sort!", "sort_by", "sort_by!", "sum", "take",
-    "take_while", "tally", "to_h", "transform_keys", "transform_keys!", "transform_values",
-    "transform_values!", "uniq", "with_index", "with_object", "zip",
+    "repeat", "repeated_combination", "reverse_each", "select", "select!", "slice_after", "slice_before",
+    "slice_when", "sort", "sort!", "sort_by", "sum", "take", "take_while", "tally", "to_h", "transform_keys",
+    "transform_keys!", "transform_values", "transform_values!", "uniq", "with_index", "with_object", "zip",
 ];
 
 /// Is `name` in [`RUBY_ITERATING_METHODS`]?

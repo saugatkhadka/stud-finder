@@ -58,6 +58,8 @@ pub struct Collected {
     pub complexity: Counter,
     /// Code lines of the parsed blocks (non-blank lines if a block's parse failed).
     pub lines: u32,
+    /// When `Some`, every function's `(start line, complexity)` (debugging).
+    pub trace: Option<Vec<(u32, u32)>>,
 }
 
 /// The oxc source type for a path, or `None` for extensions we do not parse.
@@ -97,6 +99,7 @@ pub fn parse_block(src: &str, source_type: SourceType, base_line: u32, file: &st
         data_verbs: HashMap::new(),
         scratch: String::new(),
         cx: Counter::default(),
+        trace: out.trace.take(),
     };
     walker.visit_program(&ret.program);
     let unclassified = walker.finish();
@@ -104,6 +107,7 @@ pub fn parse_block(src: &str, source_type: SourceType, base_line: u32, file: &st
     out.calls.extend(walker.sites.out);
     out.unclassified.extend(unclassified);
     out.complexity.absorb(&walker.cx);
+    out.trace = walker.trace.take();
     error
 }
 
@@ -124,6 +128,7 @@ struct Walker<'c, 'a> {
     data_verbs: HashMap<&'a str, Option<&'static str>>,
     scratch: String,
     cx: Counter,
+    trace: Option<Vec<(u32, u32)>>,
 }
 
 impl<'a> Walker<'_, 'a> {
@@ -202,6 +207,12 @@ impl<'a> Walker<'_, 'a> {
             CallUse::Compare => Some(Frame::Compare),
             CallUse::PassThrough => None,
             CallUse::Unknown => Some(Frame::Arg(callee.span())),
+        }
+    }
+
+    fn traced(&mut self, offset: u32, complexity: u32) {
+        if let Some(t) = &mut self.trace {
+            t.push((self.lines.line(offset), complexity));
         }
     }
 
@@ -596,7 +607,8 @@ impl<'a> Visit<'a> for Walker<'_, 'a> {
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
         self.cx.enter();
         self.with(Some(Frame::Func), |w| walk::walk_function(w, it, flags));
-        self.cx.leave();
+        let c = self.cx.leave();
+        self.traced(it.span.start, c);
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
@@ -605,7 +617,8 @@ impl<'a> Visit<'a> for Walker<'_, 'a> {
         self.frames.push(Frame::Func);
         self.with(expression_body.then_some(Frame::Return), |w| walk::walk_arrow_function_expression(w, it));
         self.frames.pop();
-        self.cx.leave();
+        let c = self.cx.leave();
+        self.traced(it.span.start, c);
     }
 
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
