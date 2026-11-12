@@ -439,7 +439,10 @@ impl Engine {
     fn publish(&mut self, start: Instant, mut timings: BTreeMap<String, u64>) -> Arc<Snapshot> {
         let t = Instant::now();
         let edges = self.outputs.iter().chain(&self.link_outputs).flat_map(|o| o.edges.iter()).chain(self.tombstones.values().flatten());
-        let graph = Graph::build(edges, self.ws.files.iter().map(String::as_str));
+        let mut graph = Graph::build(edges, self.ws.files.iter().map(String::as_str));
+        if let Some(m) = self.outputs.iter().find_map(|o| o.facts.mentions.as_ref()) {
+            graph.set_mentions(m);
+        }
         timings.insert("graph_us".into(), us(t));
         let t = Instant::now();
         let index = PolicyIndex::build(&self.policy, &graph);
