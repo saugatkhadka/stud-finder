@@ -268,7 +268,24 @@ impl Sim {
             let s = self.read(&f);
             let lines: Vec<&str> = s.lines().collect();
             let d = defs(&lines);
-            let (text, what) = match (d.is_empty(), self.rng.below(3)) {
+            let (text, what) = match (d.is_empty(), self.rng.below(4)) {
+                // Repeat a constant the file already mentions (the
+                // reference-only fast path when the name set is unchanged).
+                (false, 3) => {
+                    let (at, name, indent, end) = d[self.rng.below(d.len())].clone();
+                    let known: Vec<String> = s
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                        .filter(|w| w.starts_with(|c: char| c.is_ascii_uppercase()) && !w.ends_with(':') && !w.contains(":::"))
+                        .map(String::from)
+                        .collect();
+                    if end == at || known.is_empty() {
+                        continue;
+                    }
+                    let k = known[self.rng.below(known.len())].clone();
+                    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                    out.insert(at + 1, format!("{}{k}", " ".repeat(indent + 2)));
+                    (out.join("\n") + "\n", format!("known reference {k} in {name}"))
+                }
                 (false, 0 | 1) => {
                     let (at, name, indent, end) = d[self.rng.below(d.len())].clone();
                     if end == at {

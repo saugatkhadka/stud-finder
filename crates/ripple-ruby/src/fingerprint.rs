@@ -31,6 +31,13 @@
 //! Everything else in a file entry (constant reference *sites*, Rails facts,
 //! template facts, method facts, warnings) only feeds that file's own
 //! output, which is recomputed for every changed file anyway.
+//!
+//! [`of`] also returns a second hash, of the definitions part (everything
+//! above but the constant references) and the *set* of distinct constant
+//! reference names. Two versions with equal second hashes differ at most in
+//! how many plain references of each name there are and where (superclasses
+//! and mixins are part of the definitions); see the crate docs for why that
+//! is enough to skip Rubydex too.
 
 use crate::analyse::FileEntry;
 use rubydex::indexing::local_graph::LocalGraph;
@@ -40,16 +47,25 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::discriminant;
 
-pub fn of(lg: Option<&LocalGraph>, entry: &FileEntry) -> u64 {
+/// (full fingerprint, definitions + reference name set).
+pub fn of(lg: Option<&LocalGraph>, entry: &FileEntry) -> (u64, u64) {
     let mut h = DefaultHasher::new();
     entry.kind.hash(&mut h);
     entry.unreadable.hash(&mut h);
     entry.helper_defs.hash(&mut h);
     lg.is_some().hash(&mut h);
-    if let Some(lg) = lg {
-        graph(lg, &mut h);
-    }
-    h.finish()
+    let Some(lg) = lg else {
+        let f = h.finish();
+        return (f, f);
+    };
+    definitions(lg, &mut h);
+    let mut names_h = h.clone();
+    let mut names: Vec<u64> = lg.constant_references().values().map(|r| r.name_id().get()).collect();
+    names.sort_unstable();
+    names.dedup();
+    names.hash(&mut names_h);
+    references(lg, &mut h);
+    (h.finish(), names_h.finish())
 }
 
 /// Is `def` local to its class body (see the module docs)? `nesting` is
@@ -74,7 +90,7 @@ fn local(def: &Definition, defs: &HashMap<DefinitionId, &Definition>) -> bool {
     }
 }
 
-fn graph<'g>(lg: &'g LocalGraph, h: &mut DefaultHasher) {
+fn definitions<'g>(lg: &'g LocalGraph, h: &mut DefaultHasher) {
     let all = lg.definitions();
     let order = lg.document().definitions();
     let by_id: HashMap<DefinitionId, &'g Definition> = order.iter().filter_map(|id| all.get(id).map(|d| (*id, d))).collect();
@@ -147,7 +163,10 @@ fn graph<'g>(lg: &'g LocalGraph, h: &mut DefaultHasher) {
     let mut by_offset: Vec<usize> = (0..kept.len()).collect();
     by_offset.sort_by_key(|&k| by_id[&order[kept[k]]].offset().clone());
     by_offset.hash(h);
+}
 
+fn references(lg: &LocalGraph, h: &mut DefaultHasher) {
+    let refs = lg.constant_references();
     let ref_order = lg.document().constant_references();
     ref_order.len().hash(h);
     let mut offsets = Vec::with_capacity(ref_order.len());

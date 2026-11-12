@@ -55,6 +55,9 @@ pub struct FileEntry {
     /// [`crate::fingerprint::of`]: equal for two versions of the file that
     /// differ only in what feeds the file's own output.
     pub fp: u64,
+    /// Like `fp`, but with only the set of reference names (not their count,
+    /// order or place).
+    pub fp_names: u64,
     /// This file's cached share of the method-level output and whether it
     /// is computed (see [`crate::scoped::Cache`]).
     pub scoped: Option<Box<crate::scoped::FileOut>>,
@@ -81,7 +84,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             entry
                 .warnings
                 .push(Warning::new("ruby_read_error", format!("cannot read file: {e}")).file(rel));
-            entry.fp = crate::fingerprint::of(None, &entry);
+            (entry.fp, entry.fp_names) = crate::fingerprint::of(None, &entry);
             return Analysed {
                 path: rel.to_string(),
                 entry,
@@ -187,7 +190,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             }
         }
     }
-    entry.fp = crate::fingerprint::of(local_graph.as_ref(), &entry);
+    (entry.fp, entry.fp_names) = crate::fingerprint::of(local_graph.as_ref(), &entry);
     Analysed {
         path: rel.to_string(),
         entry,

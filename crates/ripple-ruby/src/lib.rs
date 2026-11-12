@@ -16,6 +16,16 @@
 //! ([`Extractor::update_rows`]). In a batch, files that keep their
 //! fingerprint are never fed to Rubydex; only the others are. A batch whose
 //! Rubydex merge would cost more than a fresh build is rebuilt instead.
+//!
+//! A file whose definitions keep their fingerprint and whose constant
+//! references name the same set of names as before (`FileEntry::fp_names`)
+//! takes the fast path too, however many references of each name there are
+//! and wherever they are: Rubydex resolves *names* (a position-free id of
+//! the string, its parent scope and its lexical nesting), so every reference
+//! of a name resolves like the others; the resolver handles every definition
+//! before any reference, so the order of references does not matter; and the
+//! file's document in Rubydex, while stale, holds the same names (keeping
+//! them alive and making [`shadow::documents_using`] see the file).
 
 mod actions;
 mod analyse;
@@ -112,6 +122,8 @@ struct Timings {
     shadow_docs: usize,
     /// Files that kept / changed their fingerprint (update only).
     fast_files: usize,
+    /// Of `fast_files`, those whose references changed (same name set).
+    ref_files: usize,
     slow_files: usize,
     batch_rebuilt: bool,
 }
@@ -374,6 +386,7 @@ impl State {
         put("ruby_time_shadow_repair_us", t.shadow_us);
         put("ruby_shadow_docs_reindexed", t.shadow_docs as u64);
         put("ruby_fast_files_this_run", t.fast_files as u64);
+        put("ruby_fast_ref_files_this_run", t.ref_files as u64);
         put("ruby_slow_files_this_run", t.slow_files as u64);
         put("ruby_slow_batch_rebuilt_this_run", u64::from(t.batch_rebuilt));
         let http_requests = self.http_requests();
@@ -620,8 +633,11 @@ impl RubyExtractor {
         // `RIPPLE_RUBY_NO_FAST=1`: every changed file takes the slow path (for comparisons).
         let fast_ok = same_set && std::env::var_os("RIPPLE_RUBY_NO_FAST").is_none_or(|v| v != "1");
         let (body, structural): (Vec<Analysed>, Vec<Analysed>) = analysed.into_iter().partition(|a| {
-            fast_ok && a.path != INFLECTIONS && state.files.get(&a.path).is_some_and(|e| e.fp == a.entry.fp)
+            fast_ok
+                && a.path != INFLECTIONS
+                && state.files.get(&a.path).is_some_and(|e| e.fp_names == a.entry.fp_names)
         });
+        t.ref_files = body.iter().filter(|a| state.files.get(&a.path).is_some_and(|e| e.fp != a.entry.fp)).count();
         t.fast_files = body.len();
         t.slow_files = structural.len();
         let mut body = body;
@@ -656,6 +672,7 @@ impl RubyExtractor {
             let mut out = self.build(ws)?;
             out.stats.insert("ruby_slow_batch_rebuilt_this_run".into(), 1);
             out.stats.insert("ruby_fast_files_this_run".into(), t.fast_files as u64);
+            out.stats.insert("ruby_fast_ref_files_this_run".into(), t.ref_files as u64);
             out.stats.insert("ruby_slow_files_this_run".into(), t.slow_files as u64);
             return Ok(out);
         }

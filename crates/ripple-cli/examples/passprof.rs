@@ -6,7 +6,9 @@
 //!
 //! Scenarios (comma-separated, default all): `body` (a statement inside the
 //! first method of MODEL), `method` (a new method in MODEL), `constref` (a
-//! reference to CONST inside the first method of MODEL), `js` (a statement
+//! reference to `::CONST` inside the first method of MODEL), `knownref` (a
+//! reference to `CONST`, which MODEL usually already references, in the
+//! same place), `js` (a statement
 //! appended to JSFILE), `batch20`, `batch200` (a comment appended to N
 //! seeded-random Ruby files under app/ and lib/), `mixed20`, `mixed200` (the
 //! same, every fourth file also gets a reference to CONST). Each edit is
@@ -54,7 +56,7 @@ fn main() {
     let root = Path::new(&a[1]).canonicalize().unwrap();
     let (model, konst, js) = (a[2].clone(), a[3].clone(), a[4].clone());
     let reps: usize = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(5);
-    let all = "body,method,constref,js,batch20,batch200,mixed20,mixed200";
+    let all = "body,method,constref,knownref,js,batch20,batch200,mixed20,mixed200";
     let scenarios: Vec<String> = a.get(6).map_or(all, |s| s.as_str()).split(',').map(String::from).collect();
 
     let t = Instant::now();
@@ -73,6 +75,7 @@ fn main() {
                 "body" => edits.push((model.clone(), insert_after_first(&read(&model), is_def, |i| format!("{i}  _ripple_prof = {rep}")))),
                 "method" => edits.push((model.clone(), insert_after_first(&read(&model), |l| l.starts_with("class ") || l.starts_with("module "), |_| format!("  def ripple_prof_m{rep}\n    1\n  end")))),
                 "constref" => edits.push((model.clone(), insert_after_first(&read(&model), is_def, |i| format!("{i}  ::{konst}")))),
+                "knownref" => edits.push((model.clone(), insert_after_first(&read(&model), is_def, |i| format!("{i}  {konst}")))),
                 "js" => edits.push((js.clone(), format!("{}\nconst __rippleProf{rep} = {rep};\n", read(&js)))),
                 s if s.starts_with("batch") || s.starts_with("mixed") => {
                     let n: usize = s[5..].parse().unwrap();
