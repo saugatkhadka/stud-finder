@@ -35,7 +35,7 @@
 
 use crate::engine::Snapshot;
 use crate::historyd::{HistoryInfo, State as HistState, View};
-use ripple_core::config::CoverageConfig;
+use ripple_core::config::{CoverageConfig, RankWeights};
 use ripple_coverage::Coverage;
 use ripple_history::PartnerQuery;
 use ripple_policy::{ChangedFile, ChurnMetric, CoChangeEntry, CoverageMetric, FileSignals, FileStatus, HotspotMetric, Language, SignalInput, SignalState, SignalStatus, Signals, cochange_why, round1};
@@ -366,6 +366,8 @@ pub struct RankKey {
     pub history_state: &'static str,
     pub coverage_load: u64,
     pub coverage_state: &'static str,
+    /// `rank:` of ripple.yml (as bits: a policy reload changes it without a new index).
+    pub config: [u64; 5],
 }
 
 impl RankKey {
@@ -376,6 +378,10 @@ impl RankKey {
             history_state: hist.state.name(),
             coverage_load: cov.load_id,
             coverage_state: cov.status().state.as_str(),
+            config: {
+                let r = &snap.policy.config.rank;
+                [r.hotspot_percent, r.weights.churn, r.weights.complexity, r.weights.dependents, r.weights.uncovered].map(f64::to_bits)
+            },
         }
     }
 }
@@ -430,19 +436,23 @@ pub struct Ranking {
     pub compute_us: u64,
 }
 
-/// The rank formula, also printed by `ripple rank --format json`.
-pub const RANK_FORMULA: &str = "score = 100 * (2*churn + 2*complexity + 1*dependents + 1*uncovered) / (sum of the weights used); \
+/// The rank formula for these weights, also printed by `ripple rank --format json`.
+pub fn rank_formula(w: &RankWeights) -> String {
+    let n = |x: f64| ripple_policy::fmt_pct(x);
+    format!(
+        "score = 100 * ({}*churn + {}*complexity + {}*dependents + {}*uncovered) / (sum of the weights used); \
 churn = percentile of (commits in the last 90 days, then all commits in the history window); \
 complexity = mean(percentile of file complexity, percentile of the most complex method), a file without methods counting 0 for both; \
-dependents = percentile of direct dependents (fan-in); uncovered = 1 - line coverage, only when the file is in a coverage report \
+dependents = percentile of direct non-test dependents (fan-in); uncovered = 1 - line coverage, only when the file is in a coverage report \
 (else that weight is dropped; churn's too when git history is not available). \
 percentile(x) = share of ranked files with a strictly smaller value. Ranked: non-test Ruby and JS/TS files of the index. \
-hotspot: rank <= ceil(files * rank.hotspot_percent / 100).";
-
-const W_CHURN: f64 = 2.0;
-const W_CX: f64 = 2.0;
-const W_DEPS: f64 = 1.0;
-const W_UNCOV: f64 = 1.0;
+Weights: rank.weights in ripple.yml. hotspot: rank <= ceil(files * rank.hotspot_percent / 100).",
+        n(w.churn),
+        n(w.complexity),
+        n(w.dependents),
+        n(w.uncovered)
+    )
+}
 
 /// `p(x)` = share of `sorted` strictly below `x`.
 fn pct_below<T: Ord>(sorted: &[T], x: &T) -> f64 {
@@ -458,7 +468,7 @@ fn top(p: f64) -> String {
 }
 
 impl Ranking {
-    /// Scores every candidate file. The formula is [`RANK_FORMULA`]:
+    /// Scores every candidate file. The formula is [`rank_formula`]:
     /// percentile ranks (not raw products) so one huge value cannot dominate
     /// and the factors are comparable; method complexity guards against a
     /// file without methods whose decisions are all `||=` memoisation.
@@ -468,6 +478,7 @@ impl Ranking {
         let g = &snap.graph;
         let h = hist.history.as_deref().filter(|_| hist.assessment.as_ref().is_some_and(|a| a.churn));
         let c = cov.ready();
+        let w = snap.policy.config.rank.weights;
         struct Cand {
             node: u32,
             churn: (u32, u32),
@@ -488,7 +499,9 @@ impl Ranking {
             let ch = h.and_then(|h| h.churn(path));
             let (cx, mx) = if fm.methods == 0 { (0, 0) } else { (fm.complexity, u32::from(fm.max_method)) };
             let cv = c.and_then(|c| c.file(path)).and_then(|f| f.percent()).map(|p| p / 100.0);
-            cands.push(Cand { node, churn: ch.map_or((0, 0), |c| (c.recent_changes, c.changes)), cx, mx, fm, deps: g.fan_in(node), cov: cv });
+            // Distinct non-test dependents: a well-tested file is not riskier for its specs.
+            let deps = g.dependents(node).map(|(d, _)| d).filter(|&d| !snap.index.get(d).is_some_and(|c| c.test)).collect::<HashSet<_>>().len();
+            cands.push(Cand { node, churn: ch.map_or((0, 0), |c| (c.recent_changes, c.changes)), cx, mx, fm, deps, cov: cv });
         }
         let sorted = |f: &dyn Fn(&Cand) -> u64| {
             let mut v: Vec<u64> = cands.iter().map(f).collect();
@@ -507,14 +520,14 @@ impl Ranking {
                 let pmx = pct_below(&mx_v, &u64::from(c.mx));
                 let pdeps = pct_below(&deps_v, &(c.deps as u64));
                 let f = Factors { churn: pch, complexity: (pcx + pmx) / 2.0, dependents: pdeps, uncovered: c.cov.map(|v| 1.0 - v) };
-                let (mut num, mut den) = (W_CX * f.complexity + W_DEPS * f.dependents, W_CX + W_DEPS);
+                let (mut num, mut den) = (w.complexity * f.complexity + w.dependents * f.dependents, w.complexity + w.dependents);
                 if h.is_some() {
-                    num += W_CHURN * f.churn;
-                    den += W_CHURN;
+                    num += w.churn * f.churn;
+                    den += w.churn;
                 }
                 if let Some(u) = f.uncovered {
-                    num += W_UNCOV * u;
-                    den += W_UNCOV;
+                    num += w.uncovered * u;
+                    den += w.uncovered;
                 }
                 let path = g.path(c.node).to_string();
                 let class = snap.index.get(c.node).cloned().unwrap_or_default();
@@ -527,7 +540,7 @@ impl Ranking {
                 } else {
                     why.push(format!("cx {} / max method {} ({})", c.cx, c.mx, top(f.complexity)));
                 }
-                why.push(format!("{} dependents ({})", c.deps, top(pdeps)));
+                why.push(format!("{} non-test dependents ({})", c.deps, top(pdeps)));
                 match c.cov {
                     Some(v) => why.push(format!("cov {}%", ripple_policy::fmt_pct(v * 100.0))),
                     None if cov.ready().is_some() => why.push("cov unknown".to_string()),
@@ -537,7 +550,7 @@ impl Ranking {
                     rank: 0,
                     path,
                     language: class.language,
-                    score: round1(100.0 * num / den),
+                    score: if den > 0.0 { round1(100.0 * num / den) } else { 0.0 },
                     percentile: 0.0,
                     factors: Factors { churn: round3(f.churn), complexity: round3(f.complexity), dependents: round3(f.dependents), uncovered: f.uncovered.map(round3) },
                     commits: c.churn.1,

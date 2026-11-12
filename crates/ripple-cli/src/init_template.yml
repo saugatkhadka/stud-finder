@@ -168,9 +168,11 @@ rules:
   #     cochange_min_confidence: 0.6  # ...in at least 60% of its commits (default 0.5)
   #   risk: low
 
-# `ripple rank`: files in the top this-many percent are hotspots.
+# `ripple rank`: files in the top this-many percent are hotspots, and the
+# weights of the score's factors (defaults shown).
 # rank:
-#   hotspot_percent: 5
+#   hotspot_percent: 1
+#   weights: { churn: 3, complexity: 1, dependents: 0.5, uncovered: 1 }
 
 query:
   max_depth: 3                    # hops to follow from a changed file; 0 = unlimited

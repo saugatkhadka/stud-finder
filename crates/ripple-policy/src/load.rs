@@ -126,6 +126,15 @@ pub fn validate(config: &Config, src: Option<&str>) -> Vec<Issue> {
     if !(hp > 0.0 && hp <= 100.0) {
         issues.push(Issue::new("rank.hotspot_percent", "a percentage above 0, at most 100"));
     }
+    let rw = &config.rank.weights;
+    for (key, v) in [("churn", rw.churn), ("complexity", rw.complexity), ("dependents", rw.dependents), ("uncovered", rw.uncovered)] {
+        if !(v.is_finite() && v >= 0.0) {
+            issues.push(Issue::new(format!("rank.weights.{key}"), "a weight of 0 or more"));
+        }
+    }
+    if rw.complexity + rw.dependents <= 0.0 {
+        issues.push(Issue::new("rank.weights", "`complexity` or `dependents` must be above 0 (they are the only factors every file has)"));
+    }
     for (name, area) in &config.areas {
         if area.paths.is_empty() {
             issues.push(Issue::new(format!("areas.{name}.paths"), "an area needs at least one path glob"));
@@ -267,7 +276,14 @@ rules:
         )
         .unwrap();
         assert_eq!(ok.rank.hotspot_percent, 2.5);
-        assert_eq!(parse_config("", "ripple.yml").unwrap().rank.hotspot_percent, 5.0);
+        let d = parse_config("", "ripple.yml").unwrap().rank;
+        assert_eq!(d.hotspot_percent, 1.0);
+        assert_eq!((d.weights.churn, d.weights.complexity, d.weights.dependents, d.weights.uncovered), (3.0, 1.0, 0.5, 1.0));
+        let w = parse_config("rank: {weights: {churn: 1, dependents: 0}}\n", "ripple.yml").unwrap().rank.weights;
+        assert_eq!((w.churn, w.complexity, w.dependents, w.uncovered), (1.0, 1.0, 0.0, 1.0));
+        let e = err("rank: {weights: {churn: -1, complexity: 0, dependents: 0}}\n");
+        assert!(e.contains("rank.weights.churn") && e.contains("must be above 0"), "{e}");
+        assert!(err("rank: {weights: {age: 1}}\n").contains("age"));
         let e = err("rank: {hotspot_percent: 0}\nrules:\n  - {id: a, risk: high, when: {coverage_under: 120, cochange_min_confidence: 0.5, uncovered_includes_unknown: true}}\n");
         for want in ["rank.hotspot_percent", "rules[0].when.coverage_under", "rules[0].when.cochange_min_confidence", "rules[0].when.uncovered_includes_unknown"] {
             assert!(e.contains(want), "{want}: {e}");

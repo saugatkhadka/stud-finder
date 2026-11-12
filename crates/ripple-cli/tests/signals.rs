@@ -223,3 +223,17 @@ fn daemon_loads_and_reloads_coverage() {
     assert!(s["coverage"]["loads"].as_u64().unwrap() >= 2, "{}", s["coverage"]);
     assert!(s["rank"]["computes"].as_u64().unwrap() >= 1, "{}", s["rank"]);
 }
+
+#[test]
+fn rank_weights_come_from_ripple_yml_and_dependents_exclude_tests() {
+    let env = Env::new();
+    env.repo.write("ripple.yml", &format!("{CONFIG}rank:\n  weights: {{churn: 0, complexity: 0, dependents: 1, uncovered: 0}}\n"));
+    let r = env.json(&["--no-daemon", "rank", "--format", "json"]);
+    assert!(r["formula"].as_str().unwrap().contains("(0*churn + 0*complexity + 1*dependents + 0*uncovered)"), "{}", r["formula"]);
+    let rows = r["rows"].as_array().unwrap();
+    // order.rb: checkout.rb and its spec depend on it; only checkout.rb counts.
+    assert_eq!(rows[0]["path"], "app/models/order.rb", "{r:#}");
+    assert_eq!(rows[0]["dependents"], 1, "{}", rows[0]);
+    assert!(rows[0]["reason"].as_str().unwrap().contains("1 non-test dependents"), "{}", rows[0]);
+    assert_eq!(r["hotspot_percent"], 1.0);
+}

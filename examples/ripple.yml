@@ -150,7 +150,8 @@ rules:
     risk: low
 
 rank:
-  hotspot_percent: 5
+  hotspot_percent: 1        # top 1% of `ripple rank` are hotspots
+  weights: { churn: 3, complexity: 1, dependents: 0.5, uncovered: 1 }
 
 query:
   max_depth: 3              # hops from a changed file; 0 = unlimited (usually "everything")

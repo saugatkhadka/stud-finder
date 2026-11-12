@@ -127,7 +127,8 @@ ripple: ripple.yml: invalid configuration:
 | `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
 | `history` | see right | Co-change from git history ("usually changes with this"), a separate signal that is never a graph edge and never feeds risk: `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`; bigger commits are sweeps), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). Defaults chosen by `ripple-eval` replay. |
 | `coverage` | see right | Existing test-coverage reports, read and never produced (ripple never runs tests): `enabled` (`true`), `paths` (`[]` = auto-detect `coverage/.resultset.json`, `coverage/lcov.info`, `coverage/lcov/*.lcov`, `coverage/coverage-final.json`; entries are files, directories or `*` globs in the last component), `max_age_days` (none; older reports are labelled stale, not hidden). |
-| `rank.hotspot_percent` | `5` | Files in this top share of `ripple rank` are hotspots (the `hotspot` rule condition, `metrics.hotspot.hotspot`). |
+| `rank.hotspot_percent` | `1` | Files in this top share of `ripple rank` are hotspots (the `hotspot` rule condition, `metrics.hotspot.hotspot`). |
+| `rank.weights` | `churn: 3`, `complexity: 1`, `dependents: 0.5`, `uncovered: 1` | Weights of the factors of the `ripple rank` score (see [Hotspot ranking](#hotspot-ranking)); each 0 or more, `complexity` or `dependents` above 0. |
 | `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
 
 **Globs** follow gitignore conventions:
@@ -586,15 +587,15 @@ memory).
 ### Hotspot ranking
 
 `ripple rank` scores non-test Ruby and JS/TS files of the index. The formula
-lives in one place, `RANK_FORMULA` in `crates/ripple-cli/src/signals.rs`, and
-`rank --format json` prints it:
+lives in one place, `rank_formula` in `crates/ripple-cli/src/signals.rs`, and
+`rank --format json` prints it with the weights in effect:
 
 ```
-score = 100 * (2*churn + 2*complexity + 1*dependents + 1*uncovered) / (sum of the weights used)
+score = 100 * (3*churn + 1*complexity + 0.5*dependents + 1*uncovered) / (sum of the weights used)
 churn      = percentile of (commits in the last 90 days, then all commits in the window)
 complexity = mean(percentile of file complexity, percentile of the most complex method);
              a file without methods counts 0 for both (the max-method guard)
-dependents = percentile of direct dependents (fan-in)
+dependents = percentile of direct non-test dependents (fan-in)
 uncovered  = 1 - line coverage, only for files in a coverage report (else the weight is dropped;
              churn's too when git history is unavailable)
 percentile(x) = share of ranked files with a strictly smaller value
@@ -602,6 +603,12 @@ hotspot    = rank <= ceil(files * rank.hotspot_percent / 100)
 ```
 
 Percentiles rather than raw products keep one huge value from dominating.
+The default weights (`rank.weights` in `ripple.yml`) come from a replay of 301
+commits each of Mastodon and Gumroad, scored by which files later fix commits
+touched: churn predicted best and dependents worst. With 3/1/0.5 the score
+finds as many fix-touched files as churn alone in the top 5% (Gumroad 37% vs
+34%, Mastodon 26% vs 26%) and more in the top 20% (69% vs 64%, 58% vs 53%);
+the previous 2/2/1 trailed churn alone at the top.
 The ranking is computed lazily, once per (index generation, history head,
 coverage load), and cached. `impact` never computes it: it uses the cached
 ranking and starts one background recompute when the cache is out of date

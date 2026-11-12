@@ -41,7 +41,7 @@
 //!   churn, coverage, hotspot rank), its most complex methods, dependents,
 //!   dependencies, direct tests, co-change partners and signal states.
 //! * `rank {limit? = 20, path?: [glob], area?, by?: score|churn|complexity|coverage}`
-//!   → the riskiest non-test source files (see [`crate::signals::RANK_FORMULA`]).
+//!   → the riskiest non-test source files (see [`crate::signals::rank_formula`]).
 //!   Computed once per index generation / history head / coverage load and cached.
 //! * `stats` → index and daemon statistics. `reload` → full re-index. `shutdown`.
 //!
