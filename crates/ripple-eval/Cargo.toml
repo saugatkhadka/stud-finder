@@ -1,0 +1,19 @@
+[package]
+name = "ripple-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replays real git history against ripple's impact predictions"
+publish = false
+
+[[bin]]
+name = "ripple-eval"
+path = "src/main.rs"
+
+[dependencies]
+ripple-core.workspace = true
+ripple-policy.workspace = true
+ripple-cli = { path = "../ripple-cli" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

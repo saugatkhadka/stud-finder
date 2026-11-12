@@ -116,7 +116,7 @@ fn count_lines(path: &Path) -> Option<u32> {
 }
 
 /// Parses `git diff -z --raw --numstat` output.
-pub(crate) fn parse_raw_numstat(out: &[u8]) -> BTreeMap<String, ChangedFile> {
+pub fn parse_raw_numstat(out: &[u8]) -> BTreeMap<String, ChangedFile> {
     let tokens: Vec<String> = out.split(|b| *b == 0).map(|s| String::from_utf8_lossy(s).into_owned()).collect();
     let mut files: BTreeMap<String, ChangedFile> = BTreeMap::new();
     let mut i = 0;
@@ -177,7 +177,7 @@ fn opens_definition(line: &str) -> bool {
 
 /// New-side hunks per file (in diff order) from `git diff -U0` with `a/` /
 /// `b/` prefixes. Files whose new side is `/dev/null` (deleted) are skipped.
-pub(crate) fn parse_hunks(patch: &[u8]) -> Vec<(String, Vec<Hunk>)> {
+pub fn parse_hunks(patch: &[u8]) -> Vec<(String, Vec<Hunk>)> {
     let text = String::from_utf8_lossy(patch);
     let mut out: Vec<(String, Vec<Hunk>)> = Vec::new();
     // In the header of a file's section (before its first `@@`), or in a hunk.

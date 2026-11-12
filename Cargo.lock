@@ -1341,6 +1341,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ripple-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ripple-cli",
+ "ripple-core",
+ "ripple-policy",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ripple-js"
 version = "0.1.0"
 dependencies = [
