@@ -121,6 +121,7 @@ ripple: ripple.yml: invalid configuration:
 | `daemon.max_wait_ms` | `150` | How long a daemon query waits for pending edits to be indexed before it answers from the current index, marked stale (see [Daemon and freshness](#daemon-and-freshness)). `--sync` waits without a limit. |
 | `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
 | `history` | see right | Co-change from git history ("usually changes with this"), a separate signal that is never a graph edge and never feeds risk: `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`; bigger commits are sweeps), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). Defaults chosen by `ripple-eval` replay. |
+| `coverage` | see right | Existing test-coverage reports, read and never produced (ripple never runs tests): `enabled` (`true`), `paths` (`[]` = auto-detect `coverage/.resultset.json`, `coverage/lcov.info`, `coverage/lcov/*.lcov`, `coverage/coverage-final.json`; entries are files, directories or `*` globs in the last component), `max_age_days` (none; older reports are labelled stale, not hidden). |
 | `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
 
 **Globs** follow gitignore conventions:

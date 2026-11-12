@@ -29,6 +29,9 @@ pub struct Config {
     /// Co-change statistics from git history (`ripple-history`): a separate
     /// "usually changes with" signal, never graph edges, never risk input.
     pub history: HistoryConfig,
+    /// Existing test-coverage reports (`ripple-coverage`): read, never
+    /// produced. A separate signal, never risk input by itself.
+    pub coverage: CoverageConfig,
 }
 
 impl Default for Config {
@@ -65,6 +68,7 @@ impl Default for Config {
             ci: CiConfig::default(),
             daemon: DaemonConfig::default(),
             history: HistoryConfig::default(),
+            coverage: CoverageConfig::default(),
         }
     }
 }
@@ -301,6 +305,30 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self { enabled: true, max_commits: 20000, max_age_days: None, max_files_per_commit: 30, min_together: 3, min_confidence: 0.3, min_lift: 2.0, limit: 5 }
+    }
+}
+
+/// `coverage:` in `ripple.yml`: where to find test-coverage reports that
+/// something else (CI, a local test run) already wrote. See the
+/// `ripple-coverage` crate docs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoverageConfig {
+    pub enabled: bool,
+    /// Report files or directories, repo-relative. A `*` wildcard is allowed
+    /// in the last component (`coverage/lcov/*.lcov`). A directory is
+    /// searched for the default report names. Empty = auto-detect in
+    /// `coverage/`: `.resultset.json` (SimpleCov), `lcov.info`,
+    /// `lcov/*.lcov`, `coverage-final.json` (Istanbul; only when there is no
+    /// `lcov.info` next to it).
+    pub paths: Vec<String>,
+    /// Reports measured longer ago than this are labelled stale (still used).
+    pub max_age_days: Option<u32>,
+}
+
+impl Default for CoverageConfig {
+    fn default() -> Self {
+        Self { enabled: true, paths: Vec::new(), max_age_days: None }
     }
 }
 

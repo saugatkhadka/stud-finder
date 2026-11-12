@@ -1,0 +1,15 @@
+[package]
+name = "ripple-coverage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reads existing test-coverage reports (SimpleCov, LCOV, Istanbul) into a compact per-line form"
+
+[dependencies]
+ripple-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+
+[dev-dependencies]
+tempfile = "3"
