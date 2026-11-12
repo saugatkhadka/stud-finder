@@ -246,3 +246,27 @@ ci:
   fail_on: critical               # `ripple check` / `impact --fail-on` default; omit to never fail
   github: true
   max_listed: 50                  # impacted files listed in the markdown report
+
+# The background daemon (defaults shown).
+# daemon:
+#   max_wait_ms: 150              # a query waits this long for pending edits, then answers marked stale
+#   idle_timeout_minutes: 30      # exit after this long without a request; 0 = never
+#   sleep_after_seconds: 300      # after this long without requests or edits, save the index to
+#                                 # <git dir>/ripple/ and serve it memory-mapped (small); 0 = never
+
+# Git history: churn and "usually changes with" (defaults shown).
+# history:
+#   enabled: true
+#   max_commits: 20000            # newest non-merge commits read; 0 = all
+#   max_age_days: 365             # also only commits younger than this (default: no limit)
+#   max_files_per_commit: 30      # bigger commits are sweeps: ignored for co-change
+#   min_together: 3               # a partner changed together at least this often...
+#   min_confidence: 0.3           # ...in at least this share of the file's commits...
+#   min_lift: 2.0                 # ...and this many times its own base rate
+#   limit: 5                      # partners shown per report
+
+# Coverage reports something else already wrote (ripple never runs tests).
+# coverage:
+#   enabled: true
+#   paths: []                     # [] = auto-detect under coverage/, tmp/coverage/, spec/coverage/, ...
+#   max_age_days: 7               # older reports are labelled stale (default: never)
