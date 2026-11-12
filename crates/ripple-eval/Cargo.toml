@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ripple-core.workspace = true
 ripple-policy.workspace = true
+ripple-history = { path = "../ripple-history" }
 ripple-cli = { path = "../ripple-cli" }
 anyhow.workspace = true
 serde.workspace = true

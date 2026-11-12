@@ -1347,9 +1347,20 @@ dependencies = [
  "anyhow",
  "ripple-cli",
  "ripple-core",
+ "ripple-history",
  "ripple-policy",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ripple-history"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ripple-core",
+ "ripple-policy",
+ "tempfile",
 ]
 
 [[package]]

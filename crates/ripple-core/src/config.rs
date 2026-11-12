@@ -26,6 +26,9 @@ pub struct Config {
     pub query: QueryConfig,
     pub ci: CiConfig,
     pub daemon: DaemonConfig,
+    /// Co-change statistics from git history (`ripple-history`): a separate
+    /// "usually changes with" signal, never graph edges, never risk input.
+    pub history: HistoryConfig,
 }
 
 impl Default for Config {
@@ -61,6 +64,7 @@ impl Default for Config {
             query: QueryConfig::default(),
             ci: CiConfig::default(),
             daemon: DaemonConfig::default(),
+            history: HistoryConfig::default(),
         }
     }
 }
@@ -264,5 +268,34 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self { idle_timeout_minutes: 30 }
+    }
+}
+
+/// `history:` in `ripple.yml`. Defaults come from the replay evaluation
+/// (`ripple-eval`), see the `ripple-history` crate docs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    pub enabled: bool,
+    /// Window: the last N non-merge commits. 0 = all.
+    pub max_commits: usize,
+    /// Window: also only commits younger than this many days.
+    pub max_age_days: Option<u32>,
+    /// Commits touching more files than this are sweeps and do not count
+    /// toward co-change (formatting, dependency bumps, translation imports).
+    pub max_files_per_commit: usize,
+    /// A partner must have changed together with the file at least this often.
+    pub min_together: u32,
+    /// ... in at least this share of the file's commits.
+    pub min_confidence: f32,
+    /// ... and at least this many times more often than its own base rate.
+    pub min_lift: f32,
+    /// Partners shown per query.
+    pub limit: usize,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_commits: 20000, max_age_days: None, max_files_per_commit: 30, min_together: 3, min_confidence: 0.3, min_lift: 2.0, limit: 5 }
     }
 }

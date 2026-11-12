@@ -30,6 +30,8 @@ pub struct CommitResult {
     pub nodes: usize,
     pub edges: usize,
     pub variants: Vec<VariantResult>,
+    /// Co-change gain analysis, one entry per configuration.
+    pub history: Vec<crate::metrics::GainResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -42,6 +44,8 @@ pub struct Selection {
     pub too_few: usize,
     pub too_many: usize,
     pub failed: Vec<String>,
+    /// Co-change history windows measured.
+    pub history: Vec<String>,
 }
 
 fn pct(num: usize, den: usize) -> String {
@@ -247,7 +251,110 @@ pub fn summary(sel: &Selection, commits: &[CommitResult]) -> String {
         );
     }
     let _ = writeln!(s, "\nMisses (neither direction within 3 hops, `{reference}`) are listed in `misses.tsv`; the most frequent per bucket in `miss_examples.md`.");
+    history_section(&mut s, sel, commits);
     s
+}
+
+fn mean(v: impl Iterator<Item = f64>) -> String {
+    let (n, sum) = v.fold((0usize, 0.0), |(n, s), x| (n + 1, s + x));
+    if n == 0 { "–".into() } else { format!("{:.2}", sum / n as f64) }
+}
+
+/// Co-change (ripple-history) against the graph: what it recovers that the
+/// graph misses, and at what cost in list size.
+fn history_section(s: &mut String, sel: &Selection, commits: &[CommitResult]) {
+    use crate::metrics::{GainCase, KS};
+    let configs: Vec<String> = commits.first().map(|c| c.history.iter().map(|g| g.config.clone()).collect()).unwrap_or_default();
+    if configs.is_empty() {
+        return;
+    }
+    let loo = |name: &str| -> Vec<&GainCase> { commits.iter().flat_map(|c| c.history.iter().filter(|g| g.config == name).flat_map(|g| &g.loo)).collect() };
+    let _ = writeln!(s, "\n## Co-change from git history (ripple-history)\n");
+    let _ = writeln!(
+        s,
+        "History is built at the parent of the oldest measured commit and folded forward to each measured commit's parent, so every commit is measured with statistics from strictly older commits (asserted: the window never contains the measured commit). Windows at the first measured parent: {}.\n",
+        sel.history.join("; ")
+    );
+    let _ = writeln!(s, "Lists hold non-test graph nodes only, seeds excluded. *recall@K*: the held-out file is in the first K partners of the other changed files. *precision@K* (single seed): share of a changed file's first K partners that are other non-test files of the same commit (Σhits / Σshown). *empty*: no partner passes the filters. *adds nothing*: every one of the first 5 partners is already in the graph's depth-1 set (either direction).\n");
+    let _ = writeln!(s, "*precision beside graph*: the same for the list without the seed's own graph depth-1 set (what would be shown next to the graph), with *shown@5* its mean length.\n");
+    let _ = writeln!(s, "| configuration | LOO cases | recall@5 | @10 | @20 | precision@5 | @10 | @20 | shown@5 mean | empty | adds nothing@5 | precision beside graph@5 | @10 | shown@5 |");
+    let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for name in &configs {
+        let cases = loo(name);
+        let n = cases.len();
+        let singles: Vec<_> = commits.iter().flat_map(|c| c.history.iter().filter(|g| &g.config == name).flat_map(|g| &g.single)).collect();
+        let prec = |k: usize| {
+            let shown: usize = singles.iter().map(|x| (x.len as usize).min(k)).sum();
+            let hits: usize = singles.iter().map(|x| x.hits.iter().filter(|&&r| (r as usize) < k).count()).sum();
+            if shown == 0 { "–".to_string() } else { format!("{:.1}%", 100.0 * hits as f64 / shown as f64) }
+        };
+        let prec1 = |k: usize| {
+            let shown: usize = singles.iter().map(|x| (x.len_ex1 as usize).min(k)).sum();
+            let hits: usize = singles.iter().map(|x| x.hits_ex1.iter().filter(|&&r| (r as usize) < k).count()).sum();
+            if shown == 0 { "–".to_string() } else { format!("{:.1}%", 100.0 * hits as f64 / shown as f64) }
+        };
+        let shown1 = mean(singles.iter().map(|x| (x.len_ex1 as usize).min(5) as f64));
+        let rec = |k: usize| pct(cases.iter().filter(|c| c.rank[0].is_some_and(|r| (r as usize) < k)).count(), n);
+        let empty = pct(cases.iter().filter(|c| c.len[0] == 0).count(), n);
+        let nothing = pct(cases.iter().filter(|c| c.len[0] > 0 && c.raw_in_d1[0] as usize == (c.len[0] as usize).min(5)).count(), n);
+        let shown = mean(cases.iter().map(|c| (c.len[0] as usize).min(5) as f64));
+        let _ = writeln!(s, "| {name} | {n} | {} | {} | {} | {} | {} | {} | {shown} | {empty} | {nothing} | {} | {} | {shown1} |", rec(5), rec(10), rec(20), prec(5), prec(10), prec(20), prec1(5), prec1(10));
+    }
+
+    for (ix, depth) in [(1usize, 1u32), (2, 3)] {
+        let _ = writeln!(
+            s,
+            "\n### Targets the graph misses at depth {depth} (either direction, file-level)\n\n*recovered@K*: the miss is among the first K partners that are not already in the graph's depth ≤ {depth} set (what an agent would be shown as \"usually changes with this, not explained by the graph\"). *added@K*: mean length of that list over all LOO queries (the cost). *hit/added*: Σrecovered / Σadded.\n"
+        );
+        let _ = writeln!(s, "| configuration | misses | recovered@5 | @10 | @20 | added@5 | @10 | @20 | hit/added@5 | @10 | @20 |");
+        let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        for name in &configs {
+            let cases = loo(name);
+            let misses: Vec<&&GainCase> = cases.iter().filter(|c| !within(c.graph, depth as usize)).collect();
+            let rec = |k: usize| misses.iter().filter(|c| c.rank[ix].is_some_and(|r| (r as usize) < k)).count();
+            let added = |k: usize| cases.iter().map(|c| (c.len[ix] as usize).min(k)).sum::<usize>();
+            let mut row = format!("| {name} | {} ", misses.len());
+            for k in KS {
+                let _ = write!(row, "| {} ", pct(rec(k), misses.len()));
+            }
+            for k in KS {
+                let _ = write!(row, "| {} ", if cases.is_empty() { "–".into() } else { format!("{:.2}", added(k) as f64 / cases.len() as f64) });
+            }
+            for k in KS {
+                let _ = write!(row, "| {} ", pct(rec(k), added(k)));
+            }
+            let _ = writeln!(s, "{row}|");
+        }
+    }
+
+    let name = &configs[0];
+    let cases = loo(name);
+    let _ = writeln!(s, "\n### By kind of target (`{name}`)\n");
+    let _ = writeln!(s, "| bucket | cases | graph ≤1 | graph ≤3 | cochange@5 alone | misses ≤1 | recovered@5 | @10 | misses ≤3 | recovered@5 | @10 |");
+    let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for b in crate::metrics::BUCKETS.iter().copied().chain(["all"]) {
+        let bc: Vec<&&GainCase> = cases.iter().filter(|c| b == "all" || c.bucket == b).collect();
+        if bc.is_empty() {
+            continue;
+        }
+        let n = bc.len();
+        let m1: Vec<_> = bc.iter().filter(|c| !within(c.graph, 1)).collect();
+        let m3: Vec<_> = bc.iter().filter(|c| !within(c.graph, 3)).collect();
+        let r = |m: &[&&&GainCase], ix: usize, k: usize| pct(m.iter().filter(|c| c.rank[ix].is_some_and(|r| (r as usize) < k)).count(), m.len());
+        let _ = writeln!(
+            s,
+            "| {b} | {n} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            pct(bc.iter().filter(|c| within(c.graph, 1)).count(), n),
+            pct(bc.iter().filter(|c| within(c.graph, 3)).count(), n),
+            pct(bc.iter().filter(|c| c.rank[0].is_some_and(|r| r < 5)).count(), n),
+            m1.len(),
+            r(&m1, 1, 5),
+            r(&m1, 1, 10),
+            m3.len(),
+            r(&m3, 2, 5),
+            r(&m3, 2, 10),
+        );
+    }
 }
 
 /// One row per leave-one-out miss of the reference variant.

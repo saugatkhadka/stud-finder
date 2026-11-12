@@ -119,6 +119,7 @@ ripple: ripple.yml: invalid configuration:
 | `ci.github` | `true` | Write `$GITHUB_STEP_SUMMARY` under Actions. |
 | `ci.max_listed` | `50` | Files listed in the markdown and text output; it ends with "…and N more". |
 | `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
+| `history` | see right | Co-change from git history ("usually changes with this"), a separate signal that is never a graph edge and never feeds risk: `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`; bigger commits are sweeps), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). Defaults chosen by `ripple-eval` replay. |
 | `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
 
 **Globs** follow gitignore conventions:
