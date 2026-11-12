@@ -10,6 +10,7 @@
 //! 3. **edges** (all files): resolve cached facts against the graph and the
 //!    file list. See [`edges`] for why this step is not incremental.
 
+mod actions;
 mod analyse;
 mod edges;
 mod inflector;

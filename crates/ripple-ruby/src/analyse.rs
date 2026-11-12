@@ -70,6 +70,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String])
     let mut local_graph = None;
     match kind {
         SourceKind::Ruby => {
+            let controller = paths::is_scoped_controller(rel);
             entry.zeitwerk_keys = paths::zeitwerk_keys(rel, extra_roots);
             match catch_unwind(AssertUnwindSafe(|| {
                 build_local_graph(
@@ -109,7 +110,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String])
                     .file(rel),
                 ),
             }
-            match catch_unwind(AssertUnwindSafe(|| rails::collect(&source))) {
+            match catch_unwind(AssertUnwindSafe(|| rails::collect(&source, controller))) {
                 Ok(f) => entry.facts = f,
                 Err(_) => entry.warnings.push(
                     Warning::new("ruby_prism_panic", "Rails DSL pass panicked; skipped").file(rel),

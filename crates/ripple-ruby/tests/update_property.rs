@@ -10,8 +10,10 @@
 //!
 //! Operations (seeded): add a constant reference, remove a line that mentions
 //! a constant, delete a file, add a new file defining a new constant that an
-//! existing file references, rename a class, restore a deleted file, and
-//! batch several of these into one `ChangeSet`.
+//! existing file references, rename a class, restore a deleted file, edit a
+//! controller (a reference inside an action, a `private` before an action,
+//! one action calling another: these move edges between action scopes), and
+//! batch several of these into one `ChangeSet`. Edges compare with their scopes.
 
 #[path = "../examples/support/mod.rs"]
 mod support;
@@ -79,12 +81,14 @@ fn fmt_edges(
         .iter()
         .map(|e| {
             format!(
-                "{} -> {} {:?} {:?} :{} {}",
+                "{} -> {} {:?} {:?} :{} @{:?}/{:?} {}",
                 e.from,
                 e.to,
                 e.kind,
                 e.confidence,
                 e.line,
+                e.from_scope,
+                e.to_scope,
                 e.detail.as_deref().unwrap_or("")
             )
         })
@@ -151,7 +155,7 @@ impl Sim {
 
     /// Applies one random operation and returns what changed.
     fn op(&mut self, step: usize, changes: &mut ChangeSet) -> String {
-        match self.rng.below(7) {
+        match self.rng.below(9) {
             0 | 1 => {
                 let f = self.pick(&self.rb_files());
                 let c = self.some_constant();
@@ -222,6 +226,59 @@ impl Sim {
                     }
                 }
                 "noop".into()
+            }
+            7 | 8 => {
+                let ctrls: Vec<String> = self
+                    .rb_files()
+                    .into_iter()
+                    .filter(|f| f.starts_with("app/controllers/") && !f.contains("/concerns/"))
+                    .collect();
+                if ctrls.is_empty() {
+                    return "noop".into();
+                }
+                let f = self.pick(&ctrls);
+                let s = self.read(&f);
+                let lines: Vec<&str> = s.lines().collect();
+                let defs: Vec<usize> = (0..lines.len())
+                    .filter(|i| lines[*i].trim_start().starts_with("def ") && !lines[*i].contains("self."))
+                    .collect();
+                if defs.is_empty() {
+                    return "noop".into();
+                }
+                let at = defs[self.rng.below(defs.len())];
+                let name: String = lines[at]
+                    .trim_start()
+                    .trim_start_matches("def ")
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let other = lines[defs[self.rng.below(defs.len())]]
+                    .trim_start()
+                    .trim_start_matches("def ")
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect::<String>();
+                let (insert_after, text, what) = match self.rng.below(3) {
+                    0 => {
+                        let c = self.some_constant();
+                        (at, format!("    ::{c}"), format!("ref {c} inside {name}"))
+                    }
+                    1 => (at.wrapping_sub(1), "  private".to_string(), format!("private before {name}")),
+                    _ => (at, format!("    {other}"), format!("{name} calls {other}")),
+                };
+                let mut out: Vec<&str> = Vec::with_capacity(lines.len() + 1);
+                if insert_after == usize::MAX {
+                    out.push(&text);
+                }
+                for (i, l) in lines.iter().enumerate() {
+                    out.push(l);
+                    if i == insert_after {
+                        out.push(&text);
+                    }
+                }
+                self.write(&f, &(out.join("\n") + "\n"));
+                changes.modified.push(f.clone());
+                format!("controller {f}: {what}")
             }
             _ => match self.deleted.pop() {
                 Some((f, s)) => {

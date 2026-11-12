@@ -122,6 +122,13 @@ pub fn controller_view_prefix(path: &str) -> Option<&str> {
     rest.strip_suffix("_controller.rb")
 }
 
+/// A controller whose edges get action scopes: under `**/app/controllers/`,
+/// a `.rb` file, and not inside any `concerns/` directory.
+pub fn is_scoped_controller(path: &str) -> bool {
+    under_app_dir(path, "controllers")
+        .is_some_and(|rest| path.ends_with(".rb") && !rest.split('/').any(|seg| seg == "concerns"))
+}
+
 /// Mailer view prefix: `app/mailers/user_mailer.rb` -> `user_mailer`.
 pub fn mailer_view_prefix(path: &str) -> Option<&str> {
     let rest = under_app_dir(path, "mailers")?;
@@ -179,6 +186,10 @@ mod tests {
             None
         );
         assert_eq!(mailer_view_prefix("app/mailers/notify.rb"), Some("notify"));
+        assert!(is_scoped_controller("ee/app/controllers/admin/users_controller.rb"));
+        assert!(!is_scoped_controller("app/controllers/concerns/x.rb"));
+        assert!(!is_scoped_controller("app/controllers/api/concerns/x.rb"));
+        assert!(!is_scoped_controller("app/models/user.rb"));
         assert_eq!(
             split_view_path("ee/app/views/a/_b.html.haml"),
             Some(("ee/app/views/", "a/_b.html.haml"))

@@ -56,6 +56,8 @@ pub struct RubyFacts {
     pub renders: Vec<Render>,
     pub assoc_polymorphic_skipped: u32,
     pub assoc_dynamic_skipped: u32,
+    /// Controller actions by line range, sorted (controllers only; see [`crate::actions`]).
+    pub actions: Vec<crate::actions::Action>,
 }
 
 /// Substrings that must appear for the prism pass to find anything; files
@@ -76,16 +78,22 @@ const TRIGGERS: &[&str] = &[
     "factory",
 ];
 
-pub fn collect(source: &str) -> RubyFacts {
-    if !TRIGGERS.iter().any(|t| source.contains(t)) {
+/// `controller`: the file is a (non-concern) controller, whose action line
+/// ranges are collected from the same parse.
+pub fn collect(source: &str, controller: bool) -> RubyFacts {
+    if !controller && !TRIGGERS.iter().any(|t| source.contains(t)) {
         return RubyFacts::default();
     }
     let result = ruby_prism::parse(source.as_bytes());
+    let root = result.node();
     let mut v = Visitor {
         nesting: Vec::new(),
         facts: RubyFacts::default(),
     };
-    v.visit(&result.node());
+    v.visit(&root);
+    if controller {
+        v.facts.actions = crate::actions::collect(&root);
+    }
     v.facts
 }
 
@@ -350,6 +358,7 @@ mod tests {
     fn associations_and_literals() {
         let f = collect(
             "module Admin\n  class Post < ApplicationRecord\n    belongs_to :author, class_name: 'User'\n    belongs_to :subject, polymorphic: true\n    has_many :comments\n    has_one :thing, class_name: name_for(:x)\n    has_many :tags, through: :taggings, source: :label\n  end\nend\n\"Foo::Bar\".constantize\nObject.const_get(:Baz)\nrequire_relative '../x'\n",
+            false,
         );
         assert_eq!(f.assoc_polymorphic_skipped, 1);
         assert_eq!(f.assoc_dynamic_skipped, 1);

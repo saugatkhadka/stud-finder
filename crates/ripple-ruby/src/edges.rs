@@ -5,6 +5,7 @@
 //! equal to a fresh `build`: any file's edges can change when *another* file
 //! adds or removes a definition, and recomputing avoids tracking that.
 
+use crate::actions::{self, Action};
 use crate::analyse::FileEntry;
 use crate::inflector::Inflector;
 use crate::paths::{self, SourceKind};
@@ -62,8 +63,10 @@ pub struct EdgeBuilder<'a> {
     cache: HashMap<DeclarationId, Option<Rc<Targets<'a>>>>,
     pub stats: EdgeStats,
     out: Vec<Edge>,
-    /// Per-`from` dedup of (to, kind) -> index into `out`.
-    seen: HashMap<(&'a str, EdgeKind), usize>,
+    /// Per-`from` dedup of (to, kind, from_scope).
+    seen: HashSet<(&'a str, EdgeKind, Option<&'a str>)>,
+    /// Action ranges of the current `from` (empty unless it is a controller).
+    actions: &'a [Action],
 }
 
 impl<'a> EdgeBuilder<'a> {
@@ -104,7 +107,8 @@ impl<'a> EdgeBuilder<'a> {
             cache: HashMap::new(),
             stats: EdgeStats::default(),
             out: Vec::new(),
-            seen: HashMap::new(),
+            seen: HashSet::new(),
+            actions: &[],
         }
     }
 
@@ -112,6 +116,8 @@ impl<'a> EdgeBuilder<'a> {
         let files = self.files;
         for (path, entry) in files {
             self.seen.clear();
+            self.actions = &entry.facts.actions;
+            let first = self.out.len();
             let from = path.as_str();
             match entry.kind {
                 Some(SourceKind::Ruby) => {
@@ -125,10 +131,14 @@ impl<'a> EdgeBuilder<'a> {
                 }
                 None => {}
             }
+            if !self.actions.is_empty() {
+                self.drop_scoped_twins(first);
+            }
         }
         (self.out, self.stats)
     }
 
+    /// Pushes an edge scoped to the action whose body contains `line`, if any.
     fn push(
         &mut self,
         from: &'a str,
@@ -138,19 +148,46 @@ impl<'a> EdgeBuilder<'a> {
         line: u32,
         detail: &str,
     ) {
+        let scope = actions::action_at(self.actions, line).map(|a| a.name.as_str());
+        self.push_scoped(from, to, kind, confidence, line, detail, scope);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_scoped(
+        &mut self,
+        from: &'a str,
+        to: &'a str,
+        kind: EdgeKind,
+        confidence: Confidence,
+        line: u32,
+        detail: &str,
+        scope: Option<&'a str>,
+    ) {
         if from == to {
             return;
         }
-        // Keep the first (lowest-line) occurrence per (to, kind).
-        if self.seen.contains_key(&(to, kind)) {
+        // Keep the first (lowest-line) occurrence per (to, kind, scope).
+        if !self.seen.insert((to, kind, scope)) {
             return;
         }
-        self.seen.insert((to, kind), self.out.len());
-        self.out.push(
-            Edge::new(from, to, kind, confidence)
-                .at(line)
-                .detail(truncate(detail)),
-        );
+        let mut edge = Edge::new(from, to, kind, confidence)
+            .at(line)
+            .detail(truncate(detail));
+        edge.from_scope = scope.map(String::from);
+        self.out.push(edge);
+    }
+
+    /// An unscoped edge already covers the whole file: drop the same
+    /// (to, kind) scoped to an action among the edges from `first` on.
+    fn drop_scoped_twins(&mut self, first: usize) {
+        let whole: HashSet<(&str, EdgeKind)> = self.seen
+            .iter()
+            .filter(|(_, _, s)| s.is_none())
+            .map(|(t, k, _)| (*t, *k))
+            .collect();
+        let mut tail = self.out.split_off(first);
+        tail.retain(|e| e.from_scope.is_none() || !whole.contains(&(e.to.as_str(), e.kind)));
+        self.out.append(&mut tail);
     }
 
     /// Defining files of a declaration, applying `namespace_definition_limit`.
@@ -467,13 +504,22 @@ impl<'a> EdgeBuilder<'a> {
             let mut targets = self.views.templates_for_prefix(prefix);
             targets.extend(self.views.layout(prefix));
             for to in targets {
-                self.push(
+                // `<prefix>/<action>.*` belongs to that action alone, unless rendered from elsewhere.
+                let stem = paths::stem(to);
+                let scope = self
+                    .actions
+                    .iter()
+                    .find(|a| a.template_scoped && a.name == stem && paths::split_view_path(to)
+                        .is_some_and(|(_, rest)| paths::dir_of(rest) == prefix))
+                    .map(|a| a.name.as_str());
+                self.push_scoped(
                     from,
                     to,
                     EdgeKind::RailsView,
                     Confidence::Inferred,
                     0,
                     &detail,
+                    scope,
                 );
             }
             for r in &entry.facts.renders {
@@ -488,14 +534,20 @@ impl<'a> EdgeBuilder<'a> {
                 if found.is_empty() {
                     self.stats.renders_unresolved += 1;
                 }
+                // Layouts wrap every action that uses them: never scoped.
+                let scope = match r.kind {
+                    RenderKind::Layout => None,
+                    _ => actions::action_at(self.actions, r.line).map(|a| a.name.as_str()),
+                };
                 for to in found {
-                    self.push(
+                    self.push_scoped(
                         from,
                         to,
                         EdgeKind::RailsView,
                         Confidence::Inferred,
                         r.line,
                         &r.name,
+                        scope,
                     );
                 }
             }
