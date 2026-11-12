@@ -77,6 +77,105 @@ pub struct VariantResult {
     pub tests: Option<TestsCase>,
 }
 
+/// Co-change list sizes reported.
+pub const KS: [usize; 3] = [5, 10, 20];
+const KMAX: usize = 20;
+
+/// One co-change configuration measured in the gain analysis.
+pub struct GainConfig {
+    pub name: String,
+    /// Index into `Ctx::history`.
+    pub history: usize,
+    /// Its `limit` is ignored (lists are taken up to 20).
+    pub query: ripple_history::PartnerQuery,
+}
+
+/// A leave-one-out target seen by the graph and by co-change.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GainCase {
+    pub file: String,
+    pub bucket: &'static str,
+    /// Depth at which the file-level graph finds it, either direction (`None` = not within D).
+    pub graph: Option<u32>,
+    /// 0-based position in the co-change list of the other files: raw,
+    /// excluding the graph's depth ≤ 1 set, excluding its depth ≤ 3 set.
+    pub rank: [Option<u8>; 3],
+    /// Length of those lists (each capped at 20).
+    pub len: [u8; 3],
+    /// How many of the first K (5, 10, 20) entries of the raw list are in
+    /// the graph's depth ≤ 1 set.
+    pub raw_in_d1: [u8; 3],
+}
+
+/// One changed file alone as the seed: its raw co-change list.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GainSingle {
+    pub len: u8,
+    /// Positions in the list holding another non-test changed file of the commit.
+    pub hits: Vec<u8>,
+    pub others: u32,
+    /// The same for the list without the seed's graph depth ≤ 1 set
+    /// (either direction): what would be shown next to the graph.
+    pub len_ex1: u8,
+    pub hits_ex1: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GainResult {
+    pub config: String,
+    pub loo: Vec<GainCase>,
+    pub single: Vec<GainSingle>,
+}
+
+/// Graph-vs-history comparison for every configuration on one commit.
+pub fn gain(ctx: &Ctx, truth: &Truth, configs: &[GainConfig]) -> Vec<GainResult> {
+    use crate::predict::{GraphPredictor, cochange};
+    use std::collections::HashSet;
+    let graph = GraphPredictor { name: "file", min_confidence: crate::adapter::Confidence::Heuristic, file_level: true };
+    let targets = &truth.targets;
+    let mut out: Vec<GainResult> = configs.iter().map(|c| GainResult { config: c.name.clone(), loo: Vec::new(), single: Vec::new() }).collect();
+    let none = HashSet::new();
+    if targets.len() >= 2 {
+        for (i, f) in targets.iter().enumerate() {
+            let seeds: Vec<Seed> = targets.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, s)| s.clone()).collect();
+            let p = graph.predict(ctx, &seeds, D as u32);
+            let mut depth: HashMap<NodeId, u32> = p.dependents.iter().copied().collect();
+            for &(n, d) in &p.dependencies {
+                let e = depth.entry(n).or_insert(d);
+                *e = (*e).min(d);
+            }
+            let d1: HashSet<NodeId> = depth.iter().filter(|e| *e.1 <= 1).map(|e| *e.0).collect();
+            let d3: HashSet<NodeId> = depth.keys().copied().collect();
+            let path = ctx.index.path(f.node).to_string();
+            for (c, r) in configs.iter().zip(out.iter_mut()) {
+                let q = ripple_history::PartnerQuery { limit: KMAX, ..c.query };
+                let lists = [cochange(ctx, c.history, &q, &seeds, &none), cochange(ctx, c.history, &q, &seeds, &d1), cochange(ctx, c.history, &q, &seeds, &d3)];
+                r.loo.push(GainCase {
+                    file: path.clone(),
+                    bucket: bucket(&path),
+                    graph: depth.get(&f.node).copied(),
+                    rank: std::array::from_fn(|k| lists[k].iter().position(|&n| n == f.node).map(|x| x as u8)),
+                    len: std::array::from_fn(|k| lists[k].len() as u8),
+                    raw_in_d1: std::array::from_fn(|k| lists[0].iter().take(KS[k]).filter(|n| d1.contains(n)).count() as u8),
+                });
+            }
+        }
+    }
+    for (i, f) in targets.iter().enumerate() {
+        let one = std::slice::from_ref(f);
+        let p = graph.predict(ctx, one, 1);
+        let d1: HashSet<NodeId> = p.dependents.iter().chain(&p.dependencies).map(|&(n, _)| n).collect();
+        let hits_of = |list: &[NodeId]| -> Vec<u8> { list.iter().enumerate().filter(|(_, n)| targets.iter().enumerate().any(|(j, t)| j != i && t.node == **n)).map(|(x, _)| x as u8).collect() };
+        for (c, r) in configs.iter().zip(out.iter_mut()) {
+            let q = ripple_history::PartnerQuery { limit: KMAX, ..c.query };
+            let list = cochange(ctx, c.history, &q, one, &none);
+            let ex1 = cochange(ctx, c.history, &q, one, &d1);
+            r.single.push(GainSingle { len: list.len() as u8, hits: hits_of(&list), others: targets.len() as u32 - 1, len_ex1: ex1.len() as u8, hits_ex1: hits_of(&ex1) });
+        }
+    }
+    out
+}
+
 /// Where a file lives, for the miss classification.
 pub fn bucket(path: &str) -> &'static str {
     let lower = path.to_ascii_lowercase();
@@ -237,7 +336,7 @@ mod tests {
     #[test]
     fn leave_one_out_both_directions() {
         let ix = index();
-        let ctx = Ctx { index: &ix, diff: &[] };
+        let ctx = Ctx { index: &ix, diff: &[], history: &[] };
         // Commit changed a, c and the yml. Spec of a also changed.
         let truth = Truth { targets: ["app/a.rb", "app/c.rb", "config/x.yml"].iter().map(|p| seed(&ix, p)).collect(), tests: vec![ix.node("spec/a_spec.rb").unwrap()] };
         let r = measure(&ctx, &truth, &file());
@@ -265,7 +364,7 @@ mod tests {
     #[test]
     fn confidence_and_method_seeds_narrow_the_prediction() {
         let ix = index();
-        let ctx = Ctx { index: &ix, diff: &[] };
+        let ctx = Ctx { index: &ix, diff: &[], history: &[] };
         let single = |p: &dyn Predictor, s: Seed| measure(&ctx, &Truth { targets: vec![s], tests: vec![] }, p).single[0].size;
         let exact = GraphPredictor { name: "x", min_confidence: Confidence::Exact, file_level: true };
         assert_eq!(single(&file(), seed(&ix, "app/a.rb")), [3, 4, 5]);
@@ -285,13 +384,69 @@ mod tests {
     #[test]
     fn same_dir_baseline() {
         let ix = index();
-        let ctx = Ctx { index: &ix, diff: &[] };
+        let ctx = Ctx { index: &ix, diff: &[], history: &[] };
         let truth = Truth { targets: ["app/a.rb", "lib/e.rb"].iter().map(|p| seed(&ix, p)).collect(), tests: vec![] };
         let r = measure(&ctx, &truth, &SameDir);
         let by: HashMap<&str, &LooCase> = r.loo.iter().map(|c| (c.file.as_str(), c)).collect();
         assert_eq!(by["app/a.rb"].rev, None, "only lib/ is predicted");
         assert_eq!((by["lib/e.rb"].rev, by["lib/e.rb"].size_rev), (None, [3, 3, 3]), "app/b, c, d");
         assert!(r.tests.is_none());
+    }
+
+    /// History: config/x.yml changes with app/a.rb (3 of 3), app/b.rb with
+    /// app/a.rb once, spec/a_spec.rb with app/a.rb (a test: never listed).
+    fn history() -> ripple_history::History {
+        let o = ripple_history::Options { min_together: 1, ..Default::default() };
+        let c: Vec<(&str, i64, &[&str])> = vec![
+            ("c5", 5, &["app/a.rb", "config/x.yml", "spec/a_spec.rb"]),
+            ("c4", 4, &["app/a.rb", "config/x.yml", "spec/a_spec.rb"]),
+            ("c3", 3, &["app/a.rb", "config/x.yml", "app/b.rb"]),
+            ("c2", 2, &["lib/e.rb"]),
+            ("c1", 1, &["app/d.rb"]),
+            ("c0", 0, &["app/c.rb"]),
+        ];
+        ripple_history::History::from_commits("p", &o, &c)
+    }
+
+    #[test]
+    fn cochange_predictors_and_gain() {
+        use crate::predict::{CoChange, cochange_variants};
+        let ix = index();
+        let h = [history()];
+        let ctx = Ctx { index: &ix, diff: &[], history: &h };
+        let truth = Truth { targets: ["app/a.rb", "config/x.yml"].iter().map(|p| seed(&ix, p)).collect(), tests: vec![] };
+        // Alone, unfiltered: x.yml is predicted from a.rb and vice versa; the spec never is.
+        let q = ripple_history::PartnerQuery { limit: 5, min_together: 1, min_confidence: 0.0, min_lift: 0.0, ..Default::default() };
+        let alone = CoChange { name: "c".into(), history: 0, query: q, graph_depth1: false };
+        let r = measure(&ctx, &truth, &alone);
+        let by: HashMap<&str, &LooCase> = r.loo.iter().map(|c| (c.file.as_str(), c)).collect();
+        assert_eq!((by["config/x.yml"].rev, by["app/a.rb"].rev), (Some(1), Some(1)));
+        // From a.rb: x.yml (3/3) then b.rb (1/3).
+        assert_eq!(by["config/x.yml"].size_rev, [2, 2, 2]);
+        // With graph depth 1: b, d, svc (dependents of a) + x.yml; b is not counted twice.
+        let both = CoChange { name: "g".into(), history: 0, query: q, graph_depth1: true };
+        let r = measure(&ctx, &truth, &both);
+        let x = r.loo.iter().find(|c| c.file == "config/x.yml").unwrap();
+        assert_eq!((x.union(), x.size_union[0]), (Some(1), 4));
+        assert!(r.tests.is_none());
+        // Gain: the graph misses x.yml at any depth; history recovers it at rank 0 in every list.
+        let g = gain(&ctx, &truth, &[GainConfig { name: "u".into(), history: 0, query: q }]);
+        let x = g[0].loo.iter().find(|c| c.file == "config/x.yml").unwrap();
+        assert_eq!((x.graph, x.rank, x.len), (None, [Some(0); 3], [2, 1, 1]), "b.rb is a graph neighbour of a.rb");
+        assert_eq!(x.raw_in_d1, [1, 1, 1]);
+        let a = g[0].loo.iter().find(|c| c.file == "app/a.rb").unwrap();
+        assert_eq!((a.graph, a.rank[0]), (None, Some(0)));
+        assert_eq!(g[0].single.iter().map(|s| (s.len, s.hits.clone())).collect::<Vec<_>>(), [(2, vec![0]), (2, vec![0])]);
+        // Next to the graph: a.rb's list loses b.rb (a direct dependent).
+        assert_eq!((g[0].single[0].len_ex1, g[0].single[0].hits_ex1.clone()), (1, vec![0]));
+        // Default filters (t≥3, conf≥0.3, lift≥2): a.rb -> x.yml passes (3/3, base rate 3/6).
+        assert_eq!(cochange_variants().len(), 6);
+        let d = &cochange_variants()[0];
+        let r = measure(&ctx, &truth, d.as_ref());
+        assert_eq!(r.loo.iter().find(|c| c.file == "config/x.yml").unwrap().rev, Some(1));
+        // No history: empty predictions, never a panic.
+        let ctx = Ctx { index: &ix, diff: &[], history: &[] };
+        assert!(measure(&ctx, &truth, d.as_ref()).loo.iter().all(|c| c.rev.is_none()));
     }
 
     #[test]

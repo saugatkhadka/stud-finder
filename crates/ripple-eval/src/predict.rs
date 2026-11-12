@@ -21,6 +21,9 @@ pub struct Ctx<'a> {
     /// dependents that mention a changed method").
     #[allow(dead_code)]
     pub diff: &'a [FileChange],
+    /// Co-change histories built strictly from commits older than the one
+    /// being measured (at its parent), one per configuration (see `main`).
+    pub history: &'a [ripple_history::History],
 }
 
 /// Predicted files as `(node, depth)`, seeds excluded, each node at most once
@@ -85,6 +88,65 @@ impl Predictor for SameDir {
         let dependents = (0..ctx.index.node_count() as NodeId).filter(|n| !seed_nodes.contains(n) && dirs.contains(dir_of(ctx.index.path(*n)))).map(|n| (n, 1)).collect();
         Prediction { dependents, dependencies: Vec::new() }
     }
+}
+
+/// Co-change partners of the seeds (ripple-history), at most `limit` non-test
+/// graph nodes, seeds excluded. `graph_depth1`: the graph's direct
+/// neighbours in both directions (file-level) plus up to `limit` partners
+/// that are not among them: what an agent would be shown as hop 1 plus
+/// "usually changes with this, not explained by the graph".
+pub struct CoChange {
+    pub name: String,
+    /// Index into `Ctx::history`.
+    pub history: usize,
+    pub query: ripple_history::PartnerQuery,
+    pub graph_depth1: bool,
+}
+
+/// The co-change list for `seeds` as node ids; tests, non-nodes and
+/// `known` skipped before the limit.
+pub fn cochange(ctx: &Ctx, history: usize, query: &ripple_history::PartnerQuery, seeds: &[Seed], known: &std::collections::HashSet<NodeId>) -> Vec<NodeId> {
+    let Some(h) = ctx.history.get(history) else { return Vec::new() };
+    let paths: Vec<&str> = seeds.iter().map(|s| ctx.index.path(s.node)).collect();
+    let skip = |p: &str| ctx.index.node(p).is_none_or(|n| ctx.index.is_test(n) || known.contains(&n));
+    h.partners_with(&paths, query, skip).iter().filter_map(|p| ctx.index.node(&p.path)).collect()
+}
+
+impl Predictor for CoChange {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_graph(&self) -> bool {
+        false
+    }
+    fn predict(&self, ctx: &Ctx, seeds: &[Seed], _max_depth: u32) -> Prediction {
+        let mut p = if self.graph_depth1 {
+            GraphPredictor { name: "", min_confidence: Confidence::Heuristic, file_level: true }.predict(ctx, seeds, 1)
+        } else {
+            Prediction::default()
+        };
+        let have: std::collections::HashSet<NodeId> = p.dependents.iter().chain(&p.dependencies).map(|&(n, _)| n).collect();
+        p.dependents.extend(cochange(ctx, self.history, &self.query, seeds, &have).into_iter().map(|n| (n, 1)));
+        p
+    }
+}
+
+/// The query `ripple.yml` defaults ask for (`history:`), without its limit.
+pub fn default_query() -> ripple_history::PartnerQuery {
+    ripple_history::PartnerQuery::from_config(&ripple_core::config::HistoryConfig::default())
+}
+
+/// The co-change rows of the standard tables: the default query at K = 5, 10, 20, alone and with graph depth 1.
+pub fn cochange_variants() -> Vec<Box<dyn Predictor>> {
+    let mut v: Vec<Box<dyn Predictor>> = Vec::new();
+    for graph_depth1 in [false, true] {
+        for k in crate::metrics::KS {
+            let query = ripple_history::PartnerQuery { limit: k, ..default_query() };
+            let name = if graph_depth1 { format!("graph1+cochange@{k}") } else { format!("cochange@{k}") };
+            v.push(Box::new(CoChange { name, history: 0, query, graph_depth1 }));
+        }
+    }
+    v
 }
 
 /// The variants run side by side. The first one is the reference for the
