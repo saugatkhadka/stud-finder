@@ -111,6 +111,47 @@ rules:
     risk: critical
     require: [add_tests]
 
+  # Signals from git history, complexity and existing coverage reports. A rule
+  # whose signal is not ready does not fire and adds a warning.
+  - id: churning-complex-billing
+    when:
+      touches: [billing]
+      churn_over: 15                    # commits in the last 90 days
+      complexity_over: 250
+    risk: high
+
+  - id: very-complex-method
+    when: { max_method_complexity_over: 50 }
+    risk: medium
+
+  - id: billing-poorly-covered
+    when:
+      touches: [billing]
+      coverage_under: 60                # unknown coverage never counts
+      changed_lines_coverage_under: 80  # needs a diff (--base / --staged)
+    risk: high
+    require: [add_tests]
+
+  - id: dead-in-tests
+    when:
+      uncovered: true
+      uncovered_includes_unknown: false
+    risk: medium
+
+  - id: hotspot-change
+    when: { hotspot: true }             # top rank.hotspot_percent of `ripple rank`
+    risk: high
+    require: [human_review]
+
+  - id: missing-partner
+    when:
+      missing_cochange: true
+      cochange_min_confidence: 0.6
+    risk: low
+
+rank:
+  hotspot_percent: 5
+
 query:
   max_depth: 3              # hops from a changed file; 0 = unlimited (usually "everything")
   min_confidence: heuristic

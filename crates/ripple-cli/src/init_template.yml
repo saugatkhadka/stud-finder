@@ -124,6 +124,54 @@ rules:
     risk: medium
     require: [add_tests]
 
+  # Rules on git history, complexity and coverage. A rule whose signal is not
+  # ready (history still building, no coverage report in coverage/) does not
+  # fire and adds one warning instead. Uncomment to use.
+  # - id: hot-and-complex
+  #   when:
+  #     churn_over: 20                # changed in more than 20 commits in the last 90 days
+  #     complexity_over: 300          # file complexity (sum of methods + top level)
+  #   risk: high
+  #
+  # - id: gnarly-method
+  #   when:
+  #     max_method_complexity_over: 40   # its most complex method
+  #   risk: medium
+  #
+  # - id: poorly-covered
+  #   when:
+  #     touches_tier: high
+  #     coverage_under: 50            # line coverage of a changed file, from existing reports
+  #   risk: high                      # (a file in no report never counts)
+  #
+  # - id: new-code-untested
+  #   when:
+  #     changed_lines_coverage_under: 60   # coverage of the lines the diff touches (needs a diff)
+  #   risk: medium
+  #   require: [add_tests]
+  #
+  # - id: no-coverage
+  #   when:
+  #     uncovered: true               # a changed file has 0% line coverage...
+  #     uncovered_includes_unknown: false  # ...true also counts files in no report
+  #   risk: medium
+  #
+  # - id: hotspot
+  #   when:
+  #     hotspot: true                 # in the top rank.hotspot_percent of `ripple rank`
+  #   risk: high
+  #   require: [human_review]
+  #
+  # - id: forgot-a-partner
+  #   when:
+  #     missing_cochange: true        # a file that usually changes with a changed one is not in the diff
+  #     cochange_min_confidence: 0.6  # ...in at least 60% of its commits (default 0.5)
+  #   risk: low
+
+# `ripple rank`: files in the top this-many percent are hotspots.
+# rank:
+#   hotspot_percent: 5
+
 query:
   max_depth: 3                    # hops to follow from a changed file; 0 = unlimited
   min_confidence: heuristic       # exact | inferred | heuristic

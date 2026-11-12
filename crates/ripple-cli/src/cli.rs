@@ -739,7 +739,7 @@ mod tests {
     }
 
     fn uses_every_when_key(src: &str) {
-        for key in ["touches:", "touches_tier:", "reaches:", "reaches_tier:", "within:", "impacted_files_over:", "changed_files_over:", "changed_lines_over:", "crosses_boundary:", "touches_global:", "untested:", "min_confidence:"] {
+        for key in ["touches:", "touches_tier:", "reaches:", "reaches_tier:", "within:", "impacted_files_over:", "changed_files_over:", "changed_lines_over:", "crosses_boundary:", "touches_global:", "untested:", "min_confidence:", "churn_over:", "complexity_over:", "max_method_complexity_over:", "coverage_under:", "changed_lines_coverage_under:", "uncovered:", "uncovered_includes_unknown:", "hotspot:", "missing_cochange:", "cochange_min_confidence:"] {
             assert!(src.contains(key), "missing {key}");
         }
     }

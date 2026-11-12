@@ -57,6 +57,8 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 | `schema` | Print the JSON Schema of the report (`schema_version` 2). |
 | `why FROM TO` | Shortest dependency path between two files, in either direction. `--scope NAME`: only paths into that method / action of TO (says so when only a file-level path exists). |
 | `areas FILE` | How `ripple.yml` classifies a file: areas, test, global, language. |
+| `file FILE` | One file's profile in at most ~40 lines: language, areas / tier / owners, test and global flags, size and complexity, the 5 most complex methods with line ranges (and their coverage), churn, coverage and uncovered methods, dependents (count and the most depended-on few), dependencies, direct tests, co-change partners, hotspot rank and the state of every signal. `--format text\|json`. |
+| `rank` | Riskiest files first (see [Hotspot ranking](#hotspot-ranking)). `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`, `--format text\|json`. Each row says why it ranks where it does. |
 | `stats` | Index size, scope ranges (`files_with_scopes`, `scopes`), per-phase timings, extractor counters, warnings, daemon info. |
 | `init [--force]`, `config check` | Starter config; validation plus how many files each area matches. |
 | `daemon status\|start\|stop`, `serve [--foreground]` | Manage the daemon. |
@@ -125,6 +127,7 @@ ripple: ripple.yml: invalid configuration:
 | `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
 | `history` | see right | Co-change from git history ("usually changes with this"), a separate signal that is never a graph edge and never feeds risk: `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`; bigger commits are sweeps), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). Defaults chosen by `ripple-eval` replay. |
 | `coverage` | see right | Existing test-coverage reports, read and never produced (ripple never runs tests): `enabled` (`true`), `paths` (`[]` = auto-detect `coverage/.resultset.json`, `coverage/lcov.info`, `coverage/lcov/*.lcov`, `coverage/coverage-final.json`; entries are files, directories or `*` globs in the last component), `max_age_days` (none; older reports are labelled stale, not hidden). |
+| `rank.hotspot_percent` | `5` | Files in this top share of `ripple rank` are hotspots (the `hotspot` rule condition, `metrics.hotspot.hotspot`). |
 | `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
 
 **Globs** follow gitignore conventions:
@@ -162,6 +165,22 @@ All the conditions in a rule must hold for it to fire. A rule with an empty
 | `touches_global: true\|false` | A changed file matches `global_files`. |
 | `untested: true\|false` | A changed, non-deleted source file has no test among its transitive dependents. |
 | `min_confidence: C` | For this rule, ignores edges below C in `reaches*`, `impacted_files_over`, `crosses_boundary` and `untested`. |
+| `churn_over: N` | A changed source file (not a test, not deleted) changed in more than N commits in the last 90 days of the history window. |
+| `complexity_over: N` | A changed source file's complexity (sum of its methods' plus decisions outside methods) is above N. |
+| `max_method_complexity_over: N` | A changed source file has a method of complexity above N. |
+| `coverage_under: P` | A changed source file's line coverage is below P% (0–100). A file in no coverage report is unknown and never counts. |
+| `changed_lines_coverage_under: P` | The coverable lines the diff added or changed in a file are covered below P%. Needs a diff (a `no_line_counts` warning otherwise). |
+| `uncovered: true\|false` | A changed source file has known 0% coverage. With `uncovered_includes_unknown: true`, a file in no report counts too. |
+| `hotspot: true\|false` | A changed source file is in the top `rank.hotspot_percent` of `ripple rank`. |
+| `missing_cochange: true\|false` | A file outside the diff changed together with a changed file in at least `cochange_min_confidence` (0–1, default `0.5`) of that file's commits (from git history; graph neighbours count too). |
+
+The last eight read **signals** besides the graph: complexity (from the
+index), churn and co-change (git history), coverage (existing reports) and
+the hotspot rank. A rule that needs a signal that is not ready (history
+still building, no coverage report, signal disabled) does not fire and adds
+one `rule_signal_not_ready` warning naming the signal and why. Each fired
+rule's reason names the files and numbers, for example
+`changed in more than 20 commits in the last 90 days: \`app/models/purchase.rb\` (41 commits)`.
 
 **Built-in default rules**, used only when `rules` is absent or empty:
 
@@ -330,7 +349,18 @@ What each section means:
 - **`policy`**: present only when `ripple.yml` defines rules or areas and a
   rule fired, or always for `check`. Rule semantics and CI exit codes are as
   described under Configuration.
-- **`usually_changes_with`**: reserved for co-change history. It is absent.
+- **`changed[].metrics`** (non-test, non-deleted files; each part absent when
+  unknown or its signal is not ready):
+  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, of, percentile, hotspot}}`.
+  `coverage` is absent for a file in no report (unknown, not 0%);
+  `changed_lines_percent` needs a diff; `stale` (only when true) means the
+  report predates HEAD or `coverage.max_age_days`.
+- **`signals`**: `{complexity, churn, cochange, coverage, hotspot}`, each
+  `{state: ready|building|loading|disabled|unavailable, reason?}`.
+- **`usually_changes_with`**: at most 5 files outside the diff and its direct
+  dependents that git history shows changing with a changed file:
+  `{path, via, together, of, why}`. Absent when there are none or co-change
+  is not ready. (The daemon's envelope `history` keeps the raw data.)
 
 Changing `ripple.yml` itself does not count as a change to analyse. It gives
 one `ripple_config_changed` warning.
@@ -372,9 +402,14 @@ risk HIGH  rules impacted_over_200, reaches_critical_direct, crosses_boundary  o
 blind spots: methods matched by name; receivers untyped; JS/TS and send/try not checked; also run: rg -w formatted_disputed_amount
 ```
 
-The order is: summary, removed methods, incomplete, changed, dependents,
-inherit-only, also-mentions, relies-on, further, tests, the one-line policy,
-warnings, and blind spots. The markdown format (for `check`) carries the same
+Each changed source file is followed by one metrics line, for example
+`cx 433 (max 88) · churn 41/90d · cov 62% (changed lines 20%) · hotspot #3 of 2114`.
+
+The order is: summary, removed methods, incomplete, changed (with metrics),
+dependents, inherit-only, also-mentions, relies-on, further, tests,
+"usually changes with" (at most 5 lines), the one-line policy, warnings,
+blind spots, and one `not ready:` line naming signals that are building,
+loading or unavailable. The markdown format (for `check`) carries the same
 sections.
 
 Warning codes include:
@@ -388,6 +423,7 @@ Warning codes include:
 - `deleted_file_still_imported` (cold index only: JS/TS files whose imports of
   a deleted file no longer resolve)
 - `ripple_config_changed`
+- `rule_signal_not_ready` (a rule needs churn, complexity, coverage, co-change or the hotspot rank and it is not ready)
 - `config_invalid`
 - extractor warnings about the changed files themselves
 
@@ -531,6 +567,48 @@ itself and the files directly connected to it in the graph, which the report
 already shows. `stats` has a `history` object with the state, build timings,
 sidecar size, memory and counters.
 
+### Coverage in the daemon
+
+Coverage reports are read, never produced. The daemon loads them on a
+low-priority background thread at start, then reloads only when
+`sources_changed` says a report file appeared, disappeared or changed. That
+check is a few `stat` calls, made on a watcher event under a report path or
+at most every 5 seconds on a query; a query never parses a report. The new
+coverage is swapped in as an `Arc`. States: `disabled` (`coverage.enabled:
+false`), `loading`, `ready`, `unavailable` (no report found: picked up as soon as
+one appears; a report that failed to parse is retried after 60 s). One-shot mode loads existing reports
+inline (Gumroad's 900 KB SimpleCov file: about 20 ms) and never runs tests.
+`stats` has a `coverage` object (state, reports, files, unmapped, load time,
+memory).
+
+### Hotspot ranking
+
+`ripple rank` scores non-test Ruby and JS/TS files of the index. The formula
+lives in one place, `RANK_FORMULA` in `crates/ripple-cli/src/signals.rs`, and
+`rank --format json` prints it:
+
+```
+score = 100 * (2*churn + 2*complexity + 1*dependents + 1*uncovered) / (sum of the weights used)
+churn      = percentile of (commits in the last 90 days, then all commits in the window)
+complexity = mean(percentile of file complexity, percentile of the most complex method);
+             a file without methods counts 0 for both (the max-method guard)
+dependents = percentile of direct dependents (fan-in)
+uncovered  = 1 - line coverage, only for files in a coverage report (else the weight is dropped;
+             churn's too when git history is unavailable)
+percentile(x) = share of ranked files with a strictly smaller value
+hotspot    = rank <= ceil(files * rank.hotspot_percent / 100)
+```
+
+Percentiles rather than raw products keep one huge value from dominating.
+The ranking is computed lazily, once per (index generation, history head,
+coverage load), and cached. `impact` never computes it: it uses the cached
+ranking and starts one background recompute when the cache is out of date
+(at most every 2 s), so `metrics.hotspot` may be missing for a moment after
+an edit. `ripple rank` waits for an up-to-date ranking; `ripple file` uses
+the cached one and computes it only when there is none. The hotspot percentile
+appears in `ripple file`, in `changed[].metrics.hotspot` and in the `hotspot`
+rule condition.
+
 ### Protocol
 
 The protocol is newline-delimited JSON over the Unix socket. Each request
@@ -550,6 +628,8 @@ Methods:
 | `dependents`, `dependencies` | `file`, `scopes` (dependents only), `depth`, `min_confidence`, `sync`, `no_wait`, `max_wait_ms` |
 | `why` | `from`, `to`, `scopes`, `sync`, `no_wait`, `max_wait_ms` |
 | `areas` | `file`, `sync`, `no_wait`, `max_wait_ms` |
+| `file` | `file`, `sync`, `no_wait`, `max_wait_ms` (the result is JSON; the client renders text) |
+| `rank` | `limit`, `path` (globs), `area`, `by` (`score`\|`churn`\|`complexity`\|`coverage`), `sync`, `no_wait`, `max_wait_ms` |
 | `stats` | — |
 | `reload` | — |
 | `shutdown` | — |
