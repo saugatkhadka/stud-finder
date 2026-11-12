@@ -95,7 +95,8 @@ pub struct JsCallSite {
     pub method: Option<String>,
     /// URL path with dynamic segments normalised to `:param`
     /// (`` `/api/v1/statuses/${id}/favourite` `` -> `/api/v1/statuses/:param/favourite`).
-    /// Query strings and origins stripped. Always starts with `/`.
+    /// Query strings and origins stripped. The leading slash is kept exactly as
+    /// written: `v1/foo` (relative to a client base URL) stays `v1/foo`.
     pub url: String,
     /// The callee as written (`fetch`, `axios.get`, `api().post`, `Routes.user_path`, ...).
     pub callee: String,

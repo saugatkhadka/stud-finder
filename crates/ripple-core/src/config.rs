@@ -113,6 +113,10 @@ pub struct BoundaryConfig {
     /// Only URLs starting with one of these are matched against routes.
     /// Empty = any URL starting with `/`.
     pub url_prefixes: Vec<String>,
+    /// Base paths prepended to call-site URLs written without a leading slash
+    /// (an API client configured with a base URL: `apiRequest("GET", "v1/foo")`
+    /// with base `/api/`). Each base is tried in order.
+    pub url_bases: Vec<String>,
 }
 
 impl Default for BoundaryConfig {
@@ -122,6 +126,7 @@ impl Default for BoundaryConfig {
             routes: vec!["config/routes.rb".into(), "config/routes/**/*.rb".into()],
             http_callees: Vec::new(),
             url_prefixes: Vec::new(),
+            url_bases: vec!["/".into(), "/api/".into()],
         }
     }
 }
