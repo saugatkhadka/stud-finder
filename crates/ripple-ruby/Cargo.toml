@@ -13,3 +13,7 @@ serde_json.workspace = true
 rubydex = "=0.4.3"
 ruby-prism = "2.1"
 rayon = "1.10"
+
+[features]
+# Memory attribution hooks for the `ripple-memprof` tool.
+mem-profile = []

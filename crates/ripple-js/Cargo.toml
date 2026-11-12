@@ -27,3 +27,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Memory attribution hooks for the `ripple-memprof` tool.
+mem-profile = []

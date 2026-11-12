@@ -15,7 +15,7 @@ pub struct EdgeData {
     pub kind: EdgeKind,
     pub confidence: Confidence,
     pub line: u32,
-    /// Index into `Graph::details`, or `u32::MAX` for none.
+    /// Index into `Graph::detail_ends`, or `u32::MAX` for none.
     detail: u32,
     /// Interned `Edge::from_scope` / `Edge::to_scope`, or `u32::MAX` for none.
     from_scope: u32,
@@ -62,12 +62,16 @@ impl Csr {
 
 #[derive(Debug, Default)]
 pub struct Graph {
+    /// Sorted (node ids follow path order), so [`Graph::id`] is a binary
+    /// search and no path is stored twice.
     paths: Vec<RelPath>,
-    index: HashMap<RelPath, NodeId>,
     /// (from, to) per edge id.
     endpoints: Vec<(NodeId, NodeId)>,
     data: Vec<EdgeData>,
-    details: Vec<String>,
+    /// Distinct edge details, concatenated; detail `i` ends at
+    /// `detail_ends[i]` and starts where detail `i - 1` ends.
+    detail_text: Box<str>,
+    detail_ends: Box<[u32]>,
     scopes: Vec<String>,
     /// [`name_id`] of each scope, to match `to_scope`s against method names.
     scope_ids: Vec<u32>,
@@ -219,7 +223,6 @@ impl Graph {
             remap[old as usize] = new as NodeId;
         }
         let paths: Vec<RelPath> = order.iter().map(|&i| names[i as usize].to_string()).collect();
-        let index: HashMap<RelPath, NodeId> = paths.iter().enumerate().map(|(i, p)| (p.clone(), i as NodeId)).collect();
 
         // Sort so the best duplicate (highest confidence, then lowest line) comes first, then dedup.
         let mut scope_ids: HashMap<&str, u32> = HashMap::new();
@@ -263,17 +266,20 @@ impl Graph {
                 || (fs != ANY && ts != ANY && present.contains(&(k.0, k.1, k.2, ANY, ANY))))
         });
 
-        let mut details = Vec::new();
+        let mut detail_ids: HashMap<&str, u32> = HashMap::new();
+        let mut detail_text = String::new();
+        let mut detail_ends: Vec<u32> = Vec::new();
         let mut endpoints = Vec::with_capacity(keyed.len());
         let mut data = Vec::with_capacity(keyed.len());
         for k in &keyed {
             let e = edges[k.6 as usize];
             endpoints.push((k.0, k.1));
             let detail = match &e.detail {
-                Some(d) => {
-                    details.push(d.clone());
-                    (details.len() - 1) as u32
-                }
+                Some(d) => *detail_ids.entry(d.as_str()).or_insert_with(|| {
+                    detail_text.push_str(d);
+                    detail_ends.push(detail_text.len() as u32);
+                    (detail_ends.len() - 1) as u32
+                }),
                 None => u32::MAX,
             };
             data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail, from_scope: k.3 .0, to_scope: k.3 .1, inherit: k.7 });
@@ -295,7 +301,9 @@ impl Graph {
         drop(scope);
         let scope_ids = scopes.iter().map(|s| name_id(s)).collect();
         let mentions = vec![None; n];
-        Self { paths, index, endpoints, data, details, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]) }
+        drop(detail_ids);
+        let (detail_text, detail_ends) = (detail_text.into_boxed_str(), detail_ends.into_boxed_slice());
+        Self { paths, endpoints, data, detail_text, detail_ends, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]) }
     }
 
     /// Attaches the per-file method mentions that let method-level queries
@@ -304,7 +312,7 @@ impl Graph {
     pub fn set_mentions(&mut self, table: &MentionTable) {
         self.mentions = vec![None; self.paths.len()];
         for (path, m) in &table.files {
-            if let Some(&n) = self.index.get(path) {
+            if let Some(n) = self.id(path) {
                 self.mentions[n as usize] = Some(m.clone());
             }
         }
@@ -323,7 +331,7 @@ impl Graph {
         self.endpoints.len()
     }
     pub fn id(&self, path: &str) -> Option<NodeId> {
-        self.index.get(path).copied()
+        self.paths.binary_search_by(|p| p.as_str().cmp(path)).ok().map(|i| i as NodeId)
     }
     pub fn path(&self, node: NodeId) -> &str {
         &self.paths[node as usize]
@@ -338,7 +346,10 @@ impl Graph {
     pub fn edge_detail(&self, edge: u32) -> Option<&str> {
         match self.data[edge as usize].detail {
             u32::MAX => None,
-            i => Some(&self.details[i as usize]),
+            i => {
+                let start = if i == 0 { 0 } else { self.detail_ends[i as usize - 1] as usize };
+                Some(&self.detail_text[start..self.detail_ends[i as usize] as usize])
+            }
         }
     }
     /// Files that directly depend on `node`, with the connecting edge id.

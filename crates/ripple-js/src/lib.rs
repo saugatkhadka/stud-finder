@@ -29,6 +29,8 @@ mod tsconfig;
 mod vfs;
 mod vue;
 mod workspaces;
+#[cfg(feature = "mem-profile")]
+pub mod memprof;
 
 use anyhow::Result;
 use callsites::CallSiteConfig;

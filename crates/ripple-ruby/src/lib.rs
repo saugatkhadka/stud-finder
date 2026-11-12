@@ -20,8 +20,11 @@ mod paths;
 mod rails;
 mod scoped;
 mod shadow;
+mod slim;
 mod templates;
 mod views;
+#[cfg(feature = "mem-profile")]
+pub mod memprof;
 
 use analyse::{Analysed, FileEntry};
 use inflector::Inflector;
@@ -401,6 +404,9 @@ impl Extractor for RubyExtractor {
             method_level: ws.config.ruby.method_level,
         };
         state.apply(analysed);
+        // Inserting in key order leaves B-tree leaves half full, and a
+        // `FileEntry` is 512 bytes: a bulk rebuild packs them (GitLab: -15 MB).
+        state.files = std::mem::take(&mut state.files).into_iter().collect();
         t.merge_us = micros(start);
         t.resolve_us = state.resolve();
         state.inconsistent = shadow::misattached(&state.graph);
