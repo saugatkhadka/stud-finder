@@ -118,6 +118,7 @@ ripple: ripple.yml: invalid configuration:
 | `ci.fail_on` | none | `check` exits 1 at or above this risk. |
 | `ci.github` | `true` | Write `$GITHUB_STEP_SUMMARY` under Actions. |
 | `ci.max_listed` | `50` | Files listed in the markdown and text output; it ends with "…and N more". |
+| `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
 | `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
 
 **Globs** follow gitignore conventions:
@@ -299,8 +300,23 @@ Warning codes include:
   `.git/` and waits for the watcher to report it. That covers edits to files
   the request does not name. Freshness is not just about the named files:
   editing another file can add an edge to the named one.
+- **Diffs are computed in the daemon.** For `impact --base`, `--staged` and
+  the default work-tree diff, the client sends the diff spec (`"diff"`) and
+  the daemon answers it from a cache. It first writes a cookie (as for
+  `--sync`), so every file event before the request is seen. Then it re-runs
+  git only for the paths that changed since the last answer: the watcher
+  reports work-tree paths, and the daemon reads `.git/index` itself to find
+  staged changes. Commits, checkouts, resets, stash and ref updates are
+  detected from `HEAD`, the refs and `packed-refs`, and the merge base is
+  cached per ref value. Changes to `.gitignore`, `.gitattributes`, git
+  config, `info/exclude`, or more than 1,000 paths at once, trigger a full
+  recompute. So does a watcher overflow. The result is the same as the
+  client-side `git diff`, which one-shot mode (`--no-daemon`, CI) still uses.
+  The daemon runs git with `GIT_OPTIONAL_LOCKS=0`, so it never rewrites the
+  index.
 - **Requests never wait for unrelated work.** Each connection has its own
-  thread. If a re-index is already running and none of the request's files
+  thread (at most 128 at once; more clients wait in the listen queue). A
+  connection that sends nothing for 10 minutes is closed. If a re-index is already running and none of the request's files
   are pending, the daemon answers from the current snapshot at once and
   reports `index.pending_changes`.
 - **Deletions and renames.** While the daemon is running, a deleted file
@@ -328,13 +344,17 @@ Methods:
 
 | Method | Params |
 |---|---|
-| `impact` | `files`, `changed` (entries may carry `hunks`: `[{start, count, removes_definition?}]`), `scopes`, `file_level`, `max_depth`, `min_confidence`, `format`, `color`, `limit`, `max_listed`, `sync` |
+| `impact` | `files`, `changed` (entries may carry `hunks`: `[{start, count, removes_definition?}]`), `diff` (`{"base": "REF"}`, `{"staged": true}` or `{}` for the work tree; not combined with `files`/`changed`), `scopes`, `file_level`, `max_depth`, `min_confidence`, `format`, `color`, `limit`, `max_listed`, `sync` |
 | `dependents`, `dependencies` | `file`, `scopes` (dependents only), `depth`, `min_confidence` |
 | `why` | `from`, `to`, `scopes` |
 | `areas` | `file` |
 | `stats` | — |
 | `reload` | — |
 | `shutdown` | — |
+
+Every response carries `"protocol": 2`. A response without it comes from an
+older daemon, which ignores `diff`: the client then computes the diff itself
+and asks again with `changed`, and prints a hint to restart the daemon.
 
 The full description is in the module docs of
 `crates/ripple-cli/src/protocol.rs`.
@@ -407,8 +427,8 @@ per-extractor counters.
 - Each incremental pass rebuilds the whole graph. On a 400k-edge graph that
   costs about 0.3 s. Queries that do not name a pending file are not blocked
   during the pass.
-- The daemon has no idle timeout. Stop it with `ripple daemon stop`. A daemon
-  from an older ripple binary keeps running until it is stopped.
+- A daemon from an older ripple binary keeps running until it is stopped or
+  its idle timeout passes.
 - Git submodules are not indexed. Symlinks are taken as git lists them.
 - Unix only (Unix sockets, `flock`).
 
