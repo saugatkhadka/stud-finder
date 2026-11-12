@@ -561,12 +561,16 @@ replies say `"state": "building"` and carry no history data.
   shallow clone, or git failed; the reason is given). Churn and co-change
   are flagged separately (`churn_available`, `cochange` +
   `cochange_reason`).
-- **Sidecar.** `<git common dir>/ripple/history.bin`, shared by linked
-  worktrees and written atomically (temporary file + rename). A daemon
-  starts from it at once. If it is behind HEAD, it is updated
-  incrementally (only the new commits are read) when the old head is an
-  ancestor, and rebuilt otherwise. An unreadable or corrupt file is
-  rebuilt.
+- **Sidecar.** `<git common dir>/ripple/history.bin` for the main work
+  tree and `history-<name>.bin` next to it for a linked worktree (`<name>`
+  as in `.git/worktrees/<name>`), written atomically (temporary file +
+  rename). Each work tree writes only its own file, so worktrees at
+  diverged HEADs do not overwrite each other's cache. A daemon starts from
+  its own file at once, or, if that is missing or unusable, from any
+  sibling's file whose head is an ancestor of its HEAD. If the file is
+  behind HEAD, it is updated incrementally (only the new commits are read);
+  with no usable file, it is rebuilt. An unreadable or corrupt file is
+  rebuilt. Files of removed worktrees are deleted on the next save.
 - **Updates.** HEAD moves are taken from the existing watcher (`HEAD`,
   `refs/heads/*` and `packed-refs`) and from the diff cache's HEAD check.
   They are debounced (500 ms), and deferred while a rebase, cherry-pick or

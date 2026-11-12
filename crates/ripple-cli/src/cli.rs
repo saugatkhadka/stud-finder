@@ -93,7 +93,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
-    /// The git-history cache (churn, co-change) at `<git dir>/ripple/history.bin`.
+    /// The git-history cache (churn, co-change) at `<git common dir>/ripple/history[-<worktree>].bin`.
     History {
         #[command(subcommand)]
         cmd: HistoryCmd,

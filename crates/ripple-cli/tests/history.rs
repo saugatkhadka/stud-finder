@@ -151,6 +151,44 @@ fn sidecar_is_reused_across_restarts() {
 }
 
 #[test]
+fn worktrees_at_diverged_heads_keep_their_own_sidecar() {
+    let repo = repo();
+    // (No leading dot: git would rename the worktree's admin directory.)
+    let wt = repo.root.with_file_name(format!("{}-wt", repo.root.file_name().unwrap().to_string_lossy().trim_start_matches('.')));
+    git(&repo.root, &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()]);
+    let wt_sidecar = std::fs::canonicalize(&repo.root).unwrap().join(".git/ripple").join(format!("history-{}.bin", wt.file_name().unwrap().to_string_lossy()));
+    ripple_cli::historyd::cli_build(&repo.root, None).unwrap();
+    // The new work tree starts from the main one's file: an update, not a build.
+    std::fs::write(wt.join("lib/a.txt"), "feat\n").unwrap();
+    git(&wt, &["commit", "-qam", "on feat"]);
+    {
+        let d = Daemon::start(&wt);
+        let s = wait_history(&d, "the feat HEAD", |h| h["head"] == head(&wt).as_str() && h["updating"].is_null());
+        assert_eq!((s["build"]["from_sidecar"].as_bool(), s["build"]["incremental"].as_bool()), (Some(true), Some(true)), "{s}");
+        assert_eq!(s["counters"]["builds"], 0, "{s}");
+    }
+    assert!(wt_sidecar.is_file());
+    // main moves on (diverging); its file is updated, the work tree's left alone.
+    repo.write("app/c.txt", "v2\n");
+    repo.commit("on main");
+    ripple_cli::historyd::cli_build(&repo.root, None).unwrap();
+    assert_eq!(ripple_history::History::load(&sidecar(&repo.root)).unwrap().head(), head(&repo.root));
+    assert_eq!(ripple_history::History::load(&wt_sidecar).unwrap().head(), head(&wt));
+    // Restarting either daemon reuses its own file as is: no rebuild ping-pong.
+    for root in [&wt, &repo.root] {
+        let d = Daemon::start(root);
+        let s = wait_history(&d, "ready", |h| h["state"] == "ready");
+        assert_eq!(s["head"], head(root));
+        assert_eq!(s["build"]["from_sidecar"], true, "{s}");
+        assert_eq!((s["counters"]["builds"].as_u64(), s["counters"]["updates"].as_u64()), (Some(0), Some(0)), "{s}");
+    }
+    // A removed work tree's file is dropped on the next save.
+    git(&repo.root, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+    ripple_cli::historyd::cli_build(&repo.root, None).unwrap();
+    assert!(!wt_sidecar.exists());
+}
+
+#[test]
 fn corrupt_sidecar_is_rebuilt() {
     let repo = repo();
     let p = sidecar(&repo.root);
