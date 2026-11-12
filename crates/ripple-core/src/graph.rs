@@ -348,8 +348,11 @@ impl Graph {
     /// unchanged. Edges inside one file (method calls method) cost no depth.
     pub fn impact_scoped(&self, seeds: &[(NodeId, Option<Vec<String>>)], opts: QueryOpts) -> Impact {
         const ALL: u32 = u32::MAX;
-        /// A named scope no edge refers to: affected, but leads nowhere.
+        /// A named scope no edge refers to: only whole-file and inheritance
+        /// edges lead on from it.
         const NOWHERE: u32 = u32::MAX - 1;
+        /// "Nothing another file can depend on changed": leads nowhere.
+        const NOTHING: u32 = u32::MAX - 2;
         let mut position = vec![u32::MAX; self.paths.len()];
         let mut whole = vec![false; self.paths.len()];
         let mut partial: HashSet<(NodeId, u32)> = HashSet::new();
@@ -373,7 +376,7 @@ impl Graph {
             found.push((Hit { node, depth: 0, via: node, edge: u32::MAX }, acts.len() as u32));
             let mut scopes = match scopes {
                 None => vec![ALL],
-                Some(v) if v.is_empty() => vec![NOWHERE],
+                Some(v) if v.is_empty() => vec![NOTHING],
                 Some(v) => v,
             };
             scopes.sort_unstable();
@@ -392,7 +395,7 @@ impl Graph {
         // 0-1 breadth-first search: same-file hops go to the front of the queue.
         while let Some(i) = queue.pop_front() {
             let cur = acts[i as usize];
-            if cur.scope == NOWHERE {
+            if cur.scope == NOTHING {
                 continue;
             }
             for (next, edge) in self.reverse.neighbours(cur.node) {
@@ -610,7 +613,8 @@ mod tests {
         assert_eq!(run(None, 0), run(Some(&["audit"]), 0));
         assert_eq!(run(Some(&[crate::model::SCOPE_BODY]), 0), run(None, 0));
         // A method nobody mentions, and "no method changed" (comment-only diff), reach nothing.
-        assert_eq!(run(Some(&["unknown"]), 0), "");
+        // A method no edge names still affects whole-file dependents and heirs.
+        assert_eq!(run(Some(&["unknown"]), 0), "sub:1");
         assert_eq!(run(Some(&[]), 0), "");
         let imp = g.impact_scoped(&[(id("model"), Some(vec![]))], QueryOpts { file_level: true, ..Default::default() });
         assert_eq!(imp.hits.len(), 8, "file-level mode ignores scopes");

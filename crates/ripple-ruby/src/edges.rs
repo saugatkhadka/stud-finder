@@ -10,6 +10,7 @@ use crate::analyse::FileEntry;
 use crate::inflector::Inflector;
 use crate::paths::{self, SourceKind};
 use crate::rails::{ClassName, RequireKind};
+use crate::scoped::{Interner, Plan};
 use crate::views::{RenderKind, ViewIndex};
 use ripple_core::{Confidence, Edge, EdgeKind};
 use rubydex::model::graph::Graph;
@@ -63,10 +64,17 @@ pub struct EdgeBuilder<'a> {
     cache: HashMap<DeclarationId, Option<Rc<Targets<'a>>>>,
     pub stats: EdgeStats,
     out: Vec<Edge>,
-    /// Per-`from` dedup of (to, kind, from_scope).
-    seen: HashSet<(&'a str, EdgeKind, Option<&'a str>)>,
+    /// Per-`from` dedup of (to, kind, from_scope, inherit).
+    seen: HashSet<(&'a str, EdgeKind, Option<&'a str>, bool)>,
     /// Action ranges of the current `from` (empty unless it is a controller).
     actions: &'a [Action],
+    /// Method-level scopes (`ruby.method_level`), if on.
+    plan: Option<(&'a Plan, &'a Interner)>,
+    /// Index of the current `from` in `files`, and its entry.
+    cur: usize,
+    entry: Option<&'a FileEntry>,
+    /// Parallel to `out`: the edge is a constant reference.
+    is_ref: Vec<bool>,
 }
 
 impl<'a> EdgeBuilder<'a> {
@@ -76,6 +84,7 @@ impl<'a> EdgeBuilder<'a> {
         all_files: &'a [String],
         limit: usize,
         inflector: Inflector,
+        plan: Option<(&'a Plan, &'a Interner)>,
     ) -> Self {
         let views = ViewIndex::new(
             files
@@ -109,14 +118,21 @@ impl<'a> EdgeBuilder<'a> {
             out: Vec::new(),
             seen: HashSet::new(),
             actions: &[],
+            plan,
+            cur: 0,
+            entry: None,
+            is_ref: Vec::new(),
         }
     }
 
-    pub fn run(mut self) -> (Vec<Edge>, EdgeStats) {
+    /// Edges, which of them are constant references, stats.
+    pub fn run(mut self) -> (Vec<Edge>, Vec<bool>, EdgeStats) {
         let files = self.files;
-        for (path, entry) in files {
+        for (i, (path, entry)) in files.iter().enumerate() {
             self.seen.clear();
             self.actions = &entry.facts.actions;
+            self.cur = i;
+            self.entry = Some(entry);
             let first = self.out.len();
             let from = path.as_str();
             match entry.kind {
@@ -135,7 +151,7 @@ impl<'a> EdgeBuilder<'a> {
                 self.drop_scoped_twins(first);
             }
         }
-        (self.out, self.stats)
+        (self.out, self.is_ref, self.stats)
     }
 
     /// Pushes an edge scoped to the action whose body contains `line`, if any.
@@ -149,7 +165,43 @@ impl<'a> EdgeBuilder<'a> {
         detail: &str,
     ) {
         let scope = actions::action_at(self.actions, line).map(|a| a.name.as_str());
-        self.push_scoped(from, to, kind, confidence, line, detail, scope);
+        self.push_full(from, to, kind, confidence, line, detail, scope, false, false);
+    }
+
+    /// A constant reference at byte `offset` (if known): scoped to the
+    /// enclosing action, or with method-level scopes to the enclosing method.
+    #[allow(clippy::too_many_arguments)]
+    fn push_ref(
+        &mut self,
+        from: &'a str,
+        to: &'a str,
+        kind: EdgeKind,
+        confidence: Confidence,
+        line: u32,
+        detail: &str,
+        offset: Option<u32>,
+        inherit: bool,
+    ) {
+        let inherit = inherit && self.plan.is_some();
+        let scope = if inherit { None } else { self.scope_at(line, offset) };
+        self.push_full(from, to, kind, confidence, line, detail, scope, true, inherit);
+    }
+
+    fn scope_at(&self, line: u32, offset: Option<u32>) -> Option<&'a str> {
+        if let Some(a) = actions::action_at(self.actions, line) {
+            return Some(a.name.as_str());
+        }
+        let ((plan, names), off, entry) = (self.plan?, offset?, self.entry?);
+        let fs = &plan.files[self.cur];
+        if fs.controller {
+            return None;
+        }
+        let defs = &entry.methods.defs;
+        let i = defs.partition_point(|d| d.start_off <= off).checked_sub(1)?;
+        if off >= defs[i].end_off {
+            return None;
+        }
+        fs.def_scope[i].map(|id| names.get(id))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -163,18 +215,36 @@ impl<'a> EdgeBuilder<'a> {
         detail: &str,
         scope: Option<&'a str>,
     ) {
+        self.push_full(from, to, kind, confidence, line, detail, scope, false, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_full(
+        &mut self,
+        from: &'a str,
+        to: &'a str,
+        kind: EdgeKind,
+        confidence: Confidence,
+        line: u32,
+        detail: &str,
+        scope: Option<&'a str>,
+        is_ref: bool,
+        inherit: bool,
+    ) {
         if from == to {
             return;
         }
-        // Keep the first (lowest-line) occurrence per (to, kind, scope).
-        if !self.seen.insert((to, kind, scope)) {
+        // Keep the first (lowest-line) occurrence per (to, kind, scope, inherit).
+        if !self.seen.insert((to, kind, scope, inherit)) {
             return;
         }
         let mut edge = Edge::new(from, to, kind, confidence)
             .at(line)
             .detail(truncate(detail));
         edge.from_scope = scope.map(String::from);
+        edge.inherit = inherit;
         self.out.push(edge);
+        self.is_ref.push(is_ref);
     }
 
     /// An unscoped edge already covers the whole file: drop the same
@@ -182,12 +252,17 @@ impl<'a> EdgeBuilder<'a> {
     fn drop_scoped_twins(&mut self, first: usize) {
         let whole: HashSet<(&str, EdgeKind)> = self.seen
             .iter()
-            .filter(|(_, _, s)| s.is_none())
-            .map(|(t, k, _)| (*t, *k))
+            .filter(|(_, _, s, inherit)| s.is_none() && !inherit)
+            .map(|(t, k, _, _)| (*t, *k))
             .collect();
-        let mut tail = self.out.split_off(first);
-        tail.retain(|e| e.from_scope.is_none() || !whole.contains(&(e.to.as_str(), e.kind)));
-        self.out.append(&mut tail);
+        let tail = self.out.split_off(first);
+        let refs = self.is_ref.split_off(first);
+        for (e, r) in tail.into_iter().zip(refs) {
+            if e.from_scope.is_none() || e.inherit || !whole.contains(&(e.to.as_str(), e.kind)) {
+                self.out.push(e);
+                self.is_ref.push(r);
+            }
+        }
     }
 
     /// Defining files of a declaration, applying `namespace_definition_limit`.
@@ -338,13 +413,15 @@ impl<'a> EdgeBuilder<'a> {
                         if let Some(t) = self.top_level_fallback(r.name_id) {
                             self.stats.refs_top_level_fallback += 1;
                             for &to in &t.files {
-                                self.push(
+                                self.push_ref(
                                     from,
                                     to,
                                     EdgeKind::RubyConstant,
                                     Confidence::Exact,
                                     r.line,
                                     t.name,
+                                    Some(r.offset),
+                                    r.inherit,
                                 );
                             }
                             continue;
@@ -365,7 +442,7 @@ impl<'a> EdgeBuilder<'a> {
                 self.stats.refs_external += 1;
             }
             for &to in &t.files {
-                self.push(from, to, EdgeKind::RubyConstant, confidence, r.line, t.name);
+                self.push_ref(from, to, EdgeKind::RubyConstant, confidence, r.line, t.name, Some(r.offset), r.inherit);
             }
         }
     }
@@ -404,13 +481,15 @@ impl<'a> EdgeBuilder<'a> {
             match candidates.iter().find_map(|c| self.lookup_name(c)) {
                 Some(t) => {
                     for &to in &t.files {
-                        self.push(
+                        self.push_ref(
                             from,
                             to,
                             EdgeKind::RailsInferred,
                             Confidence::Inferred,
                             inf.line,
                             t.name,
+                            Some(inf.offset),
+                            false,
                         );
                     }
                 }
@@ -611,13 +690,15 @@ impl<'a> EdgeBuilder<'a> {
             match targets {
                 Some(t) => {
                     for &to in &t.files {
-                        self.push(
+                        self.push_ref(
                             from,
                             to,
                             EdgeKind::RailsView,
                             Confidence::Inferred,
                             *line,
                             t.name,
+                            None,
+                            false,
                         );
                     }
                 }

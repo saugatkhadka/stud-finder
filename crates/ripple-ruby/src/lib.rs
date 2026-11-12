@@ -15,8 +15,10 @@ mod analyse;
 mod edges;
 mod inflector;
 mod lex;
+mod methods;
 mod paths;
 mod rails;
+mod scoped;
 mod shadow;
 mod templates;
 mod views;
@@ -47,6 +49,13 @@ struct State {
     /// [`shadow::misattached`] after the last build/update, as the baseline
     /// for detecting inconsistencies an update introduces.
     inconsistent: HashSet<NameId>,
+    /// Method names, workspace-wide. Append-only: ids never leak into the
+    /// output (edges carry the names), so history does not matter.
+    names: scoped::Interner,
+    /// `ruby.method_level` the cached facts were collected with.
+    method_level: bool,
+    /// `ruby.name_only_limit` the edges were assembled with.
+    name_only_limit: usize,
 }
 
 impl RubyExtractor {
@@ -80,15 +89,17 @@ fn wanted_files(ws: &Workspace) -> BTreeMap<&str, SourceKind> {
 
 fn analyse_all(ws: &Workspace, todo: &[(&str, SourceKind)]) -> Vec<Analysed> {
     let roots = &ws.config.ruby.autoload_roots;
+    let method_level = ws.config.ruby.method_level;
     todo.par_iter()
-        .map(|(path, kind)| analyse::analyse(&ws.root, path, *kind, roots))
+        .map(|(path, kind)| analyse::analyse(&ws.root, path, *kind, roots, method_level))
         .collect()
 }
 
 impl State {
     /// Applies analysed files to the Rubydex graph and the per-file cache.
     fn apply(&mut self, analysed: Vec<Analysed>) {
-        for a in analysed {
+        for mut a in analysed {
+            self.names.globalize(&mut a.entry.methods);
             match a.local_graph {
                 Some(lg) => self.graph.consume_document_changes(lg),
                 None if a.entry.kind == Some(SourceKind::Ruby) => {
@@ -111,15 +122,31 @@ impl State {
             Some(Ok(src)) => Inflector::new().with_app_rules(&src),
             _ => Inflector::new(),
         };
+        let plan = ws
+            .config
+            .ruby
+            .method_level
+            .then(|| scoped::Plan::new(&self.files, &self.names));
         let builder = edges::EdgeBuilder::new(
             &self.graph,
             &self.files,
             &ws.files,
             ws.config.ruby.namespace_definition_limit,
             inflector,
+            plan.as_ref().map(|p| (p, &self.names)),
         );
-        let (edges, es) = builder.run();
+        let (edges, is_ref, es) = builder.run();
         let edges_us = micros(start);
+        let start = Instant::now();
+        let (edges, scopes, method_stats): (_, _, BTreeMap<String, u64>) = match &plan {
+            Some(plan) => {
+                let o = scoped::finish(edges, is_ref, &self.files, &self.names, plan, self.name_only_limit);
+                (o.edges, o.scopes, o.stats)
+            }
+            // `method_level` off: exactly the file-level output (no scope ranges).
+            None => (edges, BTreeMap::new(), BTreeMap::new()),
+        };
+        let methods_us = micros(start);
 
         let mut stats = BTreeMap::new();
         let mut put = |k: &str, v: u64| {
@@ -209,12 +236,21 @@ impl State {
         put("ruby_time_merge_us", t.merge_us);
         put("ruby_time_resolve_us", t.resolve_us);
         put("ruby_time_edges_us", edges_us);
+        if plan.is_some() {
+            put("ruby_time_methods_us", methods_us);
+        }
+        for (k, v) in method_stats {
+            put(&k, v);
+        }
         put("ruby_time_shadow_repair_us", t.shadow_us);
         put("ruby_shadow_docs_reindexed", t.shadow_docs as u64);
 
         ExtractOutput {
             edges,
-            facts: Default::default(),
+            facts: ripple_core::Facts {
+                scopes,
+                ..Default::default()
+            },
             warnings: self
                 .files
                 .values()
@@ -344,6 +380,9 @@ impl Extractor for RubyExtractor {
             graph: Graph::new(),
             files: BTreeMap::new(),
             inconsistent: HashSet::new(),
+            names: scoped::Interner::default(),
+            method_level: ws.config.ruby.method_level,
+            name_only_limit: ws.config.ruby.name_only_limit,
         };
         state.apply(analysed);
         t.merge_us = micros(start);
@@ -360,7 +399,7 @@ impl Extractor for RubyExtractor {
     /// the cache is analysed and any cached file no longer wanted is dropped,
     /// so the result always matches a fresh `build` of `ws.files`.
     fn update(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
-        let Some(state) = self.state.as_mut() else {
+        let Some(state) = self.state.as_mut().filter(|s| s.method_level == ws.config.ruby.method_level && s.name_only_limit == ws.config.ruby.name_only_limit) else {
             return self.build(ws);
         };
         let wanted = wanted_files(ws);

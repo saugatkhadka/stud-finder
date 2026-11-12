@@ -13,9 +13,113 @@ pub struct TemplateFacts {
     pub renders: Vec<Render>,
     /// Receiverless identifiers (candidate helper calls), first line each.
     pub idents: Vec<(String, u32)>,
+    /// Method names the template's Ruby mentions (calls with or without a
+    /// receiver, symbols, labels, identifier-like strings), first line each.
+    pub mentions: Vec<(String, u32)>,
+    /// Over-collected names (`.name` anywhere in the raw text, identifiers in
+    /// any `#{...}`), for edges only.
+    pub crude: Vec<(String, u32)>,
+    /// Dispatches on a computed name (`send(x)`, `try(x)`, `eval`).
+    pub dynamic: bool,
 }
 
+const TEMPLATE_BY_NAME: &[&str] = &["send", "public_send", "__send__", "try", "try!", "method", "public_method"];
+
+/// Mentions and dynamic dispatch in one fragment's tokens.
+fn mentions(toks: &[Token], facts: &mut TemplateFacts, seen: &mut std::collections::HashSet<String>) {
+    let mut push = |facts: &mut TemplateFacts, name: &str, line: u32| {
+        if !name.is_empty() && seen.insert(name.to_string()) {
+            facts.mentions.push((name.to_string(), line));
+        }
+    };
+    for (i, t) in toks.iter().enumerate() {
+        match &t.tok {
+            Tok::Ident { name, .. } => {
+                if is_keyword(name) && name != "render" {
+                    continue;
+                }
+                push(facts, name, t.line);
+                if crate::methods::is_constructor(name) {
+                    push(facts, "initialize", t.line);
+                }
+                if name == "eval" || name.ends_with("_eval") {
+                    facts.dynamic = true;
+                }
+                if TEMPLATE_BY_NAME.contains(&name.as_str()) {
+                    let mut j = i + 1;
+                    if matches!(toks.get(j).map(|t| &t.tok), Some(Tok::Punct('('))) {
+                        j += 1;
+                    }
+                    match toks.get(j) {
+                        Some(n) if n.line == t.line => match &n.tok {
+                            Tok::Sym(_) | Tok::Str(_) | Tok::Punct(')' | ']' | '}' | ',') => {}
+                            Tok::Ident { name, .. } if is_keyword(name) => {}
+                            _ => facts.dynamic = true,
+                        },
+                        _ => {}
+                    }
+                }
+            }
+            Tok::Sym(name) | Tok::Label(name) => push(facts, name, t.line),
+            Tok::Str(s) if crate::methods::identifier_like(s.as_bytes()) => push(facts, s, t.line),
+            _ => {}
+        }
+    }
+}
+
+/// `.name` anywhere in the raw text, and identifiers in every `#{...}`.
+fn crude(source: &str, lang: TemplateLang) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let b = source.as_bytes();
+    let mut line = 1u32;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\n' {
+            line += 1;
+        } else if b[i] == b'.' && b.get(i + 1).is_some_and(|c| c.is_ascii_lowercase() || *c == b'_') {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j < b.len() && matches!(b[j], b'?' | b'!') {
+                j += 1;
+            }
+            let name = &source[start..j];
+            if seen.insert(name.to_string()) {
+                out.push((name.to_string(), line));
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    if matches!(lang, TemplateLang::Haml | TemplateLang::Slim) {
+        let mut frags = Vec::new();
+        for (idx, l) in source.lines().enumerate() {
+            interpolations(l, idx as u32 + 1, &mut frags);
+        }
+        for (code, line) in frags {
+            for t in lex::tokenize(&code, line) {
+                if let Tok::Ident { name, .. } | Tok::Sym(name) | Tok::Label(name) = &t.tok
+                    && seen.insert(name.clone())
+                {
+                    out.push((name.clone(), t.line));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 pub fn collect(source: &str, lang: TemplateLang) -> TemplateFacts {
+    collect_with(source, lang, true)
+}
+
+/// `methods`: also collect method mentions and dynamic dispatch (`ruby.method_level`).
+pub fn collect_with(source: &str, lang: TemplateLang, methods: bool) -> TemplateFacts {
     let fragments = match lang {
         TemplateLang::Erb => erb(source),
         TemplateLang::Haml => haml(source),
@@ -24,9 +128,13 @@ pub fn collect(source: &str, lang: TemplateLang) -> TemplateFacts {
     };
     let mut facts = TemplateFacts::default();
     let mut seen_idents = std::collections::HashSet::new();
+    let mut seen_mentions = std::collections::HashSet::new();
     for (code, line) in fragments {
         let toks = lex::tokenize(&code, line);
         renders(&toks, &mut facts.renders);
+        if methods {
+            mentions(&toks, &mut facts, &mut seen_mentions);
+        }
         for t in &toks {
             match &t.tok {
                 Tok::Const(c) => facts.consts.push((c.clone(), t.line)),
@@ -39,6 +147,9 @@ pub fn collect(source: &str, lang: TemplateLang) -> TemplateFacts {
                 _ => {}
             }
         }
+    }
+    if methods && lang != TemplateLang::Ruby {
+        facts.crude = crude(source, lang);
     }
     facts
 }
@@ -497,6 +608,18 @@ mod tests {
                 line: 8
             }]
         );
+    }
+
+    #[test]
+    fn mentions_and_dynamic() {
+        let f = collect("<%= @purchase.refund_amount %>\n<%= link_to :x, foo_path(id: 1) %>\n<%= obj.try(:ok?) %>", TemplateLang::Erb);
+        let names: Vec<&str> = f.mentions.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["refund_amount", "link_to", "x", "foo_path", "id", "obj", "try", "ok?"]);
+        assert!(!f.dynamic);
+        assert!(collect("<%= obj.send(field) %>", TemplateLang::Erb).dynamic);
+        let f = collect(":javascript\n  var x = #{@p.price_cents};\n", TemplateLang::Haml);
+        assert!(f.mentions.is_empty());
+        assert!(f.crude.iter().any(|(n, _)| n == "price_cents"));
     }
 
     #[test]

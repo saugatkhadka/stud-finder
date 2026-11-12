@@ -47,6 +47,8 @@ pub struct InferredRef {
     /// `const_get` with `inherit = true` searches `Object` for modules.
     pub top_level_fallback: Option<String>,
     pub line: u32,
+    /// Byte offset of the call, to find the enclosing method.
+    pub offset: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,14 +87,21 @@ pub fn collect(source: &str, controller: bool) -> RubyFacts {
         return RubyFacts::default();
     }
     let result = ruby_prism::parse(source.as_bytes());
-    let root = result.node();
+    collect_root(&result.node(), source, controller)
+}
+
+/// Same as [`collect`] on an already parsed tree.
+pub fn collect_root(root: &Node, source: &str, controller: bool) -> RubyFacts {
     let mut v = Visitor {
         nesting: Vec::new(),
         facts: RubyFacts::default(),
+        offset: 0,
     };
-    v.visit(&root);
+    if controller || TRIGGERS.iter().any(|t| source.contains(t)) {
+        v.visit(root);
+    }
     if controller {
-        v.facts.actions = crate::actions::collect(&root);
+        v.facts.actions = crate::actions::collect(root);
     }
     v.facts
 }
@@ -100,6 +109,8 @@ pub fn collect(source: &str, controller: bool) -> RubyFacts {
 struct Visitor {
     nesting: Vec<String>,
     facts: RubyFacts,
+    /// Start offset of the call being handled.
+    offset: u32,
 }
 
 impl Visitor {
@@ -132,12 +143,14 @@ impl Visitor {
             absolute,
             top_level_fallback: None,
             line,
+            offset: self.offset,
         });
     }
 
     fn handle_call(&mut self, call: &CallNode) {
         let method = call.name().as_slice();
         let line = line_of(&call.location());
+        self.offset = call.location().start();
         let receiver = call.receiver();
         let receiverless = receiver.as_ref().is_none_or(|r| r.as_self_node().is_some());
         let args: Vec<Node> = call

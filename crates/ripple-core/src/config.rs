@@ -80,11 +80,18 @@ pub struct RubyConfig {
     /// at runtime (`send("#{x}_at")`) are covered only by the conservative
     /// fallbacks in the extractor. Set to false for plain file-level edges.
     pub method_level: bool,
+    /// With `method_level`: also link a call to a method by name alone when
+    /// the receiver's class is unknown (`user.purchases.first.refund!` never
+    /// names `Purchase`), provided at most this many files define that name.
+    /// 0 = off (default). Measured on Gumroad, 3 roughly doubles the blast
+    /// radius, mostly through generic names (`tags`, `subject`); these edges
+    /// are `heuristic` confidence.
+    pub name_only_limit: usize,
 }
 
 impl Default for RubyConfig {
     fn default() -> Self {
-        Self { enabled: true, namespace_definition_limit: 3, autoload_roots: Vec::new(), method_level: true }
+        Self { enabled: true, namespace_definition_limit: 3, autoload_roots: Vec::new(), method_level: true, name_only_limit: 0 }
     }
 }
 

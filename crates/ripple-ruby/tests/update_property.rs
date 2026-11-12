@@ -13,7 +13,11 @@
 //! existing file references, rename a class, restore a deleted file, edit a
 //! controller (a reference inside an action, a `private` before an action,
 //! one action calling another: these move edges between action scopes), and
-//! batch several of these into one `ChangeSet`. Edges compare with their scopes.
+//! batch several of these into one `ChangeSet`. Method-level operations: add a
+//! new method then later its first mention elsewhere (unmentioned -> scoped),
+//! add more definers of an existing method name (crossing the by-name LIMIT),
+//! and remove a whole `def`. Edges compare with their scopes and `inherit`
+//! flag, and `Facts.scopes` must match too.
 
 #[path = "../examples/support/mod.rs"]
 mod support;
@@ -60,7 +64,7 @@ fn fmt_edges(
     ws: &Workspace,
     ex: &mut RubyExtractor,
     changes: Option<&ChangeSet>,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let out = match changes {
         Some(c) => ex.update(ws, c),
         None => ex.build(ws),
@@ -81,7 +85,7 @@ fn fmt_edges(
         .iter()
         .map(|e| {
             format!(
-                "{} -> {} {:?} {:?} :{} @{:?}/{:?} {}",
+                "{} -> {} {:?} {:?} :{} @{:?}/{:?}{} {}",
                 e.from,
                 e.to,
                 e.kind,
@@ -89,6 +93,7 @@ fn fmt_edges(
                 e.line,
                 e.from_scope,
                 e.to_scope,
+                if e.inherit { " inherit" } else { "" },
                 e.detail.as_deref().unwrap_or("")
             )
         })
@@ -100,7 +105,45 @@ fn fmt_edges(
         .map(|w| format!("{} {:?} {}", w.code, w.file, w.message))
         .collect();
     warnings.sort();
-    (edges, warnings)
+    let scopes: Vec<String> = out
+        .facts
+        .scopes
+        .iter()
+        .map(|(f, v)| {
+            let r: Vec<String> = v.iter().map(|r| format!("{}:{}-{}", r.name, r.start, r.end)).collect();
+            format!("{f} {}", r.join(" "))
+        })
+        .collect();
+    (edges, warnings, scopes)
+}
+
+/// `def` lines of `lines` as (index, name, indent, end index).
+fn defs(lines: &[&str]) -> Vec<(usize, String, usize, usize)> {
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if !t.starts_with("def ") || t.starts_with("def self.") {
+            continue;
+        }
+        let indent = l.len() - t.len();
+        let name: String = t[4..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '?' | '!'))
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let end = if t.ends_with(" end") || t.ends_with(";end") {
+            Some(i)
+        } else {
+            let close = format!("{}end", " ".repeat(indent));
+            (i + 1..lines.len()).find(|j| lines[*j].trim_end() == close)
+        };
+        if let Some(end) = end {
+            out.push((i, name, indent, end));
+        }
+    }
+    out
 }
 
 struct Sim {
@@ -108,6 +151,8 @@ struct Sim {
     rng: support::Rng,
     deleted: Vec<(String, String)>,
     added: usize,
+    /// Methods added by op 9 that nothing mentions yet.
+    unmentioned: Vec<String>,
 }
 
 impl Sim {
@@ -155,7 +200,7 @@ impl Sim {
 
     /// Applies one random operation and returns what changed.
     fn op(&mut self, step: usize, changes: &mut ChangeSet) -> String {
-        match self.rng.below(9) {
+        match self.rng.below(12) {
             0 | 1 => {
                 let f = self.pick(&self.rb_files());
                 let c = self.some_constant();
@@ -280,6 +325,75 @@ impl Sim {
                 changes.modified.push(f.clone());
                 format!("controller {f}: {what}")
             }
+            9 => {
+                let f = self.pick(&self.rb_files());
+                let s = self.read(&f);
+                if self.unmentioned.is_empty() || self.rng.below(2) == 0 {
+                    // A new method nothing calls (denied as unmentioned) ...
+                    let name = format!("ripple_prop_method_{step}");
+                    let lines: Vec<&str> = s.lines().collect();
+                    let d = defs(&lines);
+                    let text = match d.first() {
+                        Some(&(at, _, indent, _)) => {
+                            let pad = " ".repeat(indent);
+                            let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                            out.insert(at, format!("{pad}def {name}\n{pad}  Time.now\n{pad}end\n"));
+                            out.join("\n") + "\n"
+                        }
+                        None => format!("{s}\ndef {name}\n  1\nend\n"),
+                    };
+                    self.write(&f, &text);
+                    self.unmentioned.push(name.clone());
+                    changes.modified.push(f.clone());
+                    format!("add unmentioned def {name} in {f}")
+                } else {
+                    // ... and later its first mention.
+                    let i = self.rng.below(self.unmentioned.len());
+                    let name = self.unmentioned.swap_remove(i);
+                    self.write(&f, &format!("{s}\nripple_receiver.{name}\n"));
+                    changes.modified.push(f.clone());
+                    format!("first mention of {name} in {f}")
+                }
+            }
+            10 => {
+                // More definers of an existing method name (1-3 new ones), which
+                // moves the name across the by-name LIMIT.
+                let models: Vec<String> = self.rb_files().into_iter().filter(|f| f.starts_with("app/")).collect();
+                let src = self.pick(&models);
+                let s = self.read(&src);
+                let names: Vec<String> = defs(&s.lines().collect::<Vec<_>>()).into_iter().map(|d| d.1).filter(|n| n.len() >= 4).collect();
+                if names.is_empty() {
+                    return "noop".into();
+                }
+                let name = names[self.rng.below(names.len())].clone();
+                let n = 1 + self.rng.below(3);
+                let mut to = Vec::new();
+                for _ in 0..n {
+                    let f = self.pick(&self.rb_files());
+                    let s = self.read(&f);
+                    self.write(&f, &format!("{s}\nclass RipplePropDefiner{step}\n  def {name}\n    nil\n  end\nend\n"));
+                    changes.modified.push(f.clone());
+                    to.push(f);
+                }
+                format!("{n} more definers of {name} (from {src}) in {to:?}")
+            }
+            11 => {
+                for _ in 0..20 {
+                    let f = self.pick(&self.rb_files());
+                    let s = self.read(&f);
+                    let lines: Vec<&str> = s.lines().collect();
+                    let d = defs(&lines);
+                    if d.is_empty() {
+                        continue;
+                    }
+                    let (at, name, _, end) = d[self.rng.below(d.len())].clone();
+                    let kept: Vec<&str> = lines.iter().enumerate().filter(|(i, _)| *i < at || *i > end).map(|(_, l)| *l).collect();
+                    self.write(&f, &(kept.join("\n") + "\n"));
+                    changes.modified.push(f.clone());
+                    return format!("remove def {name} (lines {}-{}) of {f}", at + 1, end + 1);
+                }
+                "noop".into()
+            }
             _ => match self.deleted.pop() {
                 Some((f, s)) => {
                     self.write(&f, &s);
@@ -314,6 +428,7 @@ fn update_equals_build_on_real_repo() {
         rng: support::Rng::new(seed),
         deleted: Vec::new(),
         added: 0,
+        unmentioned: Vec::new(),
     };
     let mut ex = RubyExtractor::new();
     fmt_edges(&support::workspace(&root), &mut ex, None);
@@ -340,6 +455,13 @@ fn update_equals_build_on_real_repo() {
             }
             for l in b.difference(&a).take(20) {
                 eprintln!("  extra in update:   {l}");
+            }
+            let (a, b) = (to_edge(&fresh.2), to_edge(&updated.2));
+            for l in a.difference(&b).take(10) {
+                eprintln!("  scopes missing in update: {l}");
+            }
+            for l in b.difference(&a).take(10) {
+                eprintln!("  scopes extra in update:   {l}");
             }
             panic!("step {step} ({what:?}): update != build");
         }

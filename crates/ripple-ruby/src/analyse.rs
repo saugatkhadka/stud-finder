@@ -6,6 +6,7 @@
 
 use crate::paths::{self, SourceKind};
 use crate::rails::{self, RubyFacts};
+use crate::methods::{self, MethodFacts};
 use crate::templates::{self, TemplateFacts};
 use ripple_core::Warning;
 use rubydex::diagnostic::Rule;
@@ -21,6 +22,10 @@ pub struct RefSite {
     pub name_id: NameId,
     /// 1-based.
     pub line: u32,
+    /// Byte offset of the reference, to find the enclosing method.
+    pub offset: u32,
+    /// Superclass, or argument of `include`/`extend`/`prepend`.
+    pub inherit: bool,
 }
 
 #[derive(Debug, Default)]
@@ -33,11 +38,15 @@ pub struct FileEntry {
     pub passthrough_refs: u32,
     pub facts: RubyFacts,
     pub template: TemplateFacts,
+    /// Methods defined and mentioned (Ruby files and templates).
+    pub methods: MethodFacts,
     /// Normalized constant names Zeitwerk would map this path to.
     pub zeitwerk_keys: Vec<String>,
     pub warnings: Vec<Warning>,
     /// The file could not be read; it contributes nothing.
     pub unreadable: bool,
+    /// The prism pass failed: no method facts, so no method precision.
+    pub methods_failed: bool,
 }
 
 pub struct Analysed {
@@ -46,7 +55,9 @@ pub struct Analysed {
     pub local_graph: Option<LocalGraph>,
 }
 
-pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String]) -> Analysed {
+/// `method_level`: also collect method facts (`ruby.method_level`); off, the
+/// prism pass is skipped for files with no Rails DSL, as before method scopes.
+pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String], method_level: bool) -> Analysed {
     let mut entry = FileEntry {
         kind: Some(kind),
         ..FileEntry::default()
@@ -110,14 +121,41 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String])
                     .file(rel),
                 ),
             }
-            match catch_unwind(AssertUnwindSafe(|| rails::collect(&source, controller))) {
-                Ok(f) => entry.facts = f,
-                Err(_) => entry.warnings.push(
-                    Warning::new("ruby_prism_panic", "Rails DSL pass panicked; skipped").file(rel),
-                ),
+            // One prism parse for the Rails DSL facts, actions and methods.
+            match catch_unwind(AssertUnwindSafe(|| {
+                if !method_level {
+                    return (rails::collect(&source, controller), MethodFacts::default());
+                }
+                let result = ruby_prism::parse(source.as_bytes());
+                let root = result.node();
+                (rails::collect_root(&root, &source, controller), methods::collect(&root, source.as_bytes()))
+            })) {
+                Ok((f, m)) => {
+                    entry.facts = f;
+                    entry.methods = m;
+                }
+                Err(_) => {
+                    // No method facts: the edge builder treats the file as opaque (whole file).
+                    entry.methods_failed = true;
+                    entry.warnings.push(
+                        Warning::new("ruby_prism_panic", "Rails DSL pass panicked; skipped").file(rel),
+                    )
+                }
+            }
+            let ranges = &entry.methods.inherit_ranges;
+            for r in &mut entry.refs {
+                // Rubydex reports a path's reference with the whole path's span.
+                r.inherit = ranges.iter().any(|&(s, e)| s <= r.offset && r.offset < e);
+            }
+            let mut seen = std::collections::HashSet::new();
+            entry.refs.retain(|r| seen.insert((r.line, r.name_id, r.inherit)));
+        }
+        SourceKind::Template(lang) => {
+            entry.template = templates::collect_with(&source, lang, method_level);
+            if method_level {
+                entry.methods = methods::from_template(&entry.template);
             }
         }
-        SourceKind::Template(lang) => entry.template = templates::collect(&source, lang),
     }
     Analysed {
         path: rel.to_string(),
@@ -177,11 +215,13 @@ fn collect_refs(lg: &LocalGraph, source: &str, entry: &mut FileEntry) {
             RefSite {
                 name_id: *r.name_id(),
                 line,
+                offset: start,
+                inherit: false,
             },
         ));
     }
     // HashMap iteration order is arbitrary; sort for deterministic output.
     refs.sort_by_key(|(start, r)| (*start, r.name_id.get()));
-    refs.dedup_by_key(|(_, r)| (r.line, r.name_id));
+    // Deduplicated per (line, name, inherit) once `inherit` is known.
     entry.refs = refs.into_iter().map(|(_, r)| r).collect();
 }

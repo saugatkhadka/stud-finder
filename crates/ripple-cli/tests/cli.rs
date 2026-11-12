@@ -377,9 +377,9 @@ fn scope_flag_and_file_level() {
     assert!(r["changed"][0]["scopes"].is_null());
     assert_eq!(r["query"]["file_level"], true);
 
-    // Unknown method: warned, nothing impacted.
+    // Unknown method: warned; only heirs and whole-file dependents are reached.
     let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--scope", "nope", "--format", "json"]);
-    assert_eq!(r["impacted"]["total"], 0);
+    assert_eq!(impacted_of(&r), ["app/sub.txt"]);
     assert!(r["warnings"].as_array().unwrap().iter().any(|w| w["code"] == "scope_unknown"), "{}", r["warnings"]);
     // --scope needs exactly one explicit file.
     let o = env.run(&["--no-daemon", "impact", "--scope", "refund!"]);
