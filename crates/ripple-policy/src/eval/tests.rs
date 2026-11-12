@@ -1102,3 +1102,257 @@ fn many_deleted_fixtures_do_not_flood_the_report() {
     assert_eq!(all.warnings.iter().filter(|w| w.code == "deleted_file_not_indexed").count(), 40);
     assert_eq!(all.tests.len(), 40);
 }
+
+// ---- signal conditions (churn, complexity, coverage, hotspot, co-change) ----
+
+use crate::signals::{ChurnMetric, CoChangeEntry, CoverageMetric, FileSignals, HotspotMetric, SignalInput, SignalState, SignalStatus};
+use ripple_core::metrics::{FileMetrics, MethodMetric, MetricsTable};
+
+/// The fixture graph with complexity metrics for two files.
+fn metrics_graph() -> Graph {
+    let mut g = fixture_graph();
+    let inv_methods = [MethodMetric { start: 3, span: 20, complexity: 30 }, MethodMetric { start: 30, span: 5, complexity: 4 }];
+    let table = MetricsTable::build(
+        [
+            ("app/models/invoice.rb", FileMetrics { lines: 200, complexity: 120, methods: 2, max_method: 30 }, &inv_methods[..]),
+            ("lib/util.rb", FileMetrics { lines: 10, complexity: 2, methods: 0, max_method: 0 }, &[][..]),
+        ],
+        true,
+    );
+    g.set_metrics([std::sync::Arc::new(table)]);
+    g
+}
+
+fn ready_signals() -> SignalInput {
+    let mut s = SignalInput { hotspot_percent: 5.0, ..Default::default() };
+    s.files.insert(
+        "app/models/invoice.rb".into(),
+        FileSignals {
+            churn: Some(ChurnMetric { commits: 60, recent_commits: 41, last_changed: Some(1_700_000_000) }),
+            coverage: Some(CoverageMetric { percent: Some(12.0), covered: 24, coverable: 200, changed_lines_percent: Some(20.0), stale: false }),
+            hotspot: Some(HotspotMetric { rank: 3, of: 2114, percentile: 99.9, hotspot: true }),
+        },
+    );
+    s.files.insert(
+        "lib/util.rb".into(),
+        FileSignals {
+            churn: Some(ChurnMetric { commits: 2, recent_commits: 0, last_changed: None }),
+            coverage: Some(CoverageMetric { percent: Some(0.0), covered: 0, coverable: 40, changed_lines_percent: None, stale: false }),
+            hotspot: Some(HotspotMetric { rank: 900, of: 2114, percentile: 57.4, hotspot: false }),
+        },
+    );
+    // app/services/charge.rb: in no coverage report (unknown), no history.
+    let partner = |path: &str, via: &str, t: u32, of: u32| CoChangeEntry { path: path.into(), via: via.into(), together: t, of, why: crate::signals::cochange_why(via, t, of) };
+    s.partners = vec![(partner("app/views/invoices/show.html.erb", "app/models/invoice.rb", 12, 20), 0.6), (partner("config/locales/en.yml", "app/models/invoice.rb", 6, 20), 0.3)];
+    s.usually_changes_with = vec![partner("app/views/invoices/show.html.erb", "app/models/invoice.rb", 12, 20)];
+    s
+}
+
+fn run_sig(rules: &str, changed: &[ChangedFile], sig: Option<SignalInput>) -> Report {
+    let p = policy(rules);
+    let g = metrics_graph();
+    evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), changed, &EvalOptions { signals: sig, ..full() })
+}
+
+/// The single rule `r` with `when`: its message if it fired.
+fn sig_fires(when: &str, changed: &[ChangedFile], sig: Option<SignalInput>) -> (Option<String>, Report) {
+    let r = run_sig(&format!("rules:\n  - id: r\n    risk: high\n    when: {when}\n"), changed, sig);
+    // Messages are sentences; compare from the second word on.
+    let msg = pol(&r).reasons.first().map(|x| {
+        let mut c = x.message.chars();
+        c.next().map(|f| f.to_lowercase().chain(c).collect()).unwrap_or_default()
+    });
+    (msg, r)
+}
+
+fn msg(when: &str, changed: &[ChangedFile]) -> Option<String> {
+    sig_fires(when, changed, Some(ready_signals())).0
+}
+
+fn not_ready(mut s: SignalInput, f: impl FnOnce(&mut crate::signals::Signals)) -> SignalInput {
+    f(&mut s.status);
+    s
+}
+
+fn assert_blocked(when: &str, changed: &[ChangedFile], sig: SignalInput, signal: &str) {
+    let (m, r) = sig_fires(when, changed, Some(sig));
+    assert_eq!(m, None, "{when}: a rule whose signal is not ready must not fire");
+    let w: Vec<&Warning> = r.warnings.iter().filter(|w| w.code == "rule_signal_not_ready").collect();
+    assert_eq!(w.len(), 1, "{:#?}", r.warnings);
+    assert!(w[0].message.contains(&format!("needs {signal}")), "{}", w[0].message);
+}
+
+#[test]
+fn churn_over() {
+    let inv = [m("app/models/invoice.rb")];
+    let s = msg("{churn_over: 40}", &inv).expect("fires");
+    assert!(s.contains("`app/models/invoice.rb` (41 commits)") && s.contains("more than 40 commits in the last 90 days"), "{s}");
+    assert_eq!(msg("{churn_over: 41}", &inv), None);
+    // No history for the file: unknown, never fires.
+    assert_eq!(msg("{churn_over: 0}", &[m("app/services/charge.rb")]), None);
+    // Tests do not count.
+    assert_eq!(msg("{churn_over: 0}", &[m("spec/models/invoice_spec.rb")]), None);
+    assert_blocked("{churn_over: 1}", &inv, not_ready(ready_signals(), |s| s.churn = SignalStatus::new(SignalState::Building, Some("reading git history".into()))), "churn");
+}
+
+#[test]
+fn complexity_over_and_max_method() {
+    let inv = [m("app/models/invoice.rb")];
+    let s = msg("{complexity_over: 100}", &inv).expect("fires");
+    assert!(s.contains("complexity above 100: `app/models/invoice.rb` (complexity 120)"), "{s}");
+    assert_eq!(msg("{complexity_over: 120}", &inv), None);
+    let s = msg("{max_method_complexity_over: 25}", &inv).expect("fires");
+    assert!(s.contains("a method more complex than 25: `app/models/invoice.rb` (a method of complexity 30)"), "{s}");
+    assert_eq!(msg("{max_method_complexity_over: 30}", &inv), None);
+    // A file without methods has no max method; one without metrics no complexity.
+    assert_eq!(msg("{max_method_complexity_over: 0}", &[m("lib/util.rb")]), None);
+    assert_eq!(msg("{complexity_over: 0}", &[m("app/services/charge.rb")]), None);
+    // An index without metrics tables: complexity unavailable, the rule warns.
+    let p = policy("rules:\n  - {id: r, risk: high, when: {complexity_over: 1}}\n");
+    let g = fixture_graph();
+    let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &inv, &EvalOptions { signals: Some(ready_signals()), ..full() });
+    assert!(pol(&r).reasons.is_empty());
+    assert!(r.warnings.iter().any(|w| w.code == "rule_signal_not_ready" && w.message.contains("needs complexity")), "{:#?}", r.warnings);
+}
+
+#[test]
+fn coverage_under_ignores_unknown() {
+    let inv = [m("app/models/invoice.rb")];
+    let s = msg("{coverage_under: 50}", &inv).expect("fires");
+    assert!(s.contains("line coverage under 50%: `app/models/invoice.rb` (12% of 200 lines)"), "{s}");
+    assert_eq!(msg("{coverage_under: 12}", &inv), None);
+    // charge.rb is in no report: unknown never fires.
+    assert_eq!(msg("{coverage_under: 100}", &[m("app/services/charge.rb")]), None);
+    assert_blocked(
+        "{coverage_under: 50}",
+        &inv,
+        not_ready(ready_signals(), |s| s.coverage = SignalStatus::new(SignalState::Unavailable, Some("no coverage report found".into()))),
+        "coverage",
+    );
+    assert_blocked("{coverage_under: 50}", &inv, not_ready(ready_signals(), |s| s.coverage = SignalStatus::new(SignalState::Loading, None)), "coverage");
+}
+
+#[test]
+fn changed_lines_coverage_under() {
+    let inv = [m("app/models/invoice.rb").lines(10, 2)];
+    let s = msg("{changed_lines_coverage_under: 50}", &inv).expect("fires");
+    assert!(s.contains("changed lines covered under 50%: `app/models/invoice.rb` (20% of the changed lines)"), "{s}");
+    assert_eq!(msg("{changed_lines_coverage_under: 20}", &inv), None);
+    // util.rb has coverage but no changed-lines figure; charge.rb none at all.
+    assert_eq!(msg("{changed_lines_coverage_under: 100}", &[m("lib/util.rb").lines(1, 0), m("app/services/charge.rb").lines(1, 0)]), None);
+    // Without a diff: a warning, and no fire.
+    let (fired, r) = sig_fires("{changed_lines_coverage_under: 100}", &[m("lib/util.rb")], Some(ready_signals()));
+    assert_eq!(fired, None);
+    assert!(r.warnings.iter().any(|w| w.code == "no_line_counts"), "{:#?}", r.warnings);
+    assert_blocked("{changed_lines_coverage_under: 50}", &inv, not_ready(ready_signals(), |s| s.coverage = SignalStatus::new(SignalState::Loading, None)), "coverage");
+}
+
+#[test]
+fn uncovered_both_polarities_and_unknown() {
+    let util = [m("lib/util.rb")];
+    let s = msg("{uncovered: true}", &util).expect("fires");
+    assert!(s.contains("not covered by any test: `lib/util.rb` (0 of 40 lines covered)"), "{s}");
+    assert_eq!(msg("{uncovered: false}", &util), None);
+    assert_eq!(msg("{uncovered: true}", &[m("app/models/invoice.rb")]), None);
+    assert!(msg("{uncovered: false}", &[m("app/models/invoice.rb")]).is_some());
+    // Unknown (in no report) counts only with uncovered_includes_unknown.
+    let charge = [m("app/services/charge.rb")];
+    assert_eq!(msg("{uncovered: true}", &charge), None);
+    let s = msg("{uncovered: true, uncovered_includes_unknown: true}", &charge).expect("fires");
+    assert!(s.contains("`app/services/charge.rb` (in no coverage report)"), "{s}");
+    assert_blocked("{uncovered: true}", &util, not_ready(ready_signals(), |s| s.coverage = SignalStatus::new(SignalState::Unavailable, Some("no report".into()))), "coverage");
+}
+
+#[test]
+fn hotspot_both_polarities() {
+    let s = msg("{hotspot: true}", &[m("app/models/invoice.rb")]).expect("fires");
+    assert!(s.contains("a hotspot (top 5% of `ripple rank`): `app/models/invoice.rb` (#3 of 2114)"), "{s}");
+    assert_eq!(msg("{hotspot: true}", &[m("lib/util.rb")]), None);
+    assert!(msg("{hotspot: false}", &[m("lib/util.rb")]).is_some());
+    assert_eq!(msg("{hotspot: true}", &[m("app/services/charge.rb")]), None);
+    assert_blocked("{hotspot: true}", &[m("app/models/invoice.rb")], not_ready(ready_signals(), |s| s.hotspot = SignalStatus::new(SignalState::Building, None)), "hotspot");
+}
+
+#[test]
+fn missing_cochange_threshold() {
+    let inv = [m("app/models/invoice.rb")];
+    let s = msg("{missing_cochange: true}", &inv).expect("fires");
+    assert!(s.contains("usually changes with files not in the diff (50%+ of commits): `app/views/invoices/show.html.erb` (with `app/models/invoice.rb` in 12 of 20 commits)"), "{s}");
+    assert!(!s.contains("en.yml"), "{s}");
+    let s = msg("{missing_cochange: true, cochange_min_confidence: 0.25}", &inv).expect("fires");
+    assert!(s.contains("en.yml"), "{s}");
+    assert_eq!(msg("{missing_cochange: true, cochange_min_confidence: 0.9}", &inv), None);
+    assert!(msg("{missing_cochange: false, cochange_min_confidence: 0.9}", &inv).is_some());
+    let mut none = ready_signals();
+    none.partners.clear();
+    assert_eq!(sig_fires("{missing_cochange: true}", &inv, Some(none)).0, None);
+    assert_blocked(
+        "{missing_cochange: true}",
+        &inv,
+        not_ready(ready_signals(), |s| s.cochange = SignalStatus::new(SignalState::Disabled, Some("history.cochange is off".into()))),
+        "cochange",
+    );
+}
+
+#[test]
+fn signal_conditions_are_anded_with_each_other_and_the_rest() {
+    let inv = [m("app/models/invoice.rb")];
+    let s = msg("{touches: [billing], churn_over: 10, complexity_over: 100, coverage_under: 50}", &inv).expect("fires");
+    assert!(s.contains("41 commits") && s.contains("complexity 120") && s.contains("12% of 200 lines"), "{s}");
+    assert_eq!(msg("{touches: [auth], churn_over: 10}", &inv), None);
+    assert_eq!(msg("{churn_over: 10, coverage_under: 5}", &inv), None);
+    // Several files: each condition may hold on a different file.
+    assert!(msg("{churn_over: 10, uncovered: true}", &[m("app/models/invoice.rb"), m("lib/util.rb")]).is_some());
+    // One blocked signal blocks the whole rule, with one warning naming it.
+    let (fired, r) = sig_fires(
+        "{churn_over: 10, coverage_under: 50}",
+        &inv,
+        Some(not_ready(ready_signals(), |s| s.coverage = SignalStatus::new(SignalState::Loading, None))),
+    );
+    assert_eq!(fired, None);
+    assert_eq!(r.warnings.iter().filter(|w| w.code == "rule_signal_not_ready").count(), 1);
+}
+
+#[test]
+fn without_signal_input_signal_rules_warn() {
+    let (fired, r) = sig_fires("{churn_over: 1}", &[m("app/models/invoice.rb")], None);
+    assert_eq!(fired, None);
+    assert!(r.warnings.iter().any(|w| w.code == "rule_signal_not_ready" && w.message.contains("not provided by the caller")), "{:#?}", r.warnings);
+    // ... and the report carries neither signals nor history-based metrics.
+    assert!(r.signals.is_none());
+    let mx = r.changed[0].metrics.as_ref().expect("complexity alone");
+    assert_eq!((mx.complexity, mx.max_method, mx.churn), (Some(120), Some(30), None));
+}
+
+#[test]
+fn report_metrics_signals_and_usually_changes_with() {
+    let r = run_sig("", &[m("app/models/invoice.rb"), m("spec/models/invoice_spec.rb"), m("app/services/charge.rb")], Some(ready_signals()));
+    let inv = r.changed.iter().find(|c| c.path == "app/models/invoice.rb").unwrap();
+    let mx = inv.metrics.as_ref().unwrap();
+    assert_eq!(mx.churn.unwrap().recent_commits, 41);
+    assert_eq!(mx.coverage.unwrap().percent, Some(12.0));
+    assert!(mx.hotspot.unwrap().hotspot);
+    assert_eq!(crate::signals::metrics_line(mx), "cx 120 (max 30) · churn 41/90d · cov 12% (changed lines 20%) · hotspot #3 of 2114");
+    assert!(r.changed.iter().find(|c| c.path == "spec/models/invoice_spec.rb").unwrap().metrics.is_none(), "tests have no metrics");
+    assert_eq!(r.usually_changes_with.len(), 1);
+    assert_eq!(r.signals.as_ref().unwrap().coverage.state, SignalState::Ready);
+    // Not-ready signals drop their metrics and partners, and the text says so.
+    let sig = not_ready(ready_signals(), |s| {
+        s.churn = SignalStatus::new(SignalState::Building, Some("reading git history".into()));
+        s.cochange = SignalStatus::new(SignalState::Building, Some("reading git history".into()));
+        s.coverage = SignalStatus::new(SignalState::Disabled, None);
+    });
+    let r = run_sig("", &[m("app/models/invoice.rb")], Some(sig));
+    let mx = r.changed[0].metrics.as_ref().unwrap();
+    assert_eq!((mx.churn, mx.coverage), (None, None));
+    assert!(r.usually_changes_with.is_empty());
+    let t = crate::render::text::render(&r, 30, false);
+    assert!(t.contains("\n  cx 120 (max 30) · hotspot #3 of 2114\n"), "{t}");
+    assert!(t.contains("not ready: churn building (reading git history); cochange building (reading git history)\n"), "{t}");
+    assert!(!t.contains("coverage disabled"), "disabled signals are not 'not ready': {t}");
+    // The schema accepts it all.
+    let v = serde_json::to_value(run_sig("", &[m("app/models/invoice.rb").lines(3, 1)], Some(ready_signals()))).unwrap();
+    assert_eq!(crate::schema::validate_report(&v), Vec::<String>::new());
+    let t = crate::render::text::render(&serde_json::from_value(v).unwrap(), 30, false);
+    assert!(t.contains("usually changes with (not in the diff):\n  app/views/invoices/show.html.erb  changed with app/models/invoice.rb in 12 of its last 20 commits (60%)\n"), "{t}");
+}

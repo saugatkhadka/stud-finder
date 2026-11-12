@@ -258,4 +258,21 @@ rules:
     fn unsupported_version() {
         assert!(err("version: 2\n").contains("unsupported version 2"));
     }
+
+    #[test]
+    fn signal_conditions_are_checked() {
+        let ok = parse_config(
+            "rank: {hotspot_percent: 2.5}\nrules:\n  - id: a\n    risk: high\n    when: {churn_over: 10, complexity_over: 50, max_method_complexity_over: 15, coverage_under: 40, changed_lines_coverage_under: 60, uncovered: true, uncovered_includes_unknown: true, hotspot: true, missing_cochange: true, cochange_min_confidence: 0.4}\n",
+            "ripple.yml",
+        )
+        .unwrap();
+        assert_eq!(ok.rank.hotspot_percent, 2.5);
+        assert_eq!(parse_config("", "ripple.yml").unwrap().rank.hotspot_percent, 5.0);
+        let e = err("rank: {hotspot_percent: 0}\nrules:\n  - {id: a, risk: high, when: {coverage_under: 120, cochange_min_confidence: 0.5, uncovered_includes_unknown: true}}\n");
+        for want in ["rank.hotspot_percent", "rules[0].when.coverage_under", "rules[0].when.cochange_min_confidence", "rules[0].when.uncovered_includes_unknown"] {
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        assert!(err("rules:\n  - {id: a, risk: high, when: {missing_cochange: true, cochange_min_confidence: 2}}\n").contains("a share from 0 to 1"));
+        assert!(err("rank: {hotspot: 5}\n").contains("hotspot"));
+    }
 }

@@ -435,18 +435,21 @@ fn file_profile(snap: &Arc<Snapshot>, file: &str, src: &Sources) -> QueryResult 
                 (!name.is_empty()).then_some(name)
             })
         };
+        // The body without the `def` line, which runs when the class loads
+        // (SimpleCov counts it as covered even for a method never called).
+        let body = |m: &&ripple_core::MethodMetric| if m.end() > m.start { (m.start + 1, m.end()) } else { (m.start, m.end()) };
         let mut sorted: Vec<_> = mm.iter().collect();
         sorted.sort_by(|a, b| b.complexity.cmp(&a.complexity).then(a.start.cmp(&b.start)));
         for m in sorted.iter().take(5) {
             let mut v = json!({"name": name_of(m.start), "start": m.start, "end": m.end(), "complexity": m.complexity});
-            if let Some(c) = cov.and_then(|c| c.lines(&file, &[(m.start, m.end())])).and_then(|l| l.percent()) {
+            if let Some(c) = cov.and_then(|c| c.lines(&file, &[body(m)])).and_then(|l| l.percent()) {
                 v["coverage"] = json!(ripple_policy::round1(c));
             }
             methods.push(v);
         }
         if let Some(c) = cov.filter(|c| c.file(&file).is_some()) {
             for m in mm {
-                if c.lines(&file, &[(m.start, m.end())]).is_some_and(|l| l.coverable > 0 && l.covered == 0) {
+                if c.lines(&file, &[body(&m)]).is_some_and(|l| l.coverable > 0 && l.covered == 0) {
                     uncovered.push(name_of(m.start).unwrap_or_else(|| format!("line {}", m.start)));
                 }
             }
