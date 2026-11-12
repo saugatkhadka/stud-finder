@@ -27,7 +27,8 @@ fn rule(id: &str, description: &str, risk: Risk, require: &[&str], when: When) -
 /// | `default.crosses_boundary` | Ruby change reaches JS or vice versa | medium | |
 ///
 /// Tier conditions mean "at least this tier", so touching a critical area
-/// fires both `touches_*` rules; the final risk is the maximum anyway.
+/// fires both `touches_*` rules; the report keeps only the highest rung of
+/// each such ladder (see `evaluate`).
 pub fn default_rules() -> Vec<Rule> {
     vec![
         rule(

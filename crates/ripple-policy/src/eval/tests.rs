@@ -239,7 +239,7 @@ fn default_rules() {
     // lib/token.rb is tier high; session.rb (critical) depends on it directly.
     let r = run(&p, &[m("lib/token.rb")]);
     assert!(ids(&r).contains(&"default.reaches_critical_direct".to_string()));
-    assert!(ids(&r).contains(&"default.reaches_critical".to_string()));
+    assert!(!ids(&r).contains(&"default.reaches_critical".to_string()), "lower rung of the same ladder is dropped");
 
     let r = run(&p, &[m("README.md")]);
     assert_eq!(r.risk, Risk::Low);
@@ -362,7 +362,7 @@ fn markdown_snapshot() {
         "<!-- ripple-impact-report -->",
         "## Change impact: CRITICAL risk",
         "- **CRITICAL** `default.touches_critical`: Changes `app/models/invoice.rb` in billing (critical) — _Changes code in a critical area_",
-        "- [ ] `human_review` (from `default.touches_critical`, `default.touches_high`)",
+        "- [ ] `human_review` (from `default.touches_critical`)",
         "- [ ] `run_full_suite` (from `default.touches_global`)",
         "Suggested reviewers (owners of the areas involved): @payments, @web",
         "| billing | critical | changed directly | 3 | @payments | `app/models/invoice.rb` |",
@@ -399,7 +399,8 @@ fn github_snapshot() {
     let r = sample();
     let cmds = crate::render::github::workflow_commands(&r);
     let lines: Vec<&str> = cmds.lines().collect();
-    assert!(lines.contains(&"::warning file=app/models/invoice.rb,line=1,title=ripple%3A critical risk (default.touches_critical)::Changes `app/models/invoice.rb` in billing (critical)"), "{cmds}");
+    assert!(lines.iter().any(|l| l.starts_with("::warning file=app/models/invoice.rb,line=1,title=ripple%3A critical risk (default.touches_critical)::Changes `app/models/invoice.rb` in billing (critical) (also: ")), "{cmds}");
+    assert_eq!(lines.iter().filter(|l| l.starts_with("::warning file=app/models/invoice.rb")).count(), 1, "one annotation per changed file");
     assert!(lines.iter().any(|l| l.starts_with("::warning file=config/initializers/stripe.rb,line=7,title=ripple%3A high risk (default.touches_global)::")), "{cmds}");
     assert!(lines.iter().any(|l| l.starts_with("::notice file=config/initializers/stripe.rb,title=ripple: global file::global:")), "{cmds}");
     assert_eq!(*lines.last().unwrap(), format!("::notice title=ripple::{}", r.summary));

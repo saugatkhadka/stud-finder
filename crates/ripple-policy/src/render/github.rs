@@ -4,7 +4,6 @@
 
 use crate::eval::risk_word;
 use crate::report::Report;
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -20,27 +19,30 @@ fn escape_prop(s: &str) -> String {
     escape_data(s).replace(':', "%3A").replace(',', "%2C")
 }
 
-/// Workflow commands: one `::warning` per (changed file, fired rule) pair,
-/// then a `::notice` with the summary.
+/// Workflow commands: one `::warning` per changed file, carrying its
+/// highest-risk reason (reasons are sorted highest first) and a count of the
+/// rest, then a `::notice` with the summary.
 pub fn workflow_commands(report: &Report) -> String {
     let mut out = String::new();
-    let mut seen = BTreeSet::new();
-    let mut count = 0;
+    let mut per_file: Vec<(&str, Vec<&crate::report::Reason>)> = Vec::new();
     for reason in &report.reasons {
         for file in &reason.evidence.changed {
-            if count >= MAX_ANNOTATIONS || !seen.insert((file.clone(), reason.rule.clone())) {
-                continue;
+            match per_file.iter_mut().find(|(f, _)| *f == file.as_str()) {
+                Some((_, rs)) => rs.push(reason),
+                None => per_file.push((file, vec![reason])),
             }
-            let line = report.changed.iter().find(|c| &c.path == file).and_then(|c| c.first_line).unwrap_or(1);
-            let title = format!("ripple: {} risk ({})", risk_word(reason.risk).to_lowercase(), reason.rule);
-            out.push_str(&format!(
-                "::warning file={},line={line},title={}::{}\n",
-                escape_prop(file),
-                escape_prop(&title),
-                escape_data(&reason.message)
-            ));
-            count += 1;
         }
+    }
+    for (file, reasons) in per_file.into_iter().take(MAX_ANNOTATIONS) {
+        let top = reasons[0];
+        let line = report.changed.iter().find(|c| c.path == file).and_then(|c| c.first_line).unwrap_or(1);
+        let title = format!("ripple: {} risk ({})", risk_word(top.risk).to_lowercase(), top.rule);
+        let mut message = top.message.clone();
+        if reasons.len() > 1 {
+            let rest: Vec<&str> = reasons[1..].iter().map(|r| r.rule.as_str()).collect();
+            message.push_str(&format!(" (also: {})", rest.join(", ")));
+        }
+        out.push_str(&format!("::warning file={},line={line},title={}::{}\n", escape_prop(file), escape_prop(&title), escape_data(&message)));
     }
     for w in report.warnings.iter().filter(|w| w.code == "global_file_changed") {
         if let Some(f) = &w.file {

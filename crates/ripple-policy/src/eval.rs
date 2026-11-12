@@ -179,6 +179,20 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     reasons.sort_by(|a, b| (std::cmp::Reverse(a.risk), &a.rule).cmp(&(std::cmp::Reverse(b.risk), &b.rule)));
     let risk = reasons.iter().map(|r| r.risk).max().unwrap_or(Risk::Low);
     let require: Vec<String> = reasons.iter().flat_map(|r| r.require.iter().cloned()).collect::<BTreeSet<_>>().into_iter().collect();
+    // The built-in rules come in ladders (`touches_critical` > `touches_high`,
+    // `impacted_over_200` > `impacted_over_50`, ...). When a higher rung fired,
+    // the lower one says nothing new: keep the top of each ladder only.
+    // Risk and `require` above were computed before this, so nothing is lost.
+    if policy.uses_default_rules() {
+        const LADDERS: [&str; 3] = ["default.touches_critical|default.touches_high", "default.impacted_over_", "default.reaches_critical"];
+        let ladder = |id: &str| LADDERS.iter().position(|l| l.split('|').any(|p| id.starts_with(p)));
+        let mut seen = BTreeSet::new();
+        // `reasons` is sorted highest risk first.
+        reasons.retain(|r| match ladder(&r.rule) {
+            Some(l) => seen.insert(l),
+            None => true,
+        });
+    }
 
     let main = &ctx.reaches[0];
     let changed_entries: Vec<ChangedEntry> = ctx
