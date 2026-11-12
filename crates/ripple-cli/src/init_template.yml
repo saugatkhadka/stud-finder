@@ -1,0 +1,272 @@
+# ripple.yml: how ripple judges the risk of a change in this repository.
+#
+# ripple builds a dependency graph of the repo (Ruby constants and requires,
+# Rails conventions, JS/TS imports, frontend API calls to Rails routes) and,
+# for a set of changed files, reports the files it finds depending on them,
+# directly or transitively. This is static analysis, not a complete list.
+# The rules below turn that "blast radius" into a risk level
+# (low / medium / high / critical) plus required actions.
+#
+# This block is a reference: a full example, independent of the built-in
+# areas and rules (it turns them off under `defaults:`).
+#
+# Check this file with:   ripple config check
+# See what is in effect:  ripple config show
+# Try it on your changes: ripple impact            (working tree vs HEAD)
+#                         ripple impact --base main
+#
+# Globs: repo-relative; `*` stays within one directory, `**` crosses them.
+# A pattern without `/` matches at any depth (`*.log`); a leading `/`
+# anchors it to the root (`/Gemfile`); a directory name also matches
+# everything under it (`app/models/billing`).
+
+version: 1
+
+# The built-in areas and rules apply in addition to this file unless turned
+# off; an area or rule with the same name / id replaces the built-in one.
+defaults:
+  areas: false                    # built-in areas (payments, auth, migrations, api, ...)
+  rules: false                    # built-in default.* rules
+  codeowners: true                # owners from CODEOWNERS join the report
+  disable: []                     # or turn off single built-ins: [complex_file, jobs]
+
+# Never analysed and never reported (in addition to .gitignore).
+# Setting this replaces the defaults (node_modules, vendor, tmp, log, public, coverage, dist, build).
+# ignore:
+#   - node_modules/**
+#   - vendor/**
+#   - tmp/**
+
+# Named parts of the codebase. `tier` is how bad it is to break the area;
+# `owners` are suggested as reviewers when a change touches or reaches it.
+areas:
+  billing:
+    description: Payments, invoices and subscriptions
+    tier: critical
+    owners: ["@your-org/payments"]
+    paths:
+      - app/models/billing/**
+      - app/services/billing/**
+      - app/controllers/billing/**
+      - app/javascript/billing/**
+  auth:
+    description: Sign-in, sessions, permissions
+    tier: critical
+    owners: ["@your-org/identity"]
+    paths:
+      - app/models/user.rb
+      - app/controllers/sessions_controller.rb
+      - app/policies/**
+  admin:
+    tier: high
+    paths:
+      - app/controllers/admin/**
+      - app/views/admin/**
+
+# Files whose consumers no static graph can see. Changing one is reported as
+# "global: static impact is not reliable for this file".
+# Setting this replaces the defaults (config/initializers, application.rb,
+# environments, Gemfile(.lock), package.json and lockfiles).
+# global_files:
+#   - config/initializers/**
+#   - Gemfile.lock
+
+# Test files are listed under "tests that depend on it" and never count toward the blast radius.
+# Setting this replaces the defaults (RSpec, Minitest, Jest, Vitest, Cypress, Storybook:
+# spec/**, test/**, **/spec/**, **/test/**, __tests__, __mocks__, *.test.*, *.spec.*, *.cy.*,
+# *_spec.rb, *_test.rb, *.stories.*, cypress/**).
+# tests:
+#   - spec/**
+#   - "**/*.test.ts"
+
+# Rules. Every condition under `when` must hold for the rule to fire; the
+# change's risk is the highest risk among fired rules (low if none fired) and
+# the `require` lists are merged.
+rules:
+  - id: billing-change
+    description: Anything touching billing needs a payments engineer
+    when:
+      touches: [billing]          # area names or globs
+    risk: critical
+    require: [human_review]
+
+  - id: auth-reached
+    description: Changes that auth code depends on directly
+    when:
+      reaches: [auth]             # an impacted (not changed) file is in auth...
+      within: 1                   # ...at most this many hops away
+    risk: high
+    require: [security_review]
+
+  - id: critical-reached
+    when:
+      reaches_tier: critical      # an impacted file is in any critical area
+      min_confidence: inferred    # ignore heuristic (name/URL-matched) edges for this rule
+    risk: medium
+
+  - id: high-tier-touched
+    when:
+      touches_tier: high          # a changed file is in an area of tier high or above
+    risk: high
+    require: [human_review]
+
+  # Global files and boundary crossings show up in a large share of ordinary
+  # commits, so they only add an action, not risk.
+  - id: global-config
+    when:
+      touches_global: true        # a changed file matches global_files
+    risk: low
+    require: [run_full_suite]
+
+  - id: frontend-backend
+    when:
+      crosses_boundary: true      # a Ruby change reaches JS/TS or vice versa
+    risk: low
+
+  - id: huge-blast-radius
+    when:
+      impacted_files_over: 1500   # impacted non-test files, excluding the changed ones
+    risk: high
+    require: [run_full_suite]
+
+  - id: wide-blast-radius
+    when:
+      impacted_files_over_percent: 5   # more than 5% of the repository's non-test files...
+      impacted_files_over: 25          # ...and more than 25 files
+    risk: medium
+
+  - id: big-diff
+    when:
+      changed_files_over: 40      # number of changed files
+    risk: medium
+
+  # Rules on git history, complexity and coverage. A rule whose signal is not
+  # ready (history still building, no coverage report in coverage/) does not
+  # fire and adds one warning instead.
+  # The per-file conditions (churn_over, complexity_over,
+  # max_method_complexity_over, coverage_under, changed_lines_coverage_under,
+  # uncovered, hotspot, and next to them untested and changed_lines_over)
+  # must all hold on the same changed file. Pairing a metric with
+  # changed_lines_over keeps one-line edits to a big file from firing.
+  - id: complex-file
+    when:
+      complexity_over: 150        # file complexity (sum of methods + top level)...
+      changed_lines_over: 20      # ...and more than 20 lines of it changed
+    risk: high
+    require: [human_review]
+
+  - id: hot-and-churning
+    when:
+      hotspot: true               # in the top rank.hotspot_percent of `ripple rank`...
+      churn_over: 10              # ...and changed in more than 10 commits in the last 90 days
+    risk: high
+    require: [human_review]
+
+  - id: hotspot-change
+    when:
+      hotspot: true
+      changed_lines_over: 10
+    risk: high
+    require: [human_review]
+
+  - id: complex-method
+    when:
+      max_method_complexity_over: 25   # its most complex method
+      changed_lines_over: 10
+    risk: medium
+
+  # Relative thresholds: rank within this repository's non-test source files,
+  # so the same rule fits any codebase size (`ripple config show` prints the
+  # cut-offs in effect).
+  - id: among-the-most-complex
+    when:
+      complexity_top_percent: 2              # top 2% by file complexity
+      changed_lines_over: 30
+    risk: high
+    require: [human_review]
+
+  - id: among-the-most-complex-methods
+    when:
+      max_method_complexity_top_percent: 2   # top 2% by most complex method
+      changed_lines_over: 10
+    risk: medium
+
+  - id: widely-used
+    when:
+      dependents_top_percent: 1              # top 1% by direct dependents...
+      dependents_over: 10                    # ...and more than 10 of them
+      changed_lines_over: 10
+    risk: medium
+
+  - id: untested-change
+    when:
+      untested: true              # a changed source file has no test among its dependents...
+      changed_lines_over: 50      # ...and more than 50 of its lines changed
+    risk: medium
+    require: [add_tests]
+
+  - id: forgot-a-partner
+    when:
+      missing_cochange: true        # a file that usually changes with a changed one is not in the diff
+      cochange_min_confidence: 0.7  # ...in at least 70% of its commits (default 0.5)
+    risk: low
+    require: [check_cochange_partners]
+
+  # Coverage rules need a report under coverage/. Uncomment to use.
+  # - id: poorly-covered
+  #   when:
+  #     touches_tier: high
+  #     coverage_under: 50            # line coverage of a changed file, from existing reports
+  #   risk: high                      # (a file in no report never counts)
+  #
+  # - id: new-code-untested
+  #   when:
+  #     changed_lines_coverage_under: 60   # coverage of the lines the diff touches (needs a diff)
+  #   risk: medium
+  #   require: [add_tests]
+  #
+  # - id: no-coverage
+  #   when:
+  #     uncovered: true               # a changed file has 0% line coverage...
+  #     uncovered_includes_unknown: false  # ...true also counts files in no report
+  #     changed_lines_over: 20
+  #   risk: medium
+
+# `ripple rank`: files in the top this-many percent are hotspots, and the
+# weights of the score's factors (defaults shown).
+# rank:
+#   hotspot_percent: 1
+#   weights: { churn: 3, complexity: 1, dependents: 0.5, uncovered: 1 }
+
+query:
+  max_depth: 3                    # hops to follow from a changed file; 0 = unlimited
+  min_confidence: heuristic       # exact | inferred | heuristic
+
+ci:
+  fail_on: critical               # `ripple check` / `impact --fail-on` default; omit to never fail
+  github: true
+  max_listed: 50                  # impacted files listed in the markdown report
+
+# The background daemon (defaults shown).
+# daemon:
+#   max_wait_ms: 150              # a query waits this long for pending edits, then answers marked stale
+#   idle_timeout_minutes: 30      # exit after this long without a request; 0 = never
+#   sleep_after_seconds: 300      # after this long without requests or edits, save the index to
+#                                 # <git dir>/ripple/ and serve it memory-mapped (small); 0 = never
+
+# Git history: churn and "usually changes with" (defaults shown).
+# history:
+#   enabled: true
+#   max_commits: 20000            # newest non-merge commits read; 0 = all
+#   max_age_days: 365             # also only commits younger than this (default: no limit)
+#   max_files_per_commit: 30      # bigger commits are sweeps: ignored for co-change
+#   min_together: 3               # a partner changed together at least this often...
+#   min_confidence: 0.3           # ...in at least this share of the file's commits...
+#   min_lift: 2.0                 # ...and this many times its own base rate
+#   limit: 5                      # partners shown per report
+
+# Coverage reports something else already wrote (ripple never runs tests).
+# coverage:
+#   enabled: true
+#   paths: []                     # [] = auto-detect under coverage/, tmp/coverage/, spec/coverage/, ...
+#   max_age_days: 7               # older reports are labelled stale (default: never)

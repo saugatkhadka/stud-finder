@@ -1,0 +1,77 @@
+# .github/workflows/ripple.yml
+# Reports the change impact of every pull request: annotations on the
+# changed lines, a job summary, and one sticky PR comment that is updated in
+# place. Fails the check when the risk is critical (ci.fail_on in ripple.yml,
+# or --fail-on below).
+name: ripple
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write   # for the sticky comment
+
+concurrency:
+  group: ripple-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # ripple needs the merge base with the target branch
+
+      - name: Install ripple
+        # A pinned release binary (checksum-verified). From source instead:
+        #   cargo install --locked --git https://github.com/saugatkhadka/stud-finder --branch main ripple-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/main/install.sh | RIPPLE_VERSION=ripple-v0.1.0 bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/ripple" --version
+
+      - name: Change impact
+        id: ripple
+        # `check` never starts a daemon in CI; it indexes in-process.
+        # Under GitHub Actions it prints ::warning annotations, writes the job
+        # summary, and sets the outputs risk / require / impacted / tests / changed.
+        run: |
+          ripple check --base "origin/${{ github.base_ref }}" \
+            --fail-on critical \
+            --markdown-out "$RUNNER_TEMP/ripple.md" \
+            --json-out "$RUNNER_TEMP/ripple.json"
+
+      - name: Sticky PR comment
+        if: always() && steps.ripple.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = `${process.env.RUNNER_TEMP}/ripple.md`;
+            if (!fs.existsSync(path)) return;   // ripple failed before producing a report (exit 2)
+            const body = fs.readFileSync(path, 'utf8');
+            const marker = '<!-- ripple-impact-report -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const mine = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripple-report
+          path: ${{ runner.temp }}/ripple.json
+          if-no-files-found: ignore
+
+      # Example of acting on the outputs in later steps:
+      # - if: steps.ripple.outputs.risk == 'high'
+      #   run: echo "::notice::high-risk change; requires ${{ steps.ripple.outputs.require }}"

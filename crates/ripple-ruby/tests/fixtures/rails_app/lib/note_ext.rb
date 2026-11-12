@@ -1,0 +1,3 @@
+module Shared
+  # reopened
+end

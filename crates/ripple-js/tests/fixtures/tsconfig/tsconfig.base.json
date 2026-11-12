@@ -1,0 +1,10 @@
+{
+  // JSONC: comments and trailing commas are legal in tsconfig.
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@base/*": ["shared/*"],
+      "exact-name": ["shared/exact.ts"],
+    },
+  },
+}

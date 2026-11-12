@@ -1,0 +1,2 @@
+class BadgeComponent < ViewComponent::Base
+end

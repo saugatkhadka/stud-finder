@@ -1,64 +1,22 @@
-name: CI
+name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, ripple]
   pull_request:
-    branches: [main]
 
 jobs:
-  rspec:
-    name: RSpec (${{ matrix.ruby }})
-    runs-on: ubuntu-latest
+  test:
     strategy:
       fail-fast: false
       matrix:
-        ruby: ['3.2', '3.3', '3.4']
+        os: [macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: ${{ matrix.ruby }}
-          bundler-cache: true
-      - run: bundle exec rspec
-
-  rspec-head:
-    name: RSpec (head, optional)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - id: setup-ruby
-        uses: ruby/setup-ruby@v1
-        continue-on-error: true
-        with:
-          ruby-version: head
-          bundler-cache: true
-      - if: steps.setup-ruby.outcome == 'success'
+      - uses: actions/checkout@v4
+      - name: Install Rust
         run: |
-          if ! bundle exec rspec; then
-            echo "::warning::Ruby head RSpec failed; stable Ruby jobs remain required."
-          fi
-      - if: steps.setup-ruby.outcome != 'success'
-        run: echo "::warning::Ruby head setup failed; stable Ruby jobs remain required."
-
-  rubocop:
-    name: RuboCop
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.3'
-          bundler-cache: true
-      - run: bundle exec rubocop
-
-  gem-build:
-    name: Gem build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.3'
-          bundler-cache: true
-      - run: gem build stud-finder.gemspec
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Test
+        run: cargo test --release --workspace --locked

@@ -1,0 +1,230 @@
+# Example ripple.yml for a Rails + React monorepo with billing and auth.
+# Every `when` key is used at least once; see README.md for the reference.
+# Without a ripple.yml ripple uses built-in areas and `default.*` rules
+# (`ripple config show`). This file adds to them; here the built-in rules are
+# dropped (the rules below replace them) and one built-in area is disabled.
+
+version: 1
+
+defaults:
+  rules: false               # only the rules below
+  areas: true                # built-in areas stay, where their files exist...
+  disable: [shared_components]  # ...except this one
+  codeowners: true           # owners from CODEOWNERS join the report
+
+areas:
+  billing:
+    description: Payments, invoices, subscriptions, refunds
+    tier: critical
+    owners: ["@acme/payments"]
+    paths:
+      - app/models/billing/**
+      - app/services/billing/**
+      - app/controllers/billing/**
+      - app/jobs/billing/**
+      - app/javascript/billing/**
+      - /lib/stripe_client.rb          # leading / anchors to the repo root
+  auth:
+    description: Sign-in, sessions, tokens, permissions
+    tier: critical
+    owners: ["@acme/identity", "@acme/security"]
+    paths:
+      - app/models/user.rb
+      - app/models/session.rb
+      - app/controllers/sessions_controller.rb
+      - app/controllers/concerns/authentication.rb
+      - app/policies/**
+  checkout_ui:
+    description: Checkout pages in the React app
+    tier: high
+    owners: ["@acme/web"]
+    paths:
+      - app/javascript/checkout/**
+  admin:
+    tier: medium
+    paths: [app/controllers/admin/**, app/views/admin/**]
+
+# Replaces the default list (initializers, application.rb, environments, Gemfile, package.json, lockfiles).
+global_files:
+  - config/initializers/**
+  - config/application.rb
+  - config/environments/**
+  - /Gemfile
+  - /Gemfile.lock
+  - /package.json
+  - /yarn.lock
+
+rules:
+  - id: billing-touched
+    description: Billing code changed; a payments engineer must review
+    when: { touches: [billing] }
+    risk: critical
+    require: [human_review, payments_review]
+
+  - id: auth-touched
+    when: { touches: [auth] }
+    risk: critical
+    require: [human_review, security_review]
+
+  - id: migration-touches-billing-tables
+    description: Migrations are matched by glob; combined with reaching billing
+    when:
+      touches: ["db/migrate/**"]
+      reaches: [billing]
+    risk: high
+    require: [dba_review]
+
+  - id: critical-direct-dependency
+    description: A file one hop from critical code changed (exact/inferred edges only)
+    when:
+      reaches_tier: critical
+      within: 1
+      min_confidence: inferred
+    risk: medium
+    require: [human_review]
+
+  - id: critical-transitive
+    when: { reaches_tier: critical }
+    risk: low
+
+  - id: high-tier-touched
+    when: { touches_tier: high }
+    risk: high
+
+  # Common in ordinary commits: an action, not risk.
+  - id: global-config
+    when: { touches_global: true }
+    risk: low
+    require: [run_full_suite]
+
+  - id: frontend-backend-contract
+    description: A Rails change reaches React code (or vice versa), e.g. an API response shape
+    when: { crosses_boundary: true }
+    risk: low
+    require: [frontend_review]
+
+  - id: huge-blast-radius
+    when: { impacted_files_over: 1500 }
+    risk: high
+    require: [run_full_suite]
+
+  - id: wide-blast-radius
+    when: { impacted_files_over: 200 }
+    risk: medium
+
+  - id: large-change
+    when: { changed_files_over: 30 }
+    risk: medium
+
+  # Relative thresholds: measured against this repository, so they need no
+  # tuning per codebase. An absolute floor next to one keeps small repos quiet.
+  - id: big-share-of-the-repo
+    when:
+      impacted_files_over_percent: 10   # of the repository's non-test files
+      impacted_files_over: 100
+    risk: high
+    require: [run_full_suite]
+
+  - id: top-complexity-file
+    when:
+      complexity_top_percent: 2         # among this repository's files
+      changed_lines_over: 30
+    risk: high
+    require: [human_review]
+
+  - id: top-complexity-method
+    when: { max_method_complexity_top_percent: 2, changed_lines_over: 10 }
+    risk: medium
+
+  - id: most-depended-on
+    when:
+      dependents_top_percent: 1
+      dependents_over: 10               # direct dependents of that file
+    risk: medium
+
+  - id: untested-billing-change
+    when:
+      touches: [billing]
+      untested: true
+    risk: critical
+    require: [add_tests]
+
+  # Signals from git history, complexity and existing coverage reports. A rule
+  # whose signal is not ready does not fire and adds a warning. Per-file
+  # conditions (and changed_lines_over / untested next to them) must hold
+  # on the same changed file.
+  - id: churning-complex-billing
+    when:
+      touches: [billing]
+      churn_over: 15                    # commits in the last 90 days
+      complexity_over: 250
+    risk: high
+
+  - id: complex-file
+    when:
+      complexity_over: 150
+      changed_lines_over: 20            # ...lines of that same file
+    risk: high
+    require: [human_review]
+
+  - id: very-complex-method
+    when:
+      max_method_complexity_over: 25
+      changed_lines_over: 10
+    risk: medium
+
+  - id: untested-change
+    when:
+      untested: true
+      changed_lines_over: 50
+    risk: medium
+    require: [add_tests]
+
+  - id: billing-poorly-covered
+    when:
+      touches: [billing]
+      coverage_under: 60                # unknown coverage never counts
+      changed_lines_coverage_under: 80  # needs a diff (--base / --staged)
+    risk: high
+    require: [add_tests]
+
+  - id: dead-in-tests
+    when:
+      uncovered: true
+      uncovered_includes_unknown: false
+      changed_lines_over: 20
+    risk: medium
+
+  - id: hot-and-churning
+    when:
+      hotspot: true                     # top rank.hotspot_percent of `ripple rank`
+      churn_over: 10
+    risk: high
+    require: [human_review]
+
+  - id: hotspot-change
+    when:
+      hotspot: true
+      changed_lines_over: 10
+    risk: high
+    require: [human_review]
+
+  - id: missing-partner
+    when:
+      missing_cochange: true
+      cochange_min_confidence: 0.7
+    risk: low
+    require: [check_cochange_partners]
+
+rank:
+  hotspot_percent: 1        # top 1% of `ripple rank` are hotspots
+  weights: { churn: 3, complexity: 1, dependents: 0.5, uncovered: 1 }
+
+query:
+  max_depth: 3              # hops from a changed file; 0 = unlimited (usually "everything")
+  min_confidence: heuristic
+
+ci:
+  fail_on: critical
+  github: true
+  max_listed: 50

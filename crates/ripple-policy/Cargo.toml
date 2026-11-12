@@ -1,0 +1,16 @@
+[package]
+name = "ripple-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ripple.yml loading, policy evaluation and report rendering"
+
+[dependencies]
+ripple-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Maintained fork of the deprecated serde_yaml; same API, exposes error locations.
+serde_yaml_ng = "0.10"
+serde_path_to_error = "0.1"
+globset = "0.4"
+thiserror = "2"

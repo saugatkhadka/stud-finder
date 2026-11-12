@@ -1,0 +1,33 @@
+[package]
+name = "ripple-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JavaScript/TypeScript module graph and HTTP call-site extractor for ripple"
+
+[dependencies]
+ripple-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+# `preserve_order`: package.json `exports` conditions are order-significant.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# oxc 0.152.x is the newest release line whose rust-version (1.96) builds on our
+# toolchain; 0.153+ require rustc 1.97. The oxc_* crates must move together.
+oxc_allocator = "=0.152.0"
+oxc_ast = "=0.152.0"
+oxc_ast_visit = "=0.152.0"
+oxc_parser = { version = "=0.152.0", default-features = false }
+oxc_span = "=0.152.0"
+oxc_syntax = "=0.152.0"
+oxc_resolver = "=11.24.3"
+rayon = "1.12"
+globset = "0.4"
+regex = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Memory attribution hooks for the `ripple-memprof` tool.
+mem-profile = []

@@ -1,0 +1,19 @@
+[package]
+name = "ripple-ruby"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ripple-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# 0.4.4 needs a newer rustc than the pinned toolchain.
+rubydex = "=0.4.3"
+ruby-prism = "2.1"
+rayon = "1.10"
+
+[features]
+# Memory attribution hooks for the `ripple-memprof` tool.
+mem-profile = []

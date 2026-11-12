@@ -1,8 +1,0 @@
-{
-  "RSpec": {
-    "coverage": {
-      "app/models/model_0.rb": { "lines": [null, 1, 0, 1] },
-      "app/models/model_1.rb": { "lines": [1, 0, 1] }
-    }
-  }
-}

@@ -1,0 +1,14 @@
+[package]
+name = "ripple-boundary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ripple-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ruby-prism = "2.1"
+regex = "1"
+glob = "0.3"
