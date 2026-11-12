@@ -13,17 +13,21 @@
 //! is the index, while the engine indexes the working tree: files that also
 //! have unstaged edits get no hunks (whole-file), since their line numbers
 //! would not match.
+//!
+//! This is the reference implementation, run by the client in one-shot mode
+//! (`--no-daemon`, CI). The daemon answers the same question from a cache
+//! (see [`crate::gitd`]) and must produce identical results.
 
 use crate::files::run_git;
 use anyhow::{Context, Result};
 use ripple_policy::{ChangedFile, FileStatus, Hunk};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 /// `git hash-object -t tree /dev/null`: diff target for repos without commits.
-const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+pub(crate) const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffSpec {
     WorkingTree,
     Staged,
@@ -66,37 +70,61 @@ pub fn changed_files(root: &Path, spec: &DiffSpec) -> Result<Vec<ChangedFile>> {
     args.push(&target);
     args.push("--");
     if let Ok(patch) = run_git(root, &args) {
-        let unstaged: std::collections::HashSet<String> = if cached {
-            run_git(root, &["diff", "--name-only", "-z", "--relative", "--no-ext-diff", "--"])
-                .map(|o| o.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
-                .unwrap_or_default()
+        let unstaged: HashSet<String> = if cached {
+            run_git(root, &["diff", "--name-only", "-z", "--relative", "--no-ext-diff", "--"]).map(|o| split_z(&o).collect()).unwrap_or_default()
         } else {
             Default::default()
         };
-        for (path, hunks) in parse_hunks(&patch) {
-            if let Some(f) = files.get_mut(&path) {
-                f.first_line = hunks.first().map(|h| h.start.max(1));
-                if f.status == FileStatus::Modified && !unstaged.contains(&path) {
-                    f.hunks = Some(hunks);
-                }
-            }
-        }
+        apply_patch(&mut files, &patch, &unstaged);
     }
 
     if untracked {
         let out = run_git(root, &["ls-files", "-z", "-o", "--exclude-standard"])?;
-        for p in out.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-            let path = String::from_utf8_lossy(p).into_owned();
-            let mut f = ChangedFile::new(path.clone(), FileStatus::Added);
-            if let Some(n) = count_lines(&root.join(&path)) {
-                f.added = Some(n);
-                f.deleted = Some(0);
-                f.first_line = Some(1);
-            }
+        for path in split_z(&out) {
+            let f = untracked_file(root, path.clone());
             files.entry(path).or_insert(f);
         }
     }
     Ok(files.into_values().collect())
+}
+
+/// Adds first lines and hunks from a `-U0` patch to the files of a raw/numstat
+/// listing. Files in `unstaged` get no hunks (see the module docs).
+pub(crate) fn apply_patch(files: &mut BTreeMap<String, ChangedFile>, patch: &[u8], unstaged: &HashSet<String>) {
+    for (path, hunks) in parse_hunks(patch) {
+        if let Some(f) = files.get_mut(&path) {
+            f.first_line = hunks.first().map(|h| h.start.max(1));
+            if f.status == FileStatus::Modified && !unstaged.contains(&path) {
+                f.hunks = Some(hunks);
+            }
+        }
+    }
+}
+
+/// The entry `changed_files` reports for an untracked file.
+pub(crate) fn untracked_file(root: &Path, path: String) -> ChangedFile {
+    let mut f = ChangedFile::new(path, FileStatus::Added);
+    if let Some(n) = count_lines(&root.join(&f.path)) {
+        f.added = Some(n);
+        f.deleted = Some(0);
+        f.first_line = Some(1);
+    }
+    f
+}
+
+pub(crate) fn split_z(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+    bytes.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned())
+}
+
+/// Splits the output of `git diff -z --raw --numstat -p` into the raw/numstat
+/// records and the patch. With `-z`, git ends the last numstat record with a
+/// NUL and then writes one more NUL before the patch; since no record is
+/// empty, the first `\0\0` is that separator.
+pub(crate) fn split_combined(out: &[u8]) -> (&[u8], &[u8]) {
+    match out.windows(2).position(|w| w == b"\0\0") {
+        Some(i) => (&out[..=i], &out[i + 2..]),
+        None => (out, &[]),
+    }
 }
 
 fn count_lines(path: &Path) -> Option<u32> {
