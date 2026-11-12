@@ -79,6 +79,9 @@ struct State {
     merge_docs_sum: f64,
     resolve_us_avg: Option<f64>,
     cold_us: u64,
+    /// Scopes and mentions by file, kept in step with `files` by
+    /// [`State::put`] / [`State::take`] (only with `method_level`).
+    scoped: scoped::Cache,
 }
 
 /// Edge kinds Ruby emits, in stats order.
@@ -140,6 +143,25 @@ fn analyse_all(ws: &Workspace, todo: &[(&str, SourceKind)]) -> Vec<Analysed> {
 }
 
 impl State {
+    /// Inserts or replaces a file's entry (method ids already global).
+    fn put(&mut self, path: String, entry: FileEntry) {
+        if self.method_level {
+            if let Some(old) = self.files.get(&path) {
+                self.scoped.retract(&path, old);
+            }
+            self.scoped.add(&path, &entry);
+        }
+        self.files.insert(path, entry);
+    }
+
+    fn take(&mut self, path: &str) -> Option<FileEntry> {
+        let e = self.files.remove(path)?;
+        if self.method_level {
+            self.scoped.retract(path, &e);
+        }
+        Some(e)
+    }
+
     /// Applies analysed files to the Rubydex graph and the per-file cache.
     fn apply(&mut self, analysed: Vec<Analysed>) {
         for mut a in analysed {
@@ -152,7 +174,7 @@ impl State {
                 }
                 None => {}
             }
-            self.files.insert(a.path, a.entry);
+            self.put(a.path, a.entry);
         }
     }
 
@@ -217,7 +239,7 @@ impl State {
         self.over.retain(|_, (n, _)| *n > 0);
         let paths: Vec<String> = body.iter().map(|(p, _)| p.clone()).collect();
         for (p, e) in body {
-            self.files.insert(p, e);
+            self.put(p, e);
         }
         (new_edges, paths)
     }
@@ -237,13 +259,21 @@ impl State {
 
     /// The output for `edges` (all edges, or with `replaced` the rows of
     /// those files) and the current totals.
-    fn output(&self, ws: &Workspace, t: Timings, files_analysed: usize, edges: Vec<Edge>, edges_us: u64, replaced: Option<Vec<String>>) -> ExtractOutput {
+    fn output(&mut self, ws: &Workspace, t: Timings, files_analysed: usize, edges: Vec<Edge>, edges_us: u64, replaced: Option<Vec<String>>) -> ExtractOutput {
         let es = &self.totals;
         let (namespace_canonical, namespace_no_canonical) = edges::namespace_counts(&self.over);
         let method_level = ws.config.ruby.method_level;
         let start = Instant::now();
         let (scopes, mentions, method_stats) = if method_level {
-            let o = scoped::compute(&self.files, &self.names);
+            let o = self.scoped.refresh(&self.files, &self.names);
+            if verify_rows() {
+                let want = scoped::compute(&self.files, &self.names);
+                assert_eq!(o.scopes, want.scopes, "incremental scopes differ");
+                assert_eq!(o.stats, want.stats, "incremental method stats differ");
+                assert_eq!(o.mentions.unmentioned, want.mentions.unmentioned, "incremental unmentioned names differ");
+                let key = |t: &ripple_core::MentionTable| t.files.iter().map(|(p, m)| (p.clone(), std::sync::Arc::as_ptr(m))).collect::<Vec<_>>();
+                assert_eq!(key(&o.mentions), key(&want.mentions), "incremental mention table differs");
+            }
             (o.scopes, Some(std::sync::Arc::new(o.mentions)), o.stats)
         } else {
             // `method_level` off: exactly the file-level output (no scope ranges).
@@ -561,7 +591,7 @@ impl RubyExtractor {
             .cloned()
             .collect();
         for path in &stale {
-            if let Some(entry) = state.files.remove(path)
+            if let Some(entry) = state.take(path)
                 && entry.kind == Some(SourceKind::Ruby)
             {
                 state.graph.delete_document(path);
@@ -609,7 +639,7 @@ impl RubyExtractor {
                 (edges, Some(paths))
             } else {
                 for a in body {
-                    state.files.insert(a.path, a.entry);
+                    state.put(a.path, a.entry);
                 }
                 (state.all_edges(ws), None)
             };
@@ -634,7 +664,7 @@ impl RubyExtractor {
         let before = shadow::constant_decls(&state.graph, structural_ruby.iter().map(String::as_str));
         // Files that kept their fingerprint keep their Rubydex document.
         for a in body {
-            state.files.insert(a.path, a.entry);
+            state.put(a.path, a.entry);
         }
         state.apply(structural);
         t.merge_us = micros(start);
@@ -688,6 +718,7 @@ impl Extractor for RubyExtractor {
             merge_docs_sum: 0.0,
             resolve_us_avg: None,
             cold_us: 0,
+            scoped: Default::default(),
         };
         let build_start = start;
         state.apply(analysed);
