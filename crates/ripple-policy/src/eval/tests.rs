@@ -356,10 +356,11 @@ fn limit_truncates_lists_not_counts() {
     let p = policy("");
     let opts = EvalOptions { limit: Some(1), ..Default::default() };
     let g = fixture_graph();
-    let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &[m("app/models/invoice.rb")], &opts);
+    let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &[m("app/models/invoice.rb"), m("README.md"), m("lib/util.rb")], &opts);
     assert_eq!(r.further.files.len(), 1);
     assert_eq!((r.counts.impacted, r.counts.further_notable), (4, 2));
     assert!(r.truncated);
+    assert_eq!(r.changed.len(), 3, "--limit never cuts the changed files");
 }
 
 /// hub.rb with `n` direct dependents (every 10th in a critical area), each

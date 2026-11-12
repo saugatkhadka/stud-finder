@@ -182,6 +182,7 @@ fn one_shot_file_rank_and_impact_read_coverage_and_history() {
     assert_eq!(m["coverage"]["covered"], 14);
     assert_eq!(m["churn"]["commits"], 4);
     assert!(m["hotspot"]["rank"].as_u64().is_some(), "{m}");
+    assert!(m["hotspot"]["of"].as_u64().unwrap() >= m["hotspot"]["rank"].as_u64().unwrap(), "{m}");
     let reasons: Vec<&str> = v["policy"]["reasons"].as_array().unwrap().iter().map(|r| r["rule"].as_str().unwrap()).collect();
     assert!(reasons.contains(&"poorly_covered") && reasons.contains(&"churny"), "{reasons:?}");
     let t = env.text(&["--no-daemon", "impact", "--files", "app/models/order.rb"]);

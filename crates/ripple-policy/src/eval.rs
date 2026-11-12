@@ -298,7 +298,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     let changed_entries: Vec<ChangedEntry> = ctx
         .changed
         .iter()
-        .take(opts.cap(budget::CHANGED))
+        // `--limit` caps the output lists, never the input: `changed` keeps
+        // at least its default budget.
+        .take(opts.cap(budget::CHANGED).max(budget::CHANGED))
         .map(|c| ChangedEntry {
             path: c.file.path.clone(),
             status: c.file.status,

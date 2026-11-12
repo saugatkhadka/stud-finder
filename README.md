@@ -50,7 +50,7 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 
 | Command | What it does |
 |---|---|
-| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--all` (list everything), `--limit N` (cap every list; counts stay exact), `--sync` (wait until every earlier edit is indexed, however long that takes), `--no-wait` (answer from the current index at once; may be marked stale), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
+| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--all` (list everything), `--limit N` (cap every list but `changed`; counts stay exact), `--sync` (wait until every earlier edit is indexed, however long that takes), `--no-wait` (answer from the current index at once; may be marked stale), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
 | `check --base REF` | CI entry point. `--format github\|markdown\|json\|text` (github is the default under `GITHUB_ACTIONS`), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`, `--file-level`. Never starts a daemon, but uses one that is already running. |
 | `dependents FILE` | The `impact` report of FILE as if it had changed (same sections and budgets). `--scope NAME` (repeatable): as if only that method / action changed. `--depth N`, `--all`, `--limit N`, `--format text\|json`. |
 | `dependencies FILE` | Direct dependencies; `--depth N` (0 = all). |
@@ -290,7 +290,8 @@ subset of file-level ones:
 `ripple schema` prints its JSON Schema (draft 2020-12). The report is
 deterministic, apart from `timing`. Every list is cut to a small budget
 (see below) and its exact size is in `counts`. `--all` lists everything, and
-`--limit N` caps every list at N.
+`--limit N` caps every list at N, except `changed`, which keeps at least
+its default budget (a larger N raises it).
 
 ### JSON shape
 
@@ -381,7 +382,7 @@ What each section means:
   described under Configuration.
 - **`changed[].metrics`** (source files: not tests, not deleted, not "other"; each part absent when
   unknown or its signal is not ready):
-  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, percentile, hotspot}}`.
+  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, of, percentile, hotspot}}`.
   `coverage` is absent for a file in no report (unknown, not 0%); `hotspot`
   is present only for a hotspot (`ripple file` shows any file's rank);
   `changed_lines_percent` needs a diff; `stale` (only when true) means the
