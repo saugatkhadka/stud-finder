@@ -15,16 +15,31 @@
 //! current snapshot is an `Arc` behind an `RwLock` held only to clone or
 //! replace the `Arc`, and the pending-change bookkeeping is a separate mutex
 //! held only for bookkeeping. See [`crate::protocol`] for the freshness contract.
+//!
+//! Edits are coalesced: the indexer takes every path delivered so far as
+//! one batch, so N editors x M edits cost one pass per indexer cycle, not
+//! N x M passes. A waiting request only skips the debounce.
+//!
+//! **Watcher sync latency (macOS).** The cookie round trip used to take
+//! either ~0.5 ms or ~11 ms. The 11 ms is not ours (notify already uses
+//! FSEvents latency 0 with `NoDefer`): the kernel's fsevents device wakes
+//! its reader (`fseventsd`) at once only when more than about 16 events
+//! are queued, otherwise after a 10 ms timer. A raw FSEvents client shows
+//! the same 10-12 ms mode, `FSEventStreamFlushSync` does not help (right
+//! after the write, `FSEventsGetCurrentEventId()` is still below the
+//! cookie's event id: fseventsd has not seen it yet), and adding 15+ cheap
+//! events after the cookie removes the mode. So [`cookie_sync`] follows the
+//! cookie with [`KICK_EVENTS`] `fchmod`s of it.
 
 use crate::engine::{Engine, Pipeline, Snapshot};
 use crate::gitd::GitTracker;
 use crate::paths::DaemonPaths;
-use crate::protocol::{ErrorBody, FileParams, ImpactParams, Request, WhyParams, err_line, ok_line};
+use crate::protocol::{ErrorBody, FileParams, Freshness, ImpactParams, MAX_PENDING_LISTED, Request, WaitMode, WhyParams, err_line, ok_line, ok_line_fresh};
 use crate::query;
 use anyhow::{Context, Result, bail};
 use ripple_core::RelPath;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -37,9 +52,19 @@ use std::time::{Duration, Instant};
 pub const DEBOUNCE: Duration = Duration::from_millis(30);
 /// Upper bound on how long continuous events can postpone a re-index.
 pub const MAX_DEBOUNCE: Duration = Duration::from_millis(300);
-/// How long a request waits for the index to catch up before answering anyway.
+/// How long a `sync` request waits for the index to catch up before failing.
 const MAX_WAIT: Duration = Duration::from_secs(300);
+/// How long a `sync` (or `diff`) request waits for its cookie.
+const COOKIE_TIMEOUT: Duration = Duration::from_secs(2);
 const COOKIE_PREFIX: &str = "ripple-cookie-";
+/// Extra file events generated after a cookie so the kernel hands it to
+/// `fseventsd` at once (see the module docs). Measured threshold: 15.
+#[cfg(target_os = "macos")]
+const KICK_EVENTS: usize = 24;
+/// Cookie round-trip times kept for `stats`.
+const COOKIE_SAMPLES: usize = 1024;
+/// Distinguishes the cookies of daemons in one process (tests).
+static DAEMON_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Connections served at once. Each is a thread; CLI clients hold one for a
 /// single request, so this bounds threads, not clients.
 pub const MAX_CONNECTIONS: usize = 128;
@@ -62,9 +87,39 @@ struct State {
     last_event: Option<Instant>,
     reload_requested: u64,
     reload_done: u64,
-    cookies: HashSet<String>,
+    /// Cookies requests are waiting for -> reported by the watcher yet.
+    cookies: HashMap<String, bool>,
     shutdown: bool,
     fatal: Option<String>,
+    /// When the running pass started.
+    pass_started: Option<Instant>,
+    /// Duration of the last incremental pass (predicts the next one).
+    last_pass: Option<Duration>,
+    counters: Counters,
+}
+
+/// Indexer and freshness counters for `stats`.
+#[derive(Default)]
+struct Counters {
+    passes: u64,
+    /// Paths over all incremental passes, and the largest batch.
+    paths: u64,
+    max_batch: usize,
+    /// Recent cookie round trips, microseconds.
+    cookie_us: VecDeque<u32>,
+    cookie_timeouts: u64,
+    fresh: u64,
+    /// Answered fresh after waiting for the index.
+    waited: u64,
+    stale: u64,
+    /// Stale answers given before `max_wait` because the pass would not finish in time.
+    predicted: u64,
+}
+
+fn percentile(v: &VecDeque<u32>, p: f64) -> u32 {
+    let mut s: Vec<u32> = v.iter().copied().collect();
+    s.sort_unstable();
+    s.get(((s.len().max(1) - 1) as f64 * p).round() as usize).copied().unwrap_or(0)
 }
 
 pub struct Shared {
@@ -76,6 +131,8 @@ pub struct Shared {
     started: Instant,
     cookie_dir: PathBuf,
     cookie_seq: AtomicU64,
+    /// `{COOKIE_PREFIX}{pid}-{daemon}-`
+    cookie_stem: String,
     requests: AtomicU64,
     git: GitTracker,
     /// Milliseconds after `started` of the last request.
@@ -101,14 +158,24 @@ impl Shared {
         self.current().map(|s| s.generation).unwrap_or(0)
     }
 
+    fn max_wait_ms(&self) -> u64 {
+        self.current().map(|s| s.policy.config.daemon.max_wait_ms).unwrap_or(ripple_core::config::DEFAULT_MAX_WAIT_MS)
+    }
+
+    /// `paths` are relative to the root, except cookies (bare file names).
     fn deliver(&self, paths: impl IntoIterator<Item = RelPath>) {
-        let (cookies, paths): (Vec<RelPath>, Vec<RelPath>) = paths.into_iter().partition(|p| p.starts_with(COOKIE_PREFIX) || p.contains(&format!("/{COOKIE_PREFIX}")));
+        let (cookies, paths): (Vec<RelPath>, Vec<RelPath>) = paths.into_iter().partition(|p| p.starts_with(COOKIE_PREFIX));
         // Before the cookies: a request that sees its cookie must find every
         // earlier path in the git log too.
         self.git.log.push(&paths);
         let mut st = self.lock();
-        let mut any = !cookies.is_empty();
-        st.cookies.extend(cookies);
+        let mut any = false;
+        for c in cookies {
+            if let Some(seen) = st.cookies.get_mut(&c) {
+                *seen = true;
+                any = true;
+            }
+        }
         for p in paths {
             st.dirty.insert(p);
             st.delivered += 1;
@@ -155,6 +222,7 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     (&lock).write_all(format!("{}\n", std::process::id()).as_bytes())?;
 
     let cookie_dir = if root.join(".git").is_dir() { root.join(".git") } else { root.to_path_buf() };
+    let cookie_stem = format!("{COOKIE_PREFIX}{}-{}-", std::process::id(), DAEMON_SEQ.fetch_add(1, Ordering::Relaxed));
     let shared = Arc::new(Shared {
         root: root.to_path_buf(),
         paths: paths.clone(),
@@ -164,6 +232,7 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
         started: Instant::now(),
         cookie_dir,
         cookie_seq: AtomicU64::new(0),
+        cookie_stem,
         requests: AtomicU64::new(0),
         git: GitTracker::new(root),
         last_request_ms: AtomicU64::new(0),
@@ -175,6 +244,7 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
 
     let _watcher = start_watcher(&shared).map_err(|e| eprintln!("ripple: file watching unavailable ({e:#}); only re-stat freshness applies")).ok();
     // Git results are only cached while the watcher reports changes.
+    // (Also: whether there is a watcher to sync with.)
     shared.git.watching.store(_watcher.is_some(), Ordering::SeqCst);
     {
         let shared = shared.clone();
@@ -269,15 +339,12 @@ fn start_watcher(shared: &Arc<Shared>) -> Result<notify::RecommendedWatcher> {
                 return;
             }
             let rels = ev.paths.iter().filter_map(|p| relative(&roots, p)).filter(|r| !r.is_empty());
+            // Cookies are passed on as bare names; only those a request waits for count.
             let rels: Vec<RelPath> = rels
-                .filter(|r| {
-                    if r.contains(COOKIE_PREFIX) {
-                        // Only the creation matters; ignore the cookie's own deletion.
-                        return s.root.join(r).exists();
-                    }
-                    r != ".git" && !r.starts_with(".git/")
+                .filter_map(|r| match r.rsplit('/').next() {
+                    Some(name) if name.starts_with(COOKIE_PREFIX) => Some(name.to_string()),
+                    _ => (r != ".git" && !r.starts_with(".git/")).then_some(r),
                 })
-                .map(|r| if r.contains(COOKIE_PREFIX) { r.rsplit('/').next().unwrap_or(&r).to_string() } else { r })
                 .collect();
             if debug {
                 eprintln!("ripple: event {:?} {:?} -> {rels:?}", ev.kind, ev.paths);
@@ -318,6 +385,7 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
         st.applied = start_seq;
         shared.cv.notify_all();
     }
+    let debug = std::env::var_os("RIPPLE_DEBUG").is_some();
     loop {
         let mut st = shared.lock();
         loop {
@@ -340,17 +408,21 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
             st = shared.cv.wait(st).unwrap_or_else(|p| p.into_inner());
         }
         let reload = (st.reload_requested > st.reload_done).then_some(st.reload_requested);
+        // Everything delivered so far is one batch (edits coalesce).
         let batch = std::mem::take(&mut st.dirty);
         let target = st.delivered;
         st.in_progress = Some(batch.clone());
         st.urgent = false;
         st.first_event = None;
+        let started = Instant::now();
+        st.pass_started = Some(started);
         drop(st);
 
-        if std::env::var_os("RIPPLE_DEBUG").is_some() {
+        if debug {
             eprintln!("ripple: indexing {} path(s){}: {:?}", batch.len(), if reload.is_some() { " (full reload)" } else { "" }, batch.iter().take(20).collect::<Vec<_>>());
         }
         let result = if reload.is_some() { engine.full_build() } else { engine.apply_paths(&batch) };
+        let took = started.elapsed();
         match result {
             Ok(snap) => shared.set_current(snap),
             Err(e) => eprintln!("ripple: re-index failed: {e:#}"),
@@ -358,8 +430,14 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
         let mut st = shared.lock();
         st.applied = target;
         st.in_progress = None;
+        st.pass_started = None;
         if let Some(r) = reload {
             st.reload_done = r;
+        } else {
+            st.last_pass = Some(took);
+            st.counters.passes += 1;
+            st.counters.paths += batch.len() as u64;
+            st.counters.max_batch = st.counters.max_batch.max(batch.len());
         }
         shared.cv.notify_all();
     }
@@ -368,8 +446,9 @@ fn indexer(shared: Arc<Shared>, pipeline: Pipeline) {
 /// Outcome of the freshness step for one request.
 struct Fresh {
     snap: Arc<Snapshot>,
-    /// Changes known but not indexed (only when served during a busy re-index).
-    pending: usize,
+    info: Freshness,
+    /// Every pending path (`info.pending` is truncated).
+    pending: BTreeSet<RelPath>,
     refresh_us: u64,
 }
 
@@ -390,37 +469,81 @@ fn wait_for<'a>(shared: &'a Shared, mut st: MutexGuard<'a, State>, done: impl Fn
     Ok(st)
 }
 
-/// Writes a cookie file and waits until the watcher reports it: every file
-/// event that happened before this call has then been delivered.
-fn cookie_sync(shared: &Shared) -> Result<(), ErrorBody> {
-    let n = shared.cookie_seq.fetch_add(1, Ordering::Relaxed);
-    let name = format!("{COOKIE_PREFIX}{}-{n}", std::process::id());
-    let path = shared.cookie_dir.join(&name);
-    std::fs::write(&path, b"").map_err(|e| ErrorBody::new("sync_failed", format!("writing {}: {e}", path.display())))?;
-    let st = shared.lock();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut st = st;
-    let mut ok = true;
-    while !st.cookies.contains(&name) {
-        let now = Instant::now();
-        if now >= deadline {
-            ok = false;
-            break;
-        }
-        st = shared.cv.wait_timeout(st, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
+/// Makes the kernel hand pending file events to `fseventsd` now instead of
+/// after its 10 ms timer: it does so once enough events are queued.
+#[cfg(target_os = "macos")]
+fn kick(file: &std::fs::File) {
+    for i in 0..KICK_EVENTS {
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(if i % 2 == 0 { 0o644 } else { 0o600 }));
     }
-    st.cookies.remove(&name);
-    drop(st);
-    let _ = std::fs::remove_file(&path);
-    if ok { Ok(()) } else { Err(ErrorBody::new("sync_timeout", "the file watcher did not report the sync cookie within 2s")) }
 }
 
-/// The freshness step (see [`crate::protocol`]).
-fn refresh(shared: &Shared, named: &[String], sync: bool) -> Result<Fresh, ErrorBody> {
+#[cfg(not(target_os = "macos"))]
+fn kick(_: &std::fs::File) {}
+
+/// Writes a cookie file and waits (until `deadline`) for the watcher to
+/// report it: every file event that happened before this call has then been
+/// delivered. `Ok(false)` when the deadline passed first.
+fn cookie_sync(shared: &Shared, deadline: Instant) -> Result<bool, ErrorBody> {
     let t = Instant::now();
-    if sync {
-        cookie_sync(shared)?;
+    let n = shared.cookie_seq.fetch_add(1, Ordering::Relaxed);
+    let name = format!("{}{n}", shared.cookie_stem);
+    let path = shared.cookie_dir.join(&name);
+    shared.lock().cookies.insert(name.clone(), false);
+    match std::fs::File::create(&path) {
+        Ok(f) => kick(&f),
+        Err(e) => {
+            shared.lock().cookies.remove(&name);
+            return Err(ErrorBody::new("sync_failed", format!("writing {}: {e}", path.display())));
+        }
     }
+    let mut st = shared.lock();
+    let ok = loop {
+        if st.cookies.get(&name) == Some(&true) {
+            break true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break false;
+        }
+        st = shared.cv.wait_timeout(st, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
+    };
+    st.cookies.remove(&name);
+    if ok {
+        let c = &mut st.counters.cookie_us;
+        if c.len() >= COOKIE_SAMPLES {
+            c.pop_front();
+        }
+        c.push_back(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
+    } else {
+        st.counters.cookie_timeouts += 1;
+    }
+    drop(st);
+    let _ = std::fs::remove_file(&path);
+    Ok(ok)
+}
+
+/// The freshness step (see the freshness contract in [`crate::protocol`]).
+/// `synced`: a cookie round trip this request already did (diff requests).
+fn refresh(shared: &Shared, named: &[String], mode: WaitMode, synced: Option<bool>) -> Result<Fresh, ErrorBody> {
+    let t = Instant::now();
+    let deadline = match mode {
+        WaitMode::Bounded(d) => t + d,
+        _ => t + MAX_WAIT,
+    };
+    let watching = shared.git.watching.load(Ordering::SeqCst);
+    let synced = match synced {
+        Some(s) => s,
+        None if mode == WaitMode::NoWait || !watching => false,
+        None => {
+            let cookie_deadline = if mode == WaitMode::Full { t + COOKIE_TIMEOUT } else { deadline.max(t + Duration::from_millis(1)) };
+            let ok = cookie_sync(shared, cookie_deadline)?;
+            if !ok && mode == WaitMode::Full {
+                return Err(ErrorBody::new("sync_timeout", "the file watcher did not report the sync cookie within 2s"));
+            }
+            ok
+        }
+    };
     let st = wait_for(shared, shared.lock(), |_| shared.current().is_some())?;
     drop(st);
     let snap = shared.current().ok_or_else(|| ErrorBody::new("internal", "no snapshot"))?;
@@ -434,24 +557,62 @@ fn refresh(shared: &Shared, named: &[String], sync: bool) -> Result<Fresh, Error
         st.first_event.get_or_insert_with(Instant::now);
     }
     let target = st.delivered;
-    if st.applied >= target {
-        drop(st);
-        let snap = shared.current().unwrap_or(snap);
-        return Ok(Fresh { snap, pending: 0, refresh_us: t.elapsed().as_micros() as u64 });
+    let mut waited = false;
+    if st.applied < target && mode != WaitMode::NoWait {
+        st.urgent = true;
+        shared.cv.notify_all();
+        waited = true;
     }
-    let relevant = named.iter().any(|f| st.dirty.contains(f) || st.in_progress.as_ref().is_some_and(|b| b.contains(f)));
-    if st.in_progress.is_some() && !relevant {
-        let pending = st.dirty.len() + st.in_progress.as_ref().map_or(0, |b| b.len());
-        drop(st);
-        let snap = shared.current().unwrap_or(snap);
-        return Ok(Fresh { snap, pending, refresh_us: t.elapsed().as_micros() as u64 });
+    match mode {
+        WaitMode::Full => st = wait_for(shared, st, |s| s.applied >= target)?,
+        WaitMode::Bounded(_) => {
+            while st.applied < target {
+                if let Some(f) = &st.fatal {
+                    return Err(ErrorBody::new("index_failed", f.clone()));
+                }
+                if st.shutdown {
+                    return Err(ErrorBody::new("shutting_down", "daemon is shutting down"));
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                // Don't wait for a pass that cannot finish in time.
+                if let Some(eta) = eta(&st, now)
+                    && eta > deadline
+                {
+                    st.counters.predicted += 1;
+                    break;
+                }
+                st = shared.cv.wait_timeout(st, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
+            }
+        }
+        WaitMode::NoWait => {}
     }
-    st.urgent = true;
-    shared.cv.notify_all();
-    let st = wait_for(shared, st, |s| s.applied >= target)?;
+    let is_stale = st.applied < target;
+    let pending: BTreeSet<RelPath> = if is_stale { st.dirty.iter().chain(st.in_progress.iter().flatten()).cloned().collect() } else { BTreeSet::new() };
+    match (is_stale, waited) {
+        (true, _) => st.counters.stale += 1,
+        (false, true) => st.counters.waited += 1,
+        (false, false) => st.counters.fresh += 1,
+    }
     drop(st);
     let snap = shared.current().unwrap_or(snap);
-    Ok(Fresh { snap, pending: 0, refresh_us: t.elapsed().as_micros() as u64 })
+    let info = Freshness { stale: is_stale, synced, pending: pending.iter().take(MAX_PENDING_LISTED).cloned().collect(), pending_count: pending.len() };
+    Ok(Fresh { snap, info, pending, refresh_us: t.elapsed().as_micros() as u64 })
+}
+
+/// When everything delivered so far will be indexed, judging by the last
+/// pass's duration; `None` if unknown.
+fn eta(st: &State, now: Instant) -> Option<Instant> {
+    let pass = st.last_pass?;
+    let current_end = st.pass_started.map(|s| (s + pass).max(now));
+    Some(match current_end {
+        // The running pass, then one more for what arrived meanwhile.
+        Some(end) if !st.dirty.is_empty() => end + pass,
+        Some(end) => end,
+        None => now + pass,
+    })
 }
 
 /// Stops the daemon after the configured time without requests. The
@@ -529,16 +690,32 @@ fn params<T: serde::de::DeserializeOwned + Default>(v: &Value) -> Result<T, Erro
     serde_json::from_value(v.clone()).map_err(|e| ErrorBody::new("bad_params", e.to_string()))
 }
 
+/// Treats changed files that are still pending as wholly changed: their
+/// hunks describe contents newer than the method ranges in the snapshot.
+fn whole_file_if_pending(p: &mut ImpactParams, pending: &BTreeSet<RelPath>) {
+    if pending.is_empty() {
+        return;
+    }
+    for c in &mut p.changed {
+        let path = query::clean(&c.path);
+        if c.scopes.is_none() && (pending.contains(&path) || c.old_path.as_ref().is_some_and(|o| pending.contains(&query::clean(o)))) {
+            c.hunks = None;
+        }
+    }
+}
+
 fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
     shared.requests.fetch_add(1, Ordering::Relaxed);
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return err_line(&Value::Null, shared.generation(), 0, &ErrorBody::new("bad_request", format!("invalid request JSON: {e}"))),
     };
-    let result: Result<(String, u64), ErrorBody> = (|| match req.method.as_str() {
+    let default_wait = || shared.max_wait_ms();
+    let result: Result<(String, u64, Option<Freshness>), ErrorBody> = (|| match req.method.as_str() {
         "impact" => {
             let mut p: ImpactParams = params(&req.params)?;
-            let mut sync = p.sync;
+            let mode = WaitMode::from_params(p.sync, p.no_wait, p.max_wait_ms, default_wait());
+            let mut synced = None;
             if let Some(d) = p.diff.take() {
                 if !p.files.is_empty() || !p.changed.is_empty() {
                     return Err(ErrorBody::new("bad_params", "`diff` excludes `files` and `changed`"));
@@ -546,37 +723,48 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
                 // The git cache trusts the watcher's log: make sure every
                 // change made before this request is in it. If the watcher
                 // does not answer, its log cannot be trusted.
-                if shared.git.watching.load(Ordering::SeqCst) && cookie_sync(shared).is_err() {
-                    shared.git.log.overflow();
+                if shared.git.watching.load(Ordering::SeqCst) {
+                    let ok = cookie_sync(shared, Instant::now() + COOKIE_TIMEOUT)?;
+                    if !ok {
+                        shared.git.log.overflow();
+                        if mode == WaitMode::Full {
+                            return Err(ErrorBody::new("sync_timeout", "the file watcher did not report the sync cookie within 2s"));
+                        }
+                    }
+                    synced = Some(ok);
                 }
                 p.changed = shared.git.changed(&d.spec()).map_err(|e| ErrorBody::new("git_failed", e))?;
-                // The cookie round trip above already covers `sync`.
-                sync = false;
             }
-            let f = refresh(shared, &p.named_files(), sync)?;
-            Ok((query::impact_result(&f.snap, &p, f.pending, f.refresh_us)?, f.snap.generation))
+            let f = refresh(shared, &p.named_files(), mode, synced)?;
+            whole_file_if_pending(&mut p, &f.pending);
+            Ok((query::impact_result(&f.snap, &p, f.info.pending_count, f.refresh_us)?, f.snap.generation, Some(f.info)))
         }
         "dependents" | "dependencies" | "areas" => {
             let p: FileParams = params(&req.params)?;
-            let f = refresh(shared, std::slice::from_ref(&p.file), p.sync)?;
-            Ok((query::execute(&f.snap, &req.method, &req.params, f.pending)?, f.snap.generation))
+            let mode = WaitMode::from_params(p.sync, p.no_wait, p.max_wait_ms, default_wait());
+            let f = refresh(shared, std::slice::from_ref(&p.file), mode, None)?;
+            Ok((query::execute(&f.snap, &req.method, &req.params, f.info.pending_count)?, f.snap.generation, Some(f.info)))
         }
         "why" => {
             let p: WhyParams = params(&req.params)?;
-            let f = refresh(shared, &[p.from.clone(), p.to.clone()], p.sync)?;
-            Ok((query::execute(&f.snap, "why", &req.params, f.pending)?, f.snap.generation))
+            let mode = WaitMode::from_params(p.sync, p.no_wait, p.max_wait_ms, default_wait());
+            let f = refresh(shared, &[p.from.clone(), p.to.clone()], mode, None)?;
+            Ok((query::execute(&f.snap, "why", &req.params, f.info.pending_count)?, f.snap.generation, Some(f.info)))
         }
         "stats" => {
-            let f = refresh(shared, &[], false)?;
+            // Introspection never waits for the index (or syncs), unless asked to.
+            let sync = req.params.get("sync").and_then(Value::as_bool).unwrap_or(false);
+            let f = refresh(shared, &[], if sync { WaitMode::Full } else { WaitMode::NoWait }, None)?;
             let mut v = query::stats(&f.snap);
             let st = shared.lock();
+            let c = &st.counters;
             v["daemon"] = json!({
                 "pid": std::process::id(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "socket": shared.paths.socket,
                 "uptime_ms": shared.started.elapsed().as_millis() as u64,
                 "requests": shared.requests.load(Ordering::Relaxed),
-                "pending_changes": st.dirty.len(),
+                "pending_changes": st.dirty.len() + st.in_progress.as_ref().map_or(0, |b| b.len()),
                 "indexing": st.in_progress.is_some(),
                 "connections": *shared.conns.lock().unwrap_or_else(|p| p.into_inner()),
                 "git": {
@@ -586,8 +774,26 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
                     "full_updates": shared.git.counters.full.load(Ordering::Relaxed),
                     "last_us": shared.git.counters.last_us.load(Ordering::Relaxed),
                 },
+                "indexer": {
+                    "passes": c.passes,
+                    "paths": c.paths,
+                    "max_batch": c.max_batch,
+                    "last_pass_us": st.last_pass.map_or(0, |d| d.as_micros() as u64),
+                },
+                "freshness": {
+                    "max_wait_ms": shared.max_wait_ms(),
+                    "answers_fresh": c.fresh,
+                    "answers_after_wait": c.waited,
+                    "answers_stale": c.stale,
+                    "stale_predicted": c.predicted,
+                    "cookies": c.cookie_us.len(),
+                    "cookie_p50_us": percentile(&c.cookie_us, 0.5),
+                    "cookie_p99_us": percentile(&c.cookie_us, 0.99),
+                    "cookie_max_us": c.cookie_us.iter().copied().max().unwrap_or(0),
+                    "cookie_timeouts": c.cookie_timeouts,
+                },
             });
-            Ok((v.to_string(), f.snap.generation))
+            Ok((v.to_string(), f.snap.generation, Some(f.info)))
         }
         "reload" => {
             let mut st = shared.lock();
@@ -597,17 +803,18 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
             let st = wait_for(shared, st, |s| s.reload_done >= want)?;
             drop(st);
             let g = shared.generation();
-            Ok((json!({"generation": g}).to_string(), g))
+            Ok((json!({"generation": g}).to_string(), g, None))
         }
         "shutdown" => {
             begin_shutdown(shared);
-            Ok((json!({"stopping": true}).to_string(), shared.generation()))
+            Ok((json!({"stopping": true}).to_string(), shared.generation(), None))
         }
         other => Err(ErrorBody::new("unknown_method", format!("unknown method `{other}`"))),
     })();
     let us = start.elapsed().as_micros() as u64;
     match result {
-        Ok((body, generation)) => ok_line(&req.id, generation, us, &body),
+        Ok((body, generation, Some(fresh))) => ok_line_fresh(&req.id, generation, us, Some(&fresh), &body),
+        Ok((body, generation, None)) => ok_line(&req.id, generation, us, &body),
         Err(e) => err_line(&req.id, shared.generation(), us, &e),
     }
 }

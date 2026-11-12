@@ -2,7 +2,7 @@
 
 use crate::engine::{Engine, Pipeline, Snapshot};
 use crate::paths::DaemonPaths;
-use crate::protocol::{ErrorBody, ImpactParams, PROTOCOL, Response};
+use crate::protocol::{ErrorBody, Freshness, ImpactParams, PROTOCOL, Response};
 use crate::query;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -21,6 +21,9 @@ pub struct Reply {
     pub protocol: u32,
     pub generation: u64,
     pub server_us: u64,
+    /// How fresh the answer is (see the freshness contract in
+    /// [`crate::protocol`]). In-process answers are always fresh.
+    pub fresh: Freshness,
     pub result: Result<String, ErrorBody>,
 }
 
@@ -58,7 +61,8 @@ impl Client {
         } else {
             Err(resp.error.unwrap_or_else(|| ErrorBody::new("unknown", "error without details")))
         };
-        Ok(Reply { protocol: resp.protocol, generation: resp.generation, server_us: resp.server_us, result })
+        let fresh = Freshness { stale: resp.stale, synced: resp.synced.unwrap_or(false), pending: resp.pending, pending_count: resp.pending_count };
+        Ok(Reply { protocol: resp.protocol, generation: resp.generation, server_us: resp.server_us, fresh, result })
     }
 }
 
@@ -206,7 +210,8 @@ impl Backend {
                     "reload" | "shutdown" => Err(ErrorBody::new("no_daemon", "no daemon is running")),
                     m => query::execute(snap, m, params, 0),
                 });
-                Ok(Reply { protocol: PROTOCOL, generation: snap.generation, server_us: us, result })
+                let fresh = Freshness { synced: true, ..Freshness::default() };
+                Ok(Reply { protocol: PROTOCOL, generation: snap.generation, server_us: us, fresh, result })
             }
         }
     }
