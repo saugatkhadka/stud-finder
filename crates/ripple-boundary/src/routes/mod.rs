@@ -65,11 +65,92 @@ pub struct RouteTable {
     pub uninterpreted: BTreeMap<String, u64>,
     /// Route files that were never drawn from the entry file.
     pub unreached: Vec<RelPath>,
+    /// Extra helper names defined with `direct` from existing route names:
+    /// helper name -> index of the route it stands for (see [`helper_aliases`]).
+    pub helper_aliases: std::collections::HashMap<String, usize>,
+    /// Route name -> first route with that name.
+    pub by_name: std::collections::HashMap<String, usize>,
+}
+
+impl RouteTable {
+    /// The route a `<name>_path` helper resolves to: a named route, else a
+    /// [`helper_aliases`] entry.
+    pub fn named(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).or_else(|| self.helper_aliases.get(name)).copied()
+    }
+}
+
+/// `routes.set...name...each { |name| direct(name.sub('namespace_project', 'project')) ... }`
+/// (GitLab): every route whose name contains the first string also gets a
+/// helper with that part replaced. Recognised textually, only in a route file
+/// that calls `direct`, as `.sub('a', 'b')` / `.sub("a", "b")` with literal
+/// snake_case arguments.
+fn helper_aliases(files: &[(RelPath, Vec<u8>)], routes: &[Route]) -> std::collections::HashMap<String, usize> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r#"\.sub\(\s*['"]([a-z][a-z0-9_]*)['"]\s*,\s*['"]([a-z][a-z0-9_]*)['"]\s*\)"#).expect("regex"));
+    let mut out = std::collections::HashMap::new();
+    for (_, src) in files {
+        let text = String::from_utf8_lossy(src);
+        if !text.contains("direct(") {
+            continue;
+        }
+        for c in re.captures_iter(&text) {
+            let (from, to) = (&c[1], &c[2]);
+            for (i, r) in routes.iter().enumerate() {
+                let Some(name) = r.name.as_deref().filter(|n| n.contains(from)) else { continue };
+                out.entry(name.replacen(from, to, 1)).or_insert(i);
+            }
+        }
+    }
+    let named: std::collections::HashSet<&str> = routes.iter().filter_map(|r| r.name.as_deref()).collect();
+    out.retain(|k, _| !named.contains(k.as_str()));
+    out
 }
 
 /// Interprets `files` (path, source) starting from the entry file
 /// (`config/routes.rb`, or every file named `routes.rb` when that is absent).
 /// `api_only` mirrors `config.api_only` (no `new`/`edit` resource actions).
 pub fn build(files: &[(RelPath, Vec<u8>)], api_only: bool) -> RouteTable {
-    dsl::interpret(files, api_only)
+    let mut table = dsl::interpret(files, api_only);
+    for (i, r) in table.routes.iter().enumerate() {
+        if let Some(n) = &r.name {
+            table.by_name.entry(n.clone()).or_insert(i);
+        }
+    }
+    table.helper_aliases = helper_aliases(files, &table.routes);
+    table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: &str = r##"Rails.application.routes.draw do
+  get "/:ns/:id", to: "projects#show", as: :namespace_project
+  get "/:ns/:project_id/issues", to: "projects/issues#index", as: :namespace_project_issues
+  get "/explore", to: "explore#index", as: :explore_project
+  Gitlab::Application.routes.set.filter_map { |route| route.name if route.name&.include?('namespace_project') }.each do |name|
+    new_name = name.sub('namespace_project', 'project')
+    direct(new_name) { |project, *args| send("#{name}_url", project&.namespace, project, *args) }
+  end
+end
+"##;
+
+    #[test]
+    fn direct_sub_aliases_name_the_original_route() {
+        let t = build(&[("config/routes.rb".into(), SRC.as_bytes().to_vec())], false);
+        let ctrl = |n: &str| t.named(n).map(|i| t.routes[i].endpoint());
+        assert_eq!(ctrl("project").as_deref(), Some("projects#show"));
+        assert_eq!(ctrl("project_issues").as_deref(), Some("projects/issues#index"));
+        // A real route name always wins over an alias; unknown names stay unknown.
+        assert_eq!(ctrl("explore_project").as_deref(), Some("explore#index"));
+        assert_eq!(ctrl("project_wikis"), None);
+    }
+
+    #[test]
+    fn no_direct_no_aliases() {
+        let src = SRC.replace("direct(new_name)", "puts(new_name)");
+        let t = build(&[("config/routes.rb".into(), src.into_bytes())], false);
+        assert!(t.helper_aliases.is_empty());
+    }
 }

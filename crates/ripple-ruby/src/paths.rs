@@ -34,6 +34,23 @@ pub fn classify(path: &str) -> Option<SourceKind> {
     }
 }
 
+/// A Ruby file in a test tree: a `spec/` or `test/` directory at the root or
+/// below (`ee/spec/features/x_spec.rb`).
+pub fn is_test_path(path: &str) -> bool {
+    path.ends_with(".rb") && path.split('/').rev().skip(1).any(|seg| seg == "spec" || seg == "test")
+}
+
+#[cfg(test)]
+#[test]
+fn test_paths() {
+    assert!(is_test_path("spec/requests/a_spec.rb"));
+    assert!(is_test_path("ee/spec/features/a_spec.rb"));
+    assert!(is_test_path("test/integration/a_test.rb"));
+    assert!(!is_test_path("app/models/spec.rb"));
+    assert!(!is_test_path("app/models/test_run.rb"));
+    assert!(!is_test_path("spec/javascripts/a.js"));
+}
+
 pub fn file_name(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, n)| n)
 }

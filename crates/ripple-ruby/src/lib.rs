@@ -243,6 +243,7 @@ impl State {
             facts: ripple_core::Facts {
                 scopes,
                 mentions,
+                http_requests: self.http_requests(),
                 ..Default::default()
             },
             warnings: self
@@ -252,6 +253,25 @@ impl State {
                 .collect(),
             stats,
         }
+    }
+
+    /// Every test's HTTP requests, in file order.
+    fn http_requests(&self) -> Vec<ripple_core::JsCallSite> {
+        let mut out = Vec::new();
+        for (path, e) in &self.files {
+            for r in &e.facts.requests {
+                out.push(ripple_core::JsCallSite {
+                    file: path.clone(),
+                    line: r.line,
+                    method: Some(r.verb.clone()),
+                    url: r.url.clone(),
+                    callee: r.callee.clone(),
+                    route_helper: r.helper,
+                    link: false,
+                });
+            }
+        }
+        out
     }
 
     /// Repairs two Rubydex incremental gaps (see [`shadow`]): definitions

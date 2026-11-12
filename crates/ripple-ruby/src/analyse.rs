@@ -82,7 +82,8 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
     let mut local_graph = None;
     match kind {
         SourceKind::Ruby => {
-            let controller = paths::is_scoped_controller(rel);
+            let want = rails::Want { controller: paths::is_scoped_controller(rel), requests: paths::is_test_path(rel) };
+            let controller = want.controller;
             entry.zeitwerk_keys = paths::zeitwerk_keys(rel, extra_roots);
             match catch_unwind(AssertUnwindSafe(|| {
                 build_local_graph(
@@ -125,11 +126,11 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             // One prism parse for the Rails DSL facts, actions and methods.
             match catch_unwind(AssertUnwindSafe(|| {
                 if !method_level {
-                    return (rails::collect(&source, controller), MethodFacts::default());
+                    return (rails::collect(&source, want), MethodFacts::default());
                 }
                 let result = ruby_prism::parse(source.as_bytes());
                 let root = result.node();
-                (rails::collect_root(&root, &source, controller), methods::collect(&root, source.as_bytes(), controller))
+                (rails::collect_root(&root, &source, want), methods::collect(&root, source.as_bytes(), controller))
             })) {
                 Ok((f, mut m)) => {
                     entry.facts = f;
