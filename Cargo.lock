@@ -1370,6 +1370,7 @@ name = "ripple-history"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "ripple-core",
  "ripple-policy",
  "tempfile",
