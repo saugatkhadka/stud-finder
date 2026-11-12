@@ -159,3 +159,136 @@ pub fn stats(v: &Value) -> String {
     }
     o
 }
+
+/// "coverage unavailable (no coverage report found ...)" for every signal
+/// that is neither ready nor turned off; empty when all are.
+fn signals_line(v: &Value) -> String {
+    let Ok(sig) = serde_json::from_value::<ripple_policy::Signals>(v.clone()) else { return String::new() };
+    let parts: Vec<String> = sig
+        .not_ready()
+        .into_iter()
+        .map(|(name, st)| match &st.reason {
+            Some(r) => format!("{name} {} ({r})", st.state.as_str()),
+            None => format!("{name} {}", st.state.as_str()),
+        })
+        .collect();
+    if parts.is_empty() { String::new() } else { format!("not ready: {}\n", parts.join("; ")) }
+}
+
+/// `ripple file` (at most ~40 lines).
+pub fn file_profile(v: &Value) -> String {
+    let mut o = String::new();
+    let mut head = vec![s(&v["language"]).to_string()];
+    let areas: Vec<String> = v["areas"].as_array().into_iter().flatten().map(|a| format!("{} ({})", s(&a["area"]), s(&a["tier"]))).collect();
+    if !areas.is_empty() {
+        head.push(format!("area {}", areas.join(", ")));
+    }
+    let owners: Vec<&str> = v["owners"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if !owners.is_empty() {
+        head.push(format!("owners {}", owners.join(" ")));
+    }
+    if v["is_test"] == Value::Bool(true) {
+        head.push("test".into());
+    }
+    if v["is_global"] == Value::Bool(true) {
+        head.push("global (static impact is not reliable)".into());
+    }
+    if v["in_graph"] != Value::Bool(true) {
+        head.push("not in the dependency graph".into());
+    }
+    o += &format!("{}\n  {}\n", s(&v["file"]), head.join(" · "));
+    let m: ripple_policy::Metrics = serde_json::from_value(v["metrics"].clone()).unwrap_or_default();
+    let mut size = Vec::new();
+    if let Some(l) = m.lines {
+        size.push(format!("{l} code lines"));
+    }
+    if let Some(n) = v["methods"].as_u64().filter(|n| *n > 0) {
+        size.push(format!("{n} methods"));
+    }
+    let line = ripple_policy::metrics_line(&m);
+    if !line.is_empty() || !size.is_empty() {
+        o += &format!("  {}\n", [size.join(", "), line].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · "));
+    }
+    if let Some(c) = m.churn {
+        let last = c.last_changed.map(|t| format!(", last {}", days_ago(t))).unwrap_or_default();
+        o += &format!("  churn: {} commits in the history window, {} in the last 90 days{last}\n", c.commits, c.recent_commits);
+    }
+    if let Some(c) = m.coverage {
+        o += &format!("  coverage: {} of {} lines{}{}\n", c.covered, c.coverable, c.percent.map(|p| format!(" ({}%)", ripple_policy::fmt_pct(p))).unwrap_or_default(), if c.stale { ", stale (measured before HEAD or too long ago)" } else { "" });
+    }
+    if let Some(h) = m.hotspot {
+        o += &format!("  hotspot: rank {} of {} (percentile {}){}\n", h.rank, h.of, ripple_policy::fmt_pct(h.percentile), if h.hotspot { ", a hotspot" } else { "" });
+    }
+    let top: Vec<&Value> = v["top_methods"].as_array().into_iter().flatten().collect();
+    if !top.is_empty() {
+        o += "  most complex methods:\n";
+        for t in top {
+            let cov = t["coverage"].as_f64().map(|c| format!("  cov {}%", ripple_policy::fmt_pct(c))).unwrap_or_default();
+            o += &format!("    {:>4}  {} (lines {}-{}){cov}\n", t["complexity"].as_u64().unwrap_or(0), t["name"].as_str().unwrap_or("?"), t["start"], t["end"]);
+        }
+    }
+    let unc: Vec<&str> = v["uncovered_methods"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if !unc.is_empty() {
+        let shown: Vec<&str> = unc.iter().take(8).copied().collect();
+        let more = if unc.len() > 8 { format!(" and {} more", unc.len() - 8) } else { String::new() };
+        o += &format!("  uncovered methods: {}{more}\n", shown.join(", "));
+    }
+    let d = &v["dependents"];
+    let top: Vec<String> = d["top"].as_array().into_iter().flatten().map(|x| format!("{} ({})", s(&x["file"]), x["dependents"])).collect();
+    o += &format!("  dependents: {}{}\n", d["count"], if top.is_empty() { String::new() } else { format!(", most depended-on: {}", top.join(", ")) });
+    o += &format!("  dependencies: {}\n", v["dependencies"]["count"]);
+    let t = &v["tests"];
+    let files: Vec<&str> = t["files"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if files.is_empty() {
+        o += "  tests depending on it directly: none\n";
+    } else {
+        o += &format!("  tests depending on it directly: {}\n", t["count"]);
+        for f in files.iter().take(5) {
+            o += &format!("    {f}\n");
+        }
+        let n = t["count"].as_u64().unwrap_or(0) as usize;
+        if n > 5 {
+            o += &format!("    +{} more\n", n - 5);
+        }
+    }
+    let partners: Vec<&Value> = v["usually_changes_with"].as_array().into_iter().flatten().collect();
+    if !partners.is_empty() {
+        o += "  usually changes with:\n";
+        for p in partners.iter().take(5) {
+            o += &format!("    {}  {} of {} commits\n", s(&p["path"]), p["together"], p["of"]);
+        }
+    }
+    o += &signals_line(&v["signals"]).lines().map(|l| format!("  {l}\n")).collect::<String>();
+    o
+}
+
+/// "3 days ago" for a unix time.
+fn days_ago(t: i64) -> String {
+    let d = (ripple_coverage::now() - t).max(0) / 86_400;
+    match d {
+        0 => "today".to_string(),
+        1 => "1 day ago".to_string(),
+        n => format!("{n} days ago"),
+    }
+}
+
+/// `ripple rank`.
+pub fn rank(v: &Value) -> String {
+    let mut o = String::new();
+    let rows: Vec<&Value> = v["rows"].as_array().into_iter().flatten().collect();
+    let by = s(&v["by"]);
+    o += &format!(
+        "{} of {} ranked files{}; hotspots: top {}% (rank <= {})\n",
+        rows.len(),
+        v["files"],
+        if by == "score" { String::new() } else { format!(", by {by}") },
+        v["hotspot_percent"].as_f64().map(ripple_policy::fmt_pct).unwrap_or_default(),
+        v["hotspot_cutoff"]
+    );
+    for r in rows {
+        let hot = if r["hotspot"] == Value::Bool(true) { "*" } else { " " };
+        o += &format!("{:>4}{hot} {:>5.1}  {}\n       {}\n", r["rank"], r["score"].as_f64().unwrap_or(0.0), s(&r["path"]), s(&r["reason"]));
+    }
+    o += &signals_line(&v["signals"]);
+    o
+}

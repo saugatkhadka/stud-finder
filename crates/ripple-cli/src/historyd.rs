@@ -261,6 +261,11 @@ impl View {
     }
 }
 
+/// A view saying history is turned off.
+pub fn disabled_view() -> View {
+    View::new(State::Disabled)
+}
+
 fn round3(x: f32) -> f32 {
     (x * 1000.0).round() / 1000.0
 }

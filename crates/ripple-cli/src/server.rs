@@ -37,7 +37,8 @@ use crate::engine::{Engine, Pipeline, Snapshot};
 use crate::gitd::GitTracker;
 use crate::historyd::{self, HistoryD};
 use crate::paths::DaemonPaths;
-use crate::protocol::{ErrorBody, FileParams, Freshness, ImpactParams, MAX_PENDING_LISTED, Request, WaitMode, WhyParams, err_line, ok_line, ok_line_fresh, ok_line_history};
+use crate::protocol::{ErrorBody, FileParams, Freshness, ImpactParams, MAX_PENDING_LISTED, RankParams, Request, WaitMode, WhyParams, err_line, ok_line, ok_line_fresh, ok_line_history};
+use crate::signals::{CoverageD, RankD, Sources};
 use crate::query;
 use anyhow::{Context, Result, bail};
 use ripple_core::RelPath;
@@ -149,6 +150,10 @@ pub struct Shared {
     git: GitTracker,
     /// Git-history signals, built in the background (see [`crate::historyd`]).
     history: Arc<HistoryD>,
+    /// Coverage reports, loaded in the background (see [`crate::signals`]).
+    coverage: Arc<CoverageD>,
+    /// The cached hotspot ranking.
+    rank: Arc<RankD>,
     /// Milliseconds after `started` of the last request.
     last_request_ms: AtomicU64,
     in_flight: AtomicUsize,
@@ -170,6 +175,10 @@ impl Shared {
     }
     fn generation(&self) -> u64 {
         self.current().map(|s| s.generation).unwrap_or(0)
+    }
+    /// The signal sources of a query (clones three `Arc`s).
+    fn sources(&self) -> Sources {
+        Sources { history: self.history.view(), coverage: self.coverage.view(), rank: self.rank.clone(), background_rank: true }
     }
 
     fn max_wait_ms(&self) -> u64 {
@@ -237,7 +246,9 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     lock.set_len(0)?;
     (&lock).write_all(format!("{}\n", std::process::id()).as_bytes())?;
 
-    let history = HistoryD::start_with_hold(root, &ripple_policy::load_config(root).map(|l| l.config).unwrap_or_default(), opts.history_hold);
+    let config = ripple_policy::load_config(root).map(|l| l.config).unwrap_or_default();
+    let history = HistoryD::start_with_hold(root, &config, opts.history_hold);
+    let coverage = CoverageD::new(root, &config.coverage);
     let cookie_dir = if root.join(".git").is_dir() { root.join(".git") } else { root.to_path_buf() };
     let cookie_stem = format!("{COOKIE_PREFIX}{}-{}-", std::process::id(), DAEMON_SEQ.fetch_add(1, Ordering::Relaxed));
     let shared = Arc::new(Shared {
@@ -253,6 +264,8 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
         requests: AtomicU64::new(0),
         git: GitTracker::new(root),
         history,
+        coverage,
+        rank: RankD::new(),
         last_request_ms: AtomicU64::new(0),
         in_flight: AtomicUsize::new(0),
         conns: Mutex::new(0),
@@ -263,6 +276,10 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     {
         let h = shared.history.clone();
         shared.git.on_head_move(move || h.nudge());
+    }
+    {
+        let weak = Arc::downgrade(&shared);
+        shared.coverage.start(Box::new(move || weak.upgrade()?.current().map(|s| s.files.clone())));
     }
     let _watcher = start_watcher(&shared).map_err(|e| eprintln!("ripple: file watching unavailable ({e:#}); only re-stat freshness applies")).ok();
     // Git results are only cached while the watcher reports changes.
@@ -322,6 +339,8 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     drop(lock);
     // A running history build is cancelled between commits; wait for it.
     shared.history.join();
+    shared.coverage.shutdown();
+    shared.coverage.join();
     Ok(())
 }
 
@@ -366,18 +385,23 @@ fn start_watcher(shared: &Arc<Shared>) -> Result<notify::RecommendedWatcher> {
             // Cookies are passed on as bare names; only those a request waits for count.
             // Git's own files are dropped, but HEAD / branch moves feed the history thread.
             let mut head_moved = false;
+            let mut coverage = false;
             let rels: Vec<RelPath> = rels
                 .filter_map(|r| match r.rsplit('/').next() {
                     Some(name) if name.starts_with(COOKIE_PREFIX) => Some(name.to_string()),
                     _ => {
                         let git = r == ".git" || r.starts_with(".git/");
                         head_moved |= git && historyd::is_head_event(&r);
+                        coverage |= !git && !coverage && s.coverage.is_report_path(&r);
                         (!git).then_some(r)
                     }
                 })
                 .collect();
             if head_moved {
                 s.history.nudge();
+            }
+            if coverage {
+                s.coverage.nudge();
             }
             if debug {
                 eprintln!("ripple: event {:?} {:?} -> {rels:?}", ev.kind, ev.paths);
@@ -691,6 +715,7 @@ fn idle_timer(shared: Arc<Shared>) {
 /// Marks the daemon as stopping and wakes the accept loop so it exits.
 fn begin_shutdown(shared: &Shared) {
     shared.history.shutdown();
+    shared.coverage.shutdown();
     let mut st = shared.lock();
     st.shutdown = true;
     shared.cv.notify_all();
@@ -751,14 +776,6 @@ fn whole_file_if_pending(p: &mut ImpactParams, pending: &BTreeSet<RelPath>) {
     }
 }
 
-/// The changed paths of an impact request (after `diff` was resolved).
-fn changed_paths(p: &ImpactParams) -> Vec<String> {
-    let mut v: Vec<String> = p.changed.iter().map(|c| query::clean(&c.path)).chain(p.files.iter().map(|f| query::clean(f))).collect();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-
 fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
     shared.requests.fetch_add(1, Ordering::Relaxed);
     let req: Request = match serde_json::from_str(line) {
@@ -794,22 +811,30 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
             }
             let f = refresh(shared, &p.named_files(), mode, synced)?;
             whole_file_if_pending(&mut p, &f.pending);
-            let body = query::impact_result(&f.snap, &p, f.info.pending_count, f.refresh_us)?;
-            let changed = changed_paths(&p);
-            history = serde_json::to_string(&historyd::impact_history(&shared.history.view(), &f.snap, &changed)).ok();
+            shared.coverage.query_tick();
+            let (body, h) = query::impact_result(&f.snap, &p, f.info.pending_count, f.refresh_us, &shared.sources())?;
+            history = serde_json::to_string(&h).ok();
             Ok((body, f.snap.generation, Some(f.info)))
         }
-        "dependents" | "dependencies" | "areas" => {
+        "dependents" | "dependencies" | "areas" | "file" => {
             let p: FileParams = params(&req.params)?;
             let mode = WaitMode::from_params(p.sync, p.no_wait, p.max_wait_ms, default_wait());
             let f = refresh(shared, std::slice::from_ref(&p.file), mode, None)?;
-            Ok((query::execute(&f.snap, &req.method, &req.params, f.info.pending_count)?, f.snap.generation, Some(f.info)))
+            shared.coverage.query_tick();
+            Ok((query::execute(&f.snap, &req.method, &req.params, f.info.pending_count, &shared.sources())?, f.snap.generation, Some(f.info)))
+        }
+        "rank" => {
+            let p: RankParams = params(&req.params)?;
+            let mode = WaitMode::from_params(p.sync, p.no_wait, p.max_wait_ms, default_wait());
+            let f = refresh(shared, &[], mode, None)?;
+            shared.coverage.query_tick();
+            Ok((query::execute(&f.snap, "rank", &req.params, f.info.pending_count, &shared.sources())?, f.snap.generation, Some(f.info)))
         }
         "why" => {
             let p: WhyParams = params(&req.params)?;
             let mode = WaitMode::from_params(p.sync, p.no_wait, p.max_wait_ms, default_wait());
             let f = refresh(shared, &[p.from.clone(), p.to.clone()], mode, None)?;
-            Ok((query::execute(&f.snap, "why", &req.params, f.info.pending_count)?, f.snap.generation, Some(f.info)))
+            Ok((query::execute(&f.snap, "why", &req.params, f.info.pending_count, &Sources::none())?, f.snap.generation, Some(f.info)))
         }
         "stats" => {
             // Introspection never waits for the index (or syncs), unless asked to.
@@ -817,6 +842,8 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
             let f = refresh(shared, &[], if sync { WaitMode::Full } else { WaitMode::NoWait }, None)?;
             let mut v = query::stats(&f.snap);
             v["history"] = shared.history.stats_json();
+            v["coverage"] = shared.coverage.stats_json();
+            v["rank"] = shared.rank.stats_json();
             let st = shared.lock();
             let c = &st.counters;
             v["daemon"] = json!({
@@ -865,6 +892,7 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
             drop(st);
             if let Some(s) = shared.current() {
                 shared.history.configure(s.policy.config.history.enabled);
+                shared.coverage.configure(&s.policy.config.coverage);
             }
             let g = shared.generation();
             Ok((json!({"generation": g}).to_string(), g, None))

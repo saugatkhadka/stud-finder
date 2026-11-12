@@ -89,10 +89,16 @@ pub struct Report {
     /// instead. Empty for whole-file changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blind_spots: Vec<String>,
-    /// Reserved: files that historically change together with the changed
-    /// files (co-change). Absent until a provider fills it.
+    /// Files outside the diff, its direct dependents and its direct
+    /// dependencies that usually change together with a changed file (git
+    /// co-change), best first, at most [`crate::USUALLY_CHANGES_WITH`].
+    /// Absent when there are none or the signal is not ready (see `signals`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usually_changes_with: Vec<crate::signals::CoChangeEntry>,
+    /// State of each non-graph signal (complexity, churn, co-change,
+    /// coverage, hotspot). Absent when the caller provided none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usually_changes_with: Option<Vec<serde_json::Value>>,
+    pub signals: Option<crate::signals::Signals>,
     /// Risk, fired rules, required actions, owners and areas from
     /// `ripple.yml`. Present when the request asks for it (`check`), or when
     /// a `ripple.yml` defines rules or areas and a rule fired.
@@ -432,6 +438,10 @@ pub struct ChangedEntry {
     pub is_test: bool,
     /// Matches `global_files`: static impact is not reliable for this file.
     pub is_global: bool,
+    /// Complexity, size, churn, coverage and hotspot rank (non-test files
+    /// that still exist; parts are absent when unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<crate::signals::Metrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

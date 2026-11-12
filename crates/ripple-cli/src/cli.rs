@@ -58,6 +58,16 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OutFormat::Text)]
         format: OutFormat,
     },
+    /// One file's profile: metrics, its most complex methods, churn,
+    /// coverage, dependents, direct tests, co-change partners, hotspot rank.
+    File {
+        file: String,
+        #[arg(long, value_enum, default_value_t = OutFormat::Text)]
+        format: OutFormat,
+    },
+    /// The riskiest non-test source files: recent churn, complexity,
+    /// missing coverage and dependents, as percentile ranks.
+    Rank(RankArgs),
     /// Index statistics.
     Stats {
         #[arg(long, value_enum, default_value_t = OutFormat::Text)]
@@ -257,6 +267,32 @@ struct DependentsArgs {
     format: OutFormat,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum RankBy {
+    Score,
+    Churn,
+    Complexity,
+    /// Lowest known coverage first.
+    Coverage,
+}
+
+#[derive(Args)]
+struct RankArgs {
+    /// Files listed.
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    /// Only files matching this glob (repeatable).
+    #[arg(long = "path", value_name = "GLOB")]
+    path: Vec<String>,
+    /// Only files in this area of ripple.yml.
+    #[arg(long, value_name = "NAME")]
+    area: Option<String>,
+    #[arg(long, value_enum, default_value_t = RankBy::Score)]
+    by: RankBy,
+    #[arg(long, value_enum, default_value_t = OutFormat::Text)]
+    format: OutFormat,
+}
+
 #[derive(Args)]
 struct NeighbourArgs {
     file: String,
@@ -356,6 +392,22 @@ fn run(cli: Cli) -> Result<u8> {
             let mut b = open(true)?;
             let out = result_of(b.call("areas", &json!({"file": to_rel(&root, &file)}))?)?;
             print_value(&out, format, crate::output::areas)
+        }
+        Cmd::File { file, format } => {
+            let mut b = open(true)?;
+            let out = result_of(b.call("file", &json!({"file": to_rel(&root, &file)}))?)?;
+            print_value(&out, format, crate::output::file_profile)
+        }
+        Cmd::Rank(a) => {
+            let mut b = open(true)?;
+            let by = match a.by {
+                RankBy::Score => "score",
+                RankBy::Churn => "churn",
+                RankBy::Complexity => "complexity",
+                RankBy::Coverage => "coverage",
+            };
+            let out = result_of(b.call("rank", &json!({"limit": a.limit, "path": a.path, "area": a.area, "by": by}))?)?;
+            print_value(&out, a.format, crate::output::rank)
         }
         Cmd::Stats { format } => {
             let mut b = open(true)?;
