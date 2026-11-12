@@ -125,6 +125,25 @@ pub fn summary(sel: &Selection, commits: &[CommitResult]) -> String {
     };
     let _ = writeln!(s, "| random, same size as `{reference}` | {} | {} | {} | {} | | | | {} | {} | {} | | |\n", refcases.len(), rand(0, false), rand(1, false), rand(2, false), rand(0, true), rand(1, true), rand(2, true));
 
+    // The same, for targets the extractors analyse.
+    let _ = writeln!(s, "Source-file targets only (Ruby, JS/TS, templates; docs, yml, lockfiles etc. dropped as targets but kept as seeds):\n");
+    let _ = writeln!(s, "| variant | cases | dependent ≤1 | ≤3 | dependency ≤3 | either ≤1 | ≤2 | ≤3 | either ≤3, commit mean |");
+    let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for name in &names {
+        let cases: Vec<&LooCase> = of(commits, name).flat_map(|v| &v.loo).filter(|c| crate::adapter::is_source(&c.file)).collect();
+        let n = cases.len();
+        let r = |get: fn(&LooCase) -> Option<u32>, k: usize| pct(cases.iter().filter(|c| within(get(c), k)).count(), n);
+        let per: Vec<f64> = of(commits, name)
+            .filter_map(|v| {
+                let src: Vec<&LooCase> = v.loo.iter().filter(|c| crate::adapter::is_source(&c.file)).collect();
+                (!src.is_empty()).then(|| src.iter().filter(|c| within(c.union(), 3)).count() as f64 / src.len() as f64)
+            })
+            .collect();
+        let mean = if per.is_empty() { "–".to_string() } else { format!("{:.1}%", 100.0 * per.iter().sum::<f64>() / per.len() as f64) };
+        let _ = writeln!(s, "| {name} | {n} | {} | {} | {} | {} | {} | {} | {mean} |", r(|c| c.rev, 1), r(|c| c.rev, 3), r(|c| c.fwd, 3), r(LooCase::union, 1), r(LooCase::union, 2), r(LooCase::union, 3));
+    }
+    let _ = writeln!(s);
+
     // Predicted sizes in the LOO setting.
     let _ = writeln!(s, "Predicted set size in the LOO queries (non-test files, seeds excluded), p50 / p90:\n");
     let _ = writeln!(s, "| variant | dependents ≤1 | ≤2 | ≤3 | either ≤1 | ≤3 |");
