@@ -170,7 +170,25 @@ pub fn render(report: &Report, max_listed: usize) -> String {
     let (mh, ms) = if with_metrics { (" Metrics |", "---|") } else { ("", "") };
     let _ = writeln!(o, "| File | Status | Lines | Change | Language | Areas | Direct dependents |{mh}");
     let _ = writeln!(o, "|---|---|---|---|---|---|---:|{ms}");
-    for c in &r.changed {
+    for row in super::changed_rows(&r.changed) {
+        let c = match row {
+            super::ChangedRow::One(c) => c,
+            super::ChangedRow::Dir { dir, files } => {
+                let (statuses, l, areas) = super::dir_totals(&files);
+                let status = if statuses.is_empty() { "modified".to_string() } else { statuses };
+                let _ = writeln!(
+                    o,
+                    "| {} files in {} | {} | {} | | other | {} | |{}",
+                    files.len(),
+                    cell(&code(&dir)),
+                    status,
+                    l.map(|(a, d)| lines(Some(a), Some(d))).unwrap_or_default(),
+                    cell(&areas.join(", ")),
+                    if with_metrics { " |" } else { "" }
+                );
+                continue;
+            }
+        };
         let mut file = code(&c.path);
         if let Some(old) = &c.old_path {
             file = format!("{} (was {})", file, code(old));

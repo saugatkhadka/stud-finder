@@ -115,6 +115,69 @@ pub(crate) fn thousands(n: usize) -> String {
     out
 }
 
+/// Fewest plain non-source files in one directory that the text and
+/// markdown renderers show as one summary row.
+pub(crate) const MIN_COLLAPSED: usize = 3;
+
+/// A row of the "changed" section: one file, or several plain non-source
+/// files of one directory (locale JSON, fixtures, assets).
+pub(crate) enum ChangedRow<'a> {
+    One(&'a crate::report::ChangedEntry),
+    Dir { dir: String, files: Vec<&'a crate::report::ChangedEntry> },
+}
+
+/// Groups the changed files for display. A file is collapsible when its
+/// language is `other` and nothing about it needs its own line (not global,
+/// not a test, not renamed). Directories with at least [`MIN_COLLAPSED`] such
+/// files become one row, at the position of their first file; everything
+/// else keeps its order. The JSON report is not affected.
+pub(crate) fn changed_rows(changed: &[crate::report::ChangedEntry]) -> Vec<ChangedRow<'_>> {
+    use std::collections::HashMap;
+    let dir_of = |p: &str| p.rfind('/').map(|i| p[..=i].to_string()).unwrap_or_else(|| "./".to_string());
+    let collapsible = |c: &crate::report::ChangedEntry| c.language == crate::Language::Other && !c.is_global && !c.is_test && c.old_path.is_none();
+    let mut count: HashMap<String, usize> = HashMap::new();
+    for c in changed.iter().filter(|c| collapsible(c)) {
+        *count.entry(dir_of(&c.path)).or_default() += 1;
+    }
+    let mut rows: Vec<ChangedRow> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for c in changed {
+        let dir = dir_of(&c.path);
+        if collapsible(c) && count.get(&dir).copied().unwrap_or(0) >= MIN_COLLAPSED {
+            if let Some(&i) = at.get(&dir) {
+                if let ChangedRow::Dir { files, .. } = &mut rows[i] {
+                    files.push(c);
+                }
+            } else {
+                at.insert(dir.clone(), rows.len());
+                rows.push(ChangedRow::Dir { dir, files: vec![c] });
+            }
+        } else {
+            rows.push(ChangedRow::One(c));
+        }
+    }
+    rows
+}
+
+/// Totals of a collapsed row: statuses other than modified ("3 added"),
+/// summed line counts (`None` when no file has any), and the union of areas.
+pub(crate) fn dir_totals(files: &[&crate::report::ChangedEntry]) -> (String, Option<(u32, u32)>, Vec<String>) {
+    use crate::changed::FileStatus;
+    let n = |s: FileStatus| files.iter().filter(|c| c.status == s).count();
+    let statuses: Vec<String> = [(FileStatus::Added, "added"), (FileStatus::Deleted, "deleted")]
+        .into_iter()
+        .filter(|(s, _)| n(*s) > 0)
+        .map(|(s, w)| format!("{} {w}", n(s)))
+        .collect();
+    let lines = files.iter().any(|c| c.added.is_some() || c.deleted.is_some()).then(|| {
+        files.iter().fold((0u32, 0u32), |(a, d), c| (a.saturating_add(c.added.unwrap_or(0)), d.saturating_add(c.deleted.unwrap_or(0))))
+    });
+    let mut areas: Vec<String> = files.iter().flat_map(|c| c.areas.iter().cloned()).collect();
+    areas.sort();
+    areas.dedup();
+    (statuses.join(", "), lines, areas)
+}
+
 /// One line on how the analysis treated changed files.
 pub(crate) fn mode_line(r: &crate::report::Report) -> String {
     if r.query.file_level {

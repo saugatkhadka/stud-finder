@@ -276,3 +276,41 @@ fn binary_sleeps_by_reexec_and_wakes() {
     assert_eq!(s["daemon"]["sleep"]["wakes"], 1, "{}", s["daemon"]);
     assert!(child.0.try_wait().unwrap().is_none());
 }
+
+#[test]
+fn old_and_surplus_snapshots_are_pruned() {
+    use std::time::SystemTime;
+    let dir = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    let hours = |h: u64| now - Duration::from_secs(h * 3600);
+    let make = |name: &str, mtime: SystemTime| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, b"x").unwrap();
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+        p
+    };
+    let keep = make("index-self.snap", hours(0));
+    let fresh = make("index-fresh.snap", now - Duration::from_secs(60)); // just saved by another daemon
+    let recent = make("index-recent.snap", hours(1));
+    let older = make("index-older.snap", hours(2));
+    let oldest = make("index-oldest.snap", hours(3));
+    let ancient = make("index-ancient.snap", hours(24 * 4));
+    let other = make("history.bin", hours(24 * 30));
+    let tmp = make(".index-self.snap.1.tmp", hours(24 * 30));
+    let deleted: BTreeSet<_> = snapfile::prune(&keep, now).into_iter().collect();
+    // Kept: itself, anything under 10 minutes old, and the newest others up to 3 in all.
+    assert_eq!(deleted, BTreeSet::from([older.clone(), oldest.clone(), ancient.clone()]));
+    for p in [&keep, &fresh, &recent, &other, &tmp] {
+        assert!(p.exists(), "{}", p.display());
+    }
+    // A lone old file next to a new one: kept by count, deleted by age.
+    let dir2 = tempfile::tempdir().unwrap();
+    let keep2 = dir2.path().join("index-a.snap");
+    std::fs::write(&keep2, b"x").unwrap();
+    let b = dir2.path().join("index-b.snap");
+    std::fs::write(&b, b"x").unwrap();
+    std::fs::File::options().write(true).open(&b).unwrap().set_modified(hours(5)).unwrap();
+    assert!(snapfile::prune(&keep2, now).is_empty());
+    std::fs::File::options().write(true).open(&b).unwrap().set_modified(hours(24 * 3 + 1)).unwrap();
+    assert_eq!(snapfile::prune(&keep2, now), vec![b]);
+}
