@@ -1,0 +1,134 @@
+# ripple.yml: how ripple judges the risk of a change in this repository.
+#
+# ripple builds a dependency graph of the repo (Ruby constants and requires,
+# Rails conventions, JS/TS imports, frontend API calls to Rails routes) and,
+# for a set of changed files, reports every file that depends on them,
+# directly or transitively. The rules below turn that "blast radius" into a
+# risk level (low / medium / high / critical) plus required actions.
+#
+# Check this file with:   ripple config check
+# Try it on your changes: ripple impact            (working tree vs HEAD)
+#                         ripple impact --base main
+#
+# Globs: repo-relative; `*` stays within one directory, `**` crosses them.
+# A pattern without `/` matches at any depth (`*.log`); a leading `/`
+# anchors it to the root (`/Gemfile`); a directory name also matches
+# everything under it (`app/models/billing`).
+
+version: 1
+
+# Never analysed and never reported (in addition to .gitignore).
+# Setting this replaces the defaults (node_modules, vendor, tmp, log, public, coverage, dist, build).
+# ignore:
+#   - node_modules/**
+#   - vendor/**
+#   - tmp/**
+
+# Named parts of the codebase. `tier` is how bad it is to break the area;
+# `owners` are suggested as reviewers when a change touches or reaches it.
+areas:
+  billing:
+    description: Payments, invoices and subscriptions
+    tier: critical
+    owners: ["@your-org/payments"]
+    paths:
+      - app/models/billing/**
+      - app/services/billing/**
+      - app/controllers/billing/**
+      - app/javascript/billing/**
+  auth:
+    description: Sign-in, sessions, permissions
+    tier: critical
+    owners: ["@your-org/identity"]
+    paths:
+      - app/models/user.rb
+      - app/controllers/sessions_controller.rb
+      - app/policies/**
+  admin:
+    tier: high
+    paths:
+      - app/controllers/admin/**
+      - app/views/admin/**
+
+# Files whose consumers no static graph can see. Changing one is reported as
+# "global: static impact is not reliable for this file".
+# Setting this replaces the defaults (config/initializers, application.rb,
+# environments, Gemfile(.lock), package.json and lockfiles).
+# global_files:
+#   - config/initializers/**
+#   - Gemfile.lock
+
+# Test files are listed under "tests to run" and never count toward the blast radius.
+# Setting this replaces the defaults (spec/**, test/**, __tests__, *.test.*, *.spec.*, *_spec.rb, *_test.rb, *.stories.*).
+# tests:
+#   - spec/**
+#   - "**/*.test.ts"
+
+# Rules. Every condition under `when` must hold for the rule to fire; the
+# change's risk is the highest risk among fired rules (low if none fired) and
+# the `require` lists are merged. Remove `rules:` entirely to use ripple's
+# built-in defaults (see the README).
+rules:
+  - id: billing-change
+    description: Anything touching billing needs a payments engineer
+    when:
+      touches: [billing]          # area names or globs
+    risk: critical
+    require: [human_review]
+
+  - id: auth-reached
+    description: Changes that auth code depends on directly
+    when:
+      reaches: [auth]             # an impacted (not changed) file is in auth...
+      within: 1                   # ...at most this many hops away
+    risk: high
+    require: [security_review]
+
+  - id: critical-reached
+    when:
+      reaches_tier: critical      # an impacted file is in any critical area
+      min_confidence: inferred    # ignore heuristic (name/URL-matched) edges for this rule
+    risk: medium
+
+  - id: high-tier-touched
+    when:
+      touches_tier: high          # a changed file is in an area of tier high or above
+    risk: high
+    require: [human_review]
+
+  - id: global-config
+    when:
+      touches_global: true        # a changed file matches global_files
+    risk: high
+    require: [run_full_suite]
+
+  - id: wide-blast-radius
+    when:
+      impacted_files_over: 200    # impacted non-test files, excluding the changed ones
+    risk: high
+
+  - id: big-diff
+    when:
+      changed_files_over: 40      # number of changed files
+      changed_lines_over: 1500    # added + deleted lines (only when a diff is available)
+    risk: medium
+
+  - id: frontend-backend
+    when:
+      crosses_boundary: true      # a Ruby change reaches JS/TS or vice versa
+    risk: medium
+
+  - id: untested-change
+    when:
+      untested: true              # a changed source file has no test among its dependents
+    risk: medium
+    require: [add_tests]
+
+query:
+  max_depth: 3                    # hops to follow from a changed file; 0 = unlimited
+  min_confidence: heuristic       # exact | inferred | heuristic
+
+ci:
+  fail_on: critical               # `ripple check` exits 1 at or above this risk; omit to never fail
+  github: true
+  max_listed: 50                  # impacted files listed in the markdown report

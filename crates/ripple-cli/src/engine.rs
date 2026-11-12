@@ -1,0 +1,453 @@
+//! The indexing engine: file listing -> extractors -> linkers -> graph,
+//! published as immutable [`Snapshot`]s.
+//!
+//! The engine is single-owner (`&mut self`) and is driven by one indexer
+//! thread in the daemon, or directly by one-shot commands. Readers only ever
+//! see `Arc<Snapshot>`s, which are never mutated after publication.
+
+use crate::edgefile::EdgeFileExtractor;
+use crate::files::{self, Listing};
+use anyhow::Result;
+use ripple_core::{ChangeSet, Edge, ExtractOutput, Extractor, Facts, Graph, Linker, RelPath, Warning, Workspace};
+use ripple_policy::{CONFIG_FILE_NAMES, Policy, PolicyIndex};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::{Instant, SystemTime};
+
+/// The extractors and linkers an engine runs.
+pub struct Pipeline {
+    pub extractors: Vec<Box<dyn Extractor>>,
+    pub linkers: Vec<Box<dyn Linker>>,
+}
+
+impl Pipeline {
+    /// The production pipeline. This is the only place the concrete
+    /// language extractors and linkers are named.
+    pub fn standard() -> Self {
+        let mut extractors: Vec<Box<dyn Extractor>> = vec![Box::new(ripple_ruby::RubyExtractor::new()), Box::new(ripple_js::JsExtractor::new())];
+        if let Some(e) = EdgeFileExtractor::from_env() {
+            extractors.push(Box::new(e));
+        }
+        let mut linkers: Vec<Box<dyn Linker>> = vec![Box::new(ripple_boundary::BoundaryLinker::new())];
+        // Debugging / benchmarking: `RIPPLE_EXTRACTORS=edge_file` runs only the named stages.
+        if let Some(only) = std::env::var("RIPPLE_EXTRACTORS").ok().filter(|v| !v.is_empty()) {
+            let keep: HashSet<&str> = only.split(',').map(str::trim).collect();
+            extractors.retain(|e| keep.contains(e.name()));
+            linkers.retain(|l| keep.contains(l.name()));
+        }
+        Self { extractors, linkers }
+    }
+}
+
+/// When each path was last examined by an incremental pass (shared by the
+/// engine and all its snapshots; written only after a pass is published).
+pub type Seen = Arc<RwLock<HashMap<RelPath, SystemTime>>>;
+
+/// One immutable index generation.
+pub struct Snapshot {
+    pub generation: u64,
+    pub root: PathBuf,
+    pub graph: Graph,
+    pub policy: Arc<Policy>,
+    /// Policy classification of every graph node.
+    pub index: PolicyIndex,
+    /// Extractor/linker/config warnings, sorted.
+    pub warnings: Vec<Warning>,
+    /// Per extractor/linker counters.
+    pub stats: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Microseconds per phase of the pass that produced this generation.
+    pub timings: BTreeMap<String, u64>,
+    /// Workspace membership.
+    pub files: Arc<HashSet<RelPath>>,
+    /// When each path was last looked at by an incremental pass; paths not
+    /// present were last looked at by the full build at `base_time`.
+    pub seen: Seen,
+    pub base_time: SystemTime,
+    pub listing: &'static str,
+    /// Deleted files whose former dependents are kept in the graph.
+    pub tombstones: usize,
+    pub built_at: SystemTime,
+}
+
+impl Snapshot {
+    /// Files among `paths` whose on-disk state may differ from what this
+    /// snapshot indexed: modified since last seen, created, or deleted.
+    /// Costs one `stat` per path.
+    pub fn stale_files(&self, paths: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for p in paths {
+            if p.is_empty() {
+                continue;
+            }
+            let seen_at = self.seen.read().ok().and_then(|s| s.get(p).copied());
+            let known = self.files.contains(p);
+            let stale = match std::fs::metadata(self.root.join(p)) {
+                Ok(m) if m.is_file() => {
+                    let mtime = m.modified().unwrap_or(SystemTime::now());
+                    match (known, seen_at) {
+                        (true, at) => mtime >= at.unwrap_or(self.base_time),
+                        // Unknown file: stale unless we already looked at it (and excluded it) after its last write.
+                        (false, Some(at)) => mtime >= at,
+                        (false, None) => true,
+                    }
+                }
+                _ => known,
+            };
+            if stale {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
+}
+
+pub struct Engine {
+    root: PathBuf,
+    pipeline: Pipeline,
+    ws: Workspace,
+    files: Arc<HashSet<RelPath>>,
+    seen: Seen,
+    base_time: SystemTime,
+    outputs: Vec<ExtractOutput>,
+    link_outputs: Vec<ExtractOutput>,
+    /// Extractors whose last run failed; they get a full `build` next time.
+    failed: Vec<bool>,
+    tombstones: BTreeMap<RelPath, Vec<Edge>>,
+    policy: Arc<Policy>,
+    config_warning: Option<Warning>,
+    generation: u64,
+    listing: Listing,
+    current: Option<Arc<Snapshot>>,
+}
+
+fn load_policy(root: &Path) -> (Policy, Option<Warning>) {
+    match Policy::load(root) {
+        Ok(p) => (p, None),
+        Err(e) => {
+            let w = Warning::new("config_invalid", format!("{e}; using built-in defaults until it is fixed"));
+            (Policy::compile(ripple_core::Config::default()).expect("defaults compile"), Some(w))
+        }
+    }
+}
+
+fn us(t: Instant) -> u64 {
+    t.elapsed().as_micros() as u64
+}
+
+impl Engine {
+    /// Cold start: lists files and runs every extractor and linker.
+    pub fn open(root: &Path, pipeline: Pipeline) -> Result<(Self, Arc<Snapshot>)> {
+        let root = root.to_path_buf();
+        let (policy, config_warning) = load_policy(&root);
+        let n_ex = pipeline.extractors.len();
+        let n_ln = pipeline.linkers.len();
+        let mut engine = Self {
+            ws: Workspace { root: root.clone(), files: Vec::new(), config: policy.config.clone() },
+            root,
+            pipeline,
+            files: Arc::default(),
+            seen: Arc::default(),
+            base_time: SystemTime::now(),
+            outputs: vec![ExtractOutput::default(); n_ex],
+            link_outputs: vec![ExtractOutput::default(); n_ln],
+            failed: vec![false; n_ex],
+            tombstones: BTreeMap::new(),
+            policy: Arc::new(policy),
+            config_warning,
+            generation: 0,
+            listing: Listing::Git,
+            current: None,
+        };
+        let snap = engine.full_build()?;
+        Ok((engine, snap))
+    }
+
+    pub fn current(&self) -> Option<Arc<Snapshot>> {
+        self.current.clone()
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Re-lists files, reloads the config and rebuilds everything.
+    pub fn full_build(&mut self) -> Result<Arc<Snapshot>> {
+        let start = Instant::now();
+        let mut timings = BTreeMap::new();
+        let (policy, warning) = load_policy(&self.root);
+        self.policy = Arc::new(policy);
+        self.config_warning = warning;
+        self.ws.config = self.policy.config.clone();
+
+        self.base_time = SystemTime::now();
+        let t = Instant::now();
+        let (files, listing) = files::list_files(&self.root, &self.policy)?;
+        timings.insert("list_files_us".into(), us(t));
+        self.listing = listing;
+        self.files = Arc::new(files.iter().cloned().collect());
+        self.ws.files = files;
+        self.tombstones.retain(|p, _| !self.files.contains(p));
+
+        self.run_extractors(None, &mut timings);
+        self.run_linkers(None, &mut timings);
+        let snap = self.publish(start, timings);
+        if let Ok(mut seen) = self.seen.write() {
+            seen.clear();
+        }
+        Ok(snap)
+    }
+
+    /// Turns raw paths reported by a watcher or a freshness check into a
+    /// [`ChangeSet`] by looking at the file system: existing files are
+    /// modified/added (unless ignored), missing ones removed; directories are
+    /// expanded. Returns whether `ripple.yml` was among them.
+    pub fn resolve_paths(&self, paths: &BTreeSet<RelPath>) -> (ChangeSet, bool) {
+        let mut modified = BTreeSet::new();
+        let mut removed = BTreeSet::new();
+        let mut candidates = Vec::new();
+        let mut config = false;
+        let mut case = files::ExactCase::new(&self.root);
+        for p in paths {
+            if CONFIG_FILE_NAMES.contains(&p.as_str()) {
+                config = true;
+            }
+            let abs = self.root.join(p);
+            // On case-insensitive file systems `stat("Version")` finds `VERSION`;
+            // only the exact spelling counts as the file existing.
+            let meta = std::fs::metadata(&abs).ok().filter(|_| case.exists(p));
+            match meta {
+                Some(m) if m.is_file() => {
+                    if self.files.contains(p) {
+                        modified.insert(p.clone());
+                    } else {
+                        candidates.push(p.clone());
+                    }
+                }
+                Some(m) if m.is_dir() => {
+                    for f in files::walk_under(&self.root, &abs) {
+                        if !self.files.contains(&f) {
+                            candidates.push(f);
+                        }
+                    }
+                    let prefix = format!("{p}/");
+                    removed.extend(self.files.iter().filter(|f| f.starts_with(&prefix) && !case.exists(f)).cloned());
+                }
+                _ => {
+                    if self.files.contains(p) {
+                        removed.insert(p.clone());
+                    } else {
+                        // Possibly a deleted directory.
+                        let prefix = format!("{p}/");
+                        removed.extend(self.files.iter().filter(|f| f.starts_with(&prefix) && !case.exists(f)).cloned());
+                    }
+                }
+            }
+        }
+        candidates.retain(|c| !self.policy.is_ignored(c) && !c.starts_with(".git/"));
+        let ignored = files::git_ignored(&self.root, &candidates);
+        modified.extend(candidates.into_iter().filter(|c| !ignored.contains(c)));
+        (ChangeSet { modified: modified.into_iter().collect(), removed: removed.into_iter().collect() }, config)
+    }
+
+    /// Applies raw paths (see [`Self::resolve_paths`]). Returns the new
+    /// snapshot, or the current one if nothing relevant changed.
+    pub fn apply_paths(&mut self, paths: &BTreeSet<RelPath>) -> Result<Arc<Snapshot>> {
+        let pass_start = SystemTime::now();
+        let (changes, config_changed) = self.resolve_paths(paths);
+        let snap = self.apply_resolved(&changes, config_changed)?;
+        // Recorded only after publication, so a reader that finds a path
+        // fresh by its `seen` time is guaranteed to find the new snapshot.
+        if let Ok(mut seen) = self.seen.write() {
+            for p in paths.iter().chain(&changes.modified).chain(&changes.removed) {
+                seen.insert(p.clone(), pass_start);
+            }
+        }
+        Ok(snap)
+    }
+
+    fn apply_resolved(&mut self, changes: &ChangeSet, config_changed: bool) -> Result<Arc<Snapshot>> {
+        if config_changed {
+            let (policy, warning) = load_policy(&self.root);
+            let rebuild = warning.is_none() && Policy::extraction_changed(&self.policy.config, &policy.config);
+            if warning.is_none() {
+                self.policy = Arc::new(policy);
+                self.ws.config = self.policy.config.clone();
+            }
+            self.config_warning = warning;
+            if rebuild {
+                return self.full_build();
+            }
+            if changes.is_empty() {
+                return Ok(self.publish(Instant::now(), BTreeMap::new()));
+            }
+        }
+        match &self.current {
+            Some(cur) if changes.is_empty() => Ok(cur.clone()),
+            _ => Ok(self.apply_changes(changes)),
+        }
+    }
+
+    /// Incremental update: `update` on every extractor, then the linkers with
+    /// `Some(changes)`, then a graph rebuild. Bumps the generation.
+    pub fn apply_changes(&mut self, changes: &ChangeSet) -> Arc<Snapshot> {
+        let start = Instant::now();
+        let mut timings = BTreeMap::new();
+
+        // Keep the former dependents of deleted files reachable (see `tombstone`).
+        if let Some(cur) = self.current.clone() {
+            for p in &changes.removed {
+                self.tombstone(&cur.graph, p, &changes.removed);
+            }
+        }
+        for p in &changes.modified {
+            self.tombstones.remove(p);
+        }
+        for list in self.tombstones.values_mut() {
+            list.retain(|e| !changes.removed.contains(&e.from));
+        }
+        self.tombstones.retain(|_, v| !v.is_empty());
+
+        let files = Arc::make_mut(&mut self.files);
+        let mut membership_changed = false;
+        for p in &changes.removed {
+            membership_changed |= files.remove(p);
+        }
+        for p in &changes.modified {
+            membership_changed |= files.insert(p.clone());
+        }
+        if membership_changed {
+            let mut v: Vec<RelPath> = files.iter().cloned().collect();
+            v.sort_unstable();
+            self.ws.files = v;
+        }
+
+        self.run_extractors(Some(changes), &mut timings);
+        self.run_linkers(Some(changes), &mut timings);
+        self.publish(start, timings)
+    }
+
+    /// Records the edges pointing at `path` so its former dependents remain
+    /// listed after it is deleted. Only possible when the deletion is observed
+    /// by a running engine; a cold start cannot know them.
+    fn tombstone(&mut self, graph: &Graph, path: &str, removed: &[RelPath]) {
+        let Some(node) = graph.id(path) else { return };
+        let edges: Vec<Edge> = graph
+            .dependents(node)
+            .filter(|(from, _)| !removed.iter().any(|r| r == graph.path(*from)))
+            .map(|(from, e)| {
+                let (_, _, d) = graph.edge(e);
+                let detail = graph.edge_detail(e).map(|s| s.trim_start_matches("deleted: ").to_string()).unwrap_or_default();
+                let mut edge = Edge::new(graph.path(from), path, d.kind, d.confidence).at(d.line);
+                edge.detail = Some(format!("deleted: {detail}").trim_end().trim_end_matches(':').to_string());
+                edge
+            })
+            .collect();
+        if !edges.is_empty() {
+            self.tombstones.insert(path.to_string(), edges);
+        }
+    }
+
+    fn run_extractors(&mut self, changes: Option<&ChangeSet>, timings: &mut BTreeMap<String, u64>) {
+        let ws = &self.ws;
+        let failed = &self.failed;
+        let results: Vec<(String, std::thread::Result<Result<ExtractOutput>>, u64)> = std::thread::scope(|s| {
+            let handles: Vec<_> = self
+                .pipeline
+                .extractors
+                .iter_mut()
+                .enumerate()
+                .map(|(i, ex)| {
+                    let full = changes.is_none() || failed[i];
+                    s.spawn(move || {
+                        let t = Instant::now();
+                        let name = ex.name().to_string();
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match (full, changes) {
+                            (false, Some(c)) => ex.update(ws, c),
+                            _ => ex.build(ws),
+                        }));
+                        (name, r, us(t))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| ("?".into(), Err(Box::new("thread panicked")), 0))).collect()
+        });
+        for (i, (name, r, t)) in results.into_iter().enumerate() {
+            timings.insert(format!("extract_{name}_us"), t);
+            match r {
+                Ok(Ok(out)) => {
+                    self.outputs[i] = out;
+                    self.failed[i] = false;
+                }
+                Ok(Err(e)) => {
+                    self.failed[i] = true;
+                    self.outputs[i].warnings = vec![Warning::new("extractor_failed", format!("{name}: {e:#}; keeping its previous edges"))];
+                }
+                Err(_) => {
+                    self.failed[i] = true;
+                    self.outputs[i].warnings = vec![Warning::new("extractor_panicked", format!("{name} panicked; keeping its previous edges"))];
+                }
+            }
+        }
+    }
+
+    fn run_linkers(&mut self, changes: Option<&ChangeSet>, timings: &mut BTreeMap<String, u64>) {
+        let mut facts = Facts::default();
+        for o in &self.outputs {
+            facts.merge(o.facts.clone());
+        }
+        for (i, linker) in self.pipeline.linkers.iter_mut().enumerate() {
+            let t = Instant::now();
+            let name = linker.name().to_string();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| linker.link(&self.ws, &facts, changes)));
+            timings.insert(format!("link_{name}_us"), us(t));
+            match r {
+                Ok(Ok(out)) => self.link_outputs[i] = out,
+                Ok(Err(e)) => self.link_outputs[i].warnings = vec![Warning::new("linker_failed", format!("{name}: {e:#}; keeping its previous edges"))],
+                Err(_) => self.link_outputs[i].warnings = vec![Warning::new("linker_panicked", format!("{name} panicked; keeping its previous edges"))],
+            }
+        }
+    }
+
+    fn publish(&mut self, start: Instant, mut timings: BTreeMap<String, u64>) -> Arc<Snapshot> {
+        let t = Instant::now();
+        let edges = self.outputs.iter().chain(&self.link_outputs).flat_map(|o| o.edges.iter()).chain(self.tombstones.values().flatten());
+        let graph = Graph::build(edges, self.ws.files.iter().map(String::as_str));
+        timings.insert("graph_us".into(), us(t));
+        let t = Instant::now();
+        let index = PolicyIndex::build(&self.policy, &graph);
+        timings.insert("classify_us".into(), us(t));
+
+        let mut warnings: Vec<Warning> = self.outputs.iter().chain(&self.link_outputs).flat_map(|o| o.warnings.iter().cloned()).collect();
+        warnings.extend(self.config_warning.clone());
+        warnings.sort_by(|a, b| (&a.code, &a.file, &a.message).cmp(&(&b.code, &b.file, &b.message)));
+        let mut stats = BTreeMap::new();
+        let names = self.pipeline.extractors.iter().map(|e| e.name()).chain(self.pipeline.linkers.iter().map(|l| l.name()));
+        for (name, out) in names.zip(self.outputs.iter().chain(&self.link_outputs)) {
+            let mut s = out.stats.clone();
+            s.insert("edges".into(), out.edges.len() as u64);
+            s.insert("warnings".into(), out.warnings.len() as u64);
+            stats.insert(name.to_string(), s);
+        }
+        self.generation += 1;
+        timings.insert("total_us".into(), us(start));
+        let snap = Arc::new(Snapshot {
+            generation: self.generation,
+            root: self.root.clone(),
+            graph,
+            policy: self.policy.clone(),
+            index,
+            warnings,
+            stats,
+            timings,
+            files: self.files.clone(),
+            seen: self.seen.clone(),
+            base_time: self.base_time,
+            listing: self.listing.as_str(),
+            tombstones: self.tombstones.len(),
+            built_at: SystemTime::now(),
+        });
+        self.current = Some(snap.clone());
+        snap
+    }
+}

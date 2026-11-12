@@ -1,1 +1,3 @@
-fn main() { eprintln!("ripple: not implemented yet"); }
+fn main() -> std::process::ExitCode {
+    ripple_cli::cli::main()
+}
