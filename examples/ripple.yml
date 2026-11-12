@@ -1,0 +1,121 @@
+# Example ripple.yml for a Rails + React monorepo with billing and auth.
+# Every `when` key is used at least once; see README.md for the reference.
+
+version: 1
+
+areas:
+  billing:
+    description: Payments, invoices, subscriptions, refunds
+    tier: critical
+    owners: ["@acme/payments"]
+    paths:
+      - app/models/billing/**
+      - app/services/billing/**
+      - app/controllers/billing/**
+      - app/jobs/billing/**
+      - app/javascript/billing/**
+      - /lib/stripe_client.rb          # leading / anchors to the repo root
+  auth:
+    description: Sign-in, sessions, tokens, permissions
+    tier: critical
+    owners: ["@acme/identity", "@acme/security"]
+    paths:
+      - app/models/user.rb
+      - app/models/session.rb
+      - app/controllers/sessions_controller.rb
+      - app/controllers/concerns/authentication.rb
+      - app/policies/**
+  checkout_ui:
+    description: Checkout pages in the React app
+    tier: high
+    owners: ["@acme/web"]
+    paths:
+      - app/javascript/checkout/**
+  admin:
+    tier: medium
+    paths: [app/controllers/admin/**, app/views/admin/**]
+
+# Replaces the default list (initializers, application.rb, environments, Gemfile, package.json, lockfiles).
+global_files:
+  - config/initializers/**
+  - config/application.rb
+  - config/environments/**
+  - /Gemfile
+  - /Gemfile.lock
+  - /package.json
+  - /yarn.lock
+
+rules:
+  - id: billing-touched
+    description: Billing code changed; a payments engineer must review
+    when: { touches: [billing] }
+    risk: critical
+    require: [human_review, payments_review]
+
+  - id: auth-touched
+    when: { touches: [auth] }
+    risk: critical
+    require: [human_review, security_review]
+
+  - id: migration-touches-billing-tables
+    description: Migrations are matched by glob; combined with reaching billing
+    when:
+      touches: ["db/migrate/**"]
+      reaches: [billing]
+    risk: high
+    require: [dba_review]
+
+  - id: critical-direct-dependency
+    description: A file one hop from critical code changed (exact/inferred edges only)
+    when:
+      reaches_tier: critical
+      within: 1
+      min_confidence: inferred
+    risk: high
+    require: [human_review]
+
+  - id: critical-transitive
+    when: { reaches_tier: critical }
+    risk: medium
+
+  - id: high-tier-touched
+    when: { touches_tier: high }
+    risk: high
+
+  - id: global-config
+    when: { touches_global: true }
+    risk: high
+    require: [run_full_suite]
+
+  - id: wide-blast-radius
+    when: { impacted_files_over: 200 }
+    risk: high
+    require: [run_full_suite]
+
+  - id: large-change
+    when:
+      changed_files_over: 30
+      changed_lines_over: 1000
+    risk: medium
+
+  - id: frontend-backend-contract
+    description: A Rails change reaches React code (or vice versa), e.g. an API response shape
+    when: { crosses_boundary: true }
+    risk: medium
+    require: [frontend_review]
+
+  - id: untested-billing-change
+    when:
+      touches: [billing]
+      untested: true
+    risk: critical
+    require: [add_tests]
+
+query:
+  max_depth: 3              # hops from a changed file; 0 = unlimited (usually "everything")
+  min_confidence: heuristic
+
+ci:
+  fail_on: critical
+  github: true
+  max_listed: 50
