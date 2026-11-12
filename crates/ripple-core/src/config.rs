@@ -34,6 +34,34 @@ pub struct Config {
     pub coverage: CoverageConfig,
     /// `ripple rank` and the hotspot signal.
     pub rank: RankConfig,
+    /// The built-in areas, rules and CODEOWNERS lookup that apply on top
+    /// of this file (see `ripple config show`).
+    pub defaults: DefaultsConfig,
+}
+
+/// `defaults:` in `ripple.yml`. Merge semantics: the built-in areas and
+/// rules apply in addition to the file's own; an area or rule of the file
+/// with the same name / id replaces the built-in one; `disable` removes
+/// built-ins by name; `areas: false` / `rules: false` drop them all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DefaultsConfig {
+    /// Use the built-in areas (payments, auth, migrations, ...), each only
+    /// where its paths exist.
+    pub areas: bool,
+    /// Use the built-in `default.*` rules.
+    pub rules: bool,
+    /// Read review owners from CODEOWNERS (`.github/`, root, `docs/`, `.gitlab/`).
+    pub codeowners: bool,
+    /// Built-in rule ids (`default.complex_file` or `complex_file`) and
+    /// built-in area names to leave out.
+    pub disable: Vec<String>,
+}
+
+impl Default for DefaultsConfig {
+    fn default() -> Self {
+        Self { areas: true, rules: true, codeowners: true, disable: Vec::new() }
+    }
 }
 
 impl Default for Config {
@@ -62,7 +90,23 @@ impl Default for Config {
             ]
             .map(String::from)
             .to_vec(),
-            tests: ["spec/**", "test/**", "**/__tests__/**", "**/*.test.*", "**/*.spec.*", "**/*_spec.rb", "**/*_test.rb", "**/*.stories.*"]
+            // RSpec, Minitest, Jest, Vitest, Cypress, Storybook; `spec/` and
+            // `test/` also inside engines and `ee/`.
+            tests: [
+                "spec/**",
+                "test/**",
+                "**/spec/**",
+                "**/test/**",
+                "**/__tests__/**",
+                "**/__mocks__/**",
+                "**/*.test.*",
+                "**/*.spec.*",
+                "**/*.cy.*",
+                "**/*_spec.rb",
+                "**/*_test.rb",
+                "**/*.stories.*",
+                "cypress/**",
+            ]
                 .map(String::from)
                 .to_vec(),
             rules: Vec::new(),
@@ -72,6 +116,7 @@ impl Default for Config {
             history: HistoryConfig::default(),
             coverage: CoverageConfig::default(),
             rank: RankConfig::default(),
+            defaults: DefaultsConfig::default(),
         }
     }
 }
@@ -211,6 +256,9 @@ pub struct When {
     pub within: Option<u32>,
     /// Number of impacted non-test files (excluding the changed files) is greater than this.
     pub impacted_files_over: Option<usize>,
+    /// Impacted non-test files are more than this share (percent) of the
+    /// repository's non-test source files.
+    pub impacted_files_over_percent: Option<f64>,
     /// Number of changed files is greater than this.
     pub changed_files_over: Option<usize>,
     /// Added + deleted lines is greater than this (only when a diff is
@@ -237,8 +285,20 @@ pub struct When {
     pub churn_over: Option<u32>,
     /// A changed file's complexity (sum over its methods plus top level) is greater than this.
     pub complexity_over: Option<u32>,
+    /// A changed file's complexity is in this top share (percent) of the
+    /// repository's non-test source files: relative to the repo, so one
+    /// rule fits large and small codebases.
+    pub complexity_top_percent: Option<f64>,
     /// A changed file has a method more complex than this.
     pub max_method_complexity_over: Option<u32>,
+    /// A changed file's most complex method is in this top share (percent)
+    /// of the repository's non-test source files.
+    pub max_method_complexity_top_percent: Option<f64>,
+    /// A changed file has more direct dependents (distinct files) than this.
+    pub dependents_over: Option<u32>,
+    /// A changed file's number of direct dependents (distinct files) is in
+    /// this top share (percent) of the repository's non-test source files.
+    pub dependents_top_percent: Option<f64>,
     /// A changed file's line coverage is below this percentage. Files with
     /// unknown coverage (in no report) never satisfy it.
     pub coverage_under: Option<f64>,
@@ -393,7 +453,9 @@ pub struct CoverageConfig {
     /// Report files or directories, repo-relative. A `*` wildcard is allowed
     /// in the last component (`coverage/lcov/*.lcov`). A directory is
     /// searched for the default report names. Empty = auto-detect in
-    /// `coverage/`: `.resultset.json` (SimpleCov), `lcov.info`,
+    /// `coverage/`, `tmp/coverage/`, `spec/coverage/`, `test/coverage/`,
+    /// `frontend/`, `client/`, `web/`, `app/javascript/` and
+    /// `app/frontend/` `coverage/`: `.resultset.json` (SimpleCov), `lcov.info`,
     /// `lcov/*.lcov`, `coverage-final.json` (Istanbul; only when there is no
     /// `lcov.info` next to it).
     pub paths: Vec<String>,

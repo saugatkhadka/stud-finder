@@ -116,7 +116,7 @@ impl CovView {
         let t = Instant::now();
         let mut v = match Coverage::load(root, cfg, known.iter().map(String::as_str)) {
             Ok(c) if c.reports().is_empty() => {
-                let where_ = if cfg.paths.is_empty() { "coverage/ (.resultset.json, lcov.info, lcov/*.lcov, coverage-final.json)".to_string() } else { format!("coverage.paths ({})", cfg.paths.join(", ")) };
+                let where_ = if cfg.paths.is_empty() { "coverage/, tmp/coverage/, {spec,test,frontend,client,web}/coverage/, app/{javascript,frontend}/coverage/ (.resultset.json, lcov.info, lcov/*.lcov, coverage-final.json)".to_string() } else { format!("coverage.paths ({})", cfg.paths.join(", ")) };
                 Self { coverage: Some(Arc::new(c)), ..Self::new(CovState::Unavailable(format!("no coverage report found in {where_}"))) }
             }
             Ok(c) => {

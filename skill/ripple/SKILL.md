@@ -1,6 +1,6 @@
 ---
 name: ripple
-description: Lists files that depend on a change in this Rails + React repo (callers, subclasses, views, frontend consumers of an endpoint), each changed file's complexity, churn and coverage, and which ripple.yml rules fire. Use before changing shared code and on your diff before you call a change done.
+description: Lists files that depend on a change in this Rails + React repo (callers, subclasses, views, frontend consumers of an endpoint), each changed file's complexity, churn and coverage, and which risk rules fire (built-in, or from ripple.yml). Use before changing shared code and on your diff before you call a change done.
 ---
 
 # ripple
@@ -15,10 +15,13 @@ thirds of the files that real renames and removals had to change.
 - After editing: `ripple impact` (working tree vs HEAD), or
   `ripple impact --base REF` for a branch or commit range.
 - Sizing up one file: `ripple file PATH`. Riskiest files: `ripple rank`.
-- `--format json` for structure (`ripple schema` has the schema). Do not add
+- Many paths: `git diff --name-only | ripple impact -`; one JSON line per
+  file: `... | ripple file -`.
+- `--format json` for structure (`ripple schema impact|file|rank`). Do not add
   `--all` by default: the cut lists are enough; use it only to see one list
   in full.
 - Just saved a file? Add `--sync` so the answer includes the edit.
+- Something missing or slow (`not ready:`, no daemon)? `ripple doctor`.
 
 ## Reading the report
 - `REMOVED … still mentioned`: methods you deleted or renamed that files
@@ -38,7 +41,9 @@ thirds of the files that real renames and removals had to change.
 - Metrics line (`cx 433 (max 88) · churn 41/90d · cov 62% · hotspot #3`):
   complexity, recent commits, coverage (absent = unknown, not 0%), hotspot
   rank. Tells you where to read slowly, not what is wrong.
-- `risk` line: rules from `ripple.yml`; about review effort, not correctness.
+- `risk` line: built-in rules plus any in `ripple.yml` (`ripple config show`
+  lists them); about review effort, not correctness. Built-in areas
+  (payments, auth, migrations...) are guessed from paths and file names.
 - `INCOMPLETE` and `not ready:` lines: the answer is missing something
   (dynamic dispatch, a global file, a stale index, history still loading).
 

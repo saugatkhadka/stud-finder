@@ -84,7 +84,7 @@ pub fn render(report: &Report, max_listed: usize) -> String {
         o,
         "<sub>Files that depend, directly or through other files, on the files changed here \
          (Ruby constants and requires, Rails conventions, JS/TS imports, frontend API calls to Rails routes). \
-         Risk comes from the rules in this repository's `ripple.yml`.</sub>\n"
+         Risk comes from ripple's built-in rules and any in this repository's `ripple.yml` (`ripple config show`).</sub>\n"
     );
 
     if !r.removed_methods.is_empty() {

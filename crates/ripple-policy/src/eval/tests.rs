@@ -45,6 +45,12 @@ fn policy(rules: &str) -> Policy {
     if !rules.contains("max_depth") {
         config.query.max_depth = 0;
     }
+    // Rule-semantics tests see only the fixture's areas and their own
+    // rules (or, with none, the built-in rules); built-ins have their own tests.
+    if !rules.contains("defaults:") {
+        config.defaults.areas = false;
+        config.defaults.rules = config.rules.is_empty();
+    }
     Policy::compile(config).unwrap()
 }
 
@@ -261,31 +267,35 @@ fn default_rules() {
 #[test]
 fn default_rules_reach_any_depth_and_blast_radius() {
     use Confidence::*;
-    // hub <- 60 files; deep: x -> y -> crit (critical, 2 hops)
-    let mut edges: Vec<Edge> = (0..60).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
-    edges.push(Edge::new("app/y.rb", "app/x.rb", RubyConstant, Exact));
-    edges.push(Edge::new("app/crit.rb", "app/y.rb", RubyConstant, Exact));
-    let g = Graph::build(&edges, []);
-    let p = Policy::compile(parse_config("areas: {c: {paths: [app/crit.rb], tier: critical}}", "t").unwrap()).unwrap();
-    let r = evaluate(&p, &g, &[m("app/hub.rb")]);
-    assert!(r.policy.is_none(), "60 impacted files is ordinary: no rule fires");
-    let r = evaluate(&p, &g, &[m("app/x.rb")]);
-    assert_eq!(pol(&r).risk, Risk::Low);
-    assert_eq!(pol(&r).reasons.iter().map(|x| x.rule.as_str()).collect::<Vec<_>>(), ["default.reaches_critical"]);
-
-    let edges: Vec<Edge> = (0..201).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
-    let g = Graph::build(&edges, []);
-    let r = evaluate(&p, &g, &[m("app/hub.rb")]);
-    assert_eq!(pol(&r).risk, Risk::Medium);
-    assert_eq!(pol(&r).reasons[0].rule, "default.impacted_over_200");
-
-    let edges: Vec<Edge> = (0..1501).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
-    let g = Graph::build(&edges, []);
-    let r = evaluate(&p, &g, &[m("app/hub.rb")]);
-    assert_eq!(pol(&r).risk, Risk::High);
-    assert_eq!(pol(&r).reasons.iter().map(|x| x.rule.as_str()).collect::<Vec<_>>(), ["default.impacted_over_1500"], "lower rung dropped");
+    let p = Policy::compile(parse_config("defaults: {areas: false}\nareas: {c: {paths: [app/crit.rb], tier: critical}}", "t").unwrap()).unwrap();
+    // hub <- n files, in a repository of n + 1 + others files.
+    let hub = |n: usize, others: usize| {
+        let edges: Vec<Edge> = (0..n).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
+        let lone: Vec<String> = (0..others).map(|i| format!("app/z{i}.rb")).collect();
+        Graph::build(&edges, lone.iter().map(String::as_str))
+    };
+    let ids = |r: &Report| pol(r).reasons.iter().map(|x| x.rule.clone()).collect::<Vec<_>>();
+    // 20 impacted files: under the absolute floor of the relative rules.
+    let r = evaluate(&p, &hub(20, 10), &[m("app/hub.rb")]);
+    assert!(ids(&r).is_empty(), "20 impacted files is ordinary: no rule fires");
+    // 30 of 431 files (7%): wide.
+    let r = evaluate(&p, &hub(30, 400), &[m("app/hub.rb")]);
+    assert_eq!((pol(&r).risk, ids(&r)), (Risk::Medium, vec!["default.impacted_over_5pct".to_string()]));
+    assert!(pol(&r).reasons[0].message.contains("30 files impacted, 7% of the repository's 431"), "{}", pol(&r).reasons[0].message);
+    // The same 30 files in a repository of 1031 (3%): ordinary.
+    assert!(ids(&evaluate(&p, &hub(30, 1000), &[m("app/hub.rb")])).is_empty());
+    // 250 of 551 (45%): huge; the lower rung is dropped.
+    let r = evaluate(&p, &hub(250, 300), &[m("app/hub.rb")]);
+    assert_eq!((pol(&r).risk, ids(&r)), (Risk::High, vec!["default.impacted_over_40pct".to_string()]), "lower rung dropped");
     assert_eq!(pol(&r).require, ["run_full_suite"]);
     assert!(r.warnings.iter().all(|w| w.code != "rule_signal_not_ready"), "built-in metric rules skip quietly");
+
+    // deep: x -> y -> crit (critical, 2 hops)
+    let edges = vec![Edge::new("app/y.rb", "app/x.rb", RubyConstant, Exact), Edge::new("app/crit.rb", "app/y.rb", RubyConstant, Exact)];
+    let g = Graph::build(&edges, []);
+    let r = evaluate(&p, &g, &[m("app/x.rb")]);
+    assert_eq!(pol(&r).risk, Risk::Low);
+    assert_eq!(ids(&r), ["default.reaches_critical"]);
 }
 
 #[test]
@@ -938,29 +948,30 @@ fn incomplete_is_never_silent() {
 }
 
 #[test]
-fn policy_section_only_when_configured_and_fired() {
+fn policy_section_always_present_compact_unless_asked() {
     let g = fixture_graph();
-    // Built-in rules and no areas: never shown by default, even when a rule fires.
+    // No ripple.yml: the built-in rules still give a risk level.
     let bare = Policy::compile(parse_config("", "t").unwrap()).unwrap();
     let r = evaluate(&bare, &g, &[m("config/initializers/stripe.rb")]);
-    assert!(r.policy.is_none(), "{:?}", r.policy);
-    // Areas configured but nothing fired: not shown.
+    let pr = r.policy.as_ref().expect("policy section without a config");
+    assert_eq!(pr.require, ["run_full_suite"]);
+    assert!(pr.reasons.iter().all(|x| x.builtin));
+    // Nothing fired: still there, low.
     let p = policy("");
     let r = evaluate(&p, &g, &[m("README.md")]);
-    assert!(r.policy.is_none());
+    assert_eq!(pol(&r).risk, Risk::Low);
+    assert!(pol(&r).reasons.is_empty());
     // Fired: shown compactly (one evidence path per reason, no area examples).
     let r = evaluate(&p, &g, &[m("app/models/invoice.rb")]);
     let pr = r.policy.as_ref().unwrap();
     assert_eq!(pr.risk, Risk::Critical);
     assert!(pr.reasons.iter().all(|x| x.evidence.impacted.len() <= budget::EVIDENCE));
     assert!(pr.areas.iter().all(|a| a.example.is_none()));
-    // Asked for (check): always shown, with full evidence; the meaning does not change.
+    // Asked for (check): full evidence; the meaning does not change.
     let full_r = run(&p, &[m("app/models/invoice.rb")]);
     assert_eq!(pol(&full_r).risk, pr.risk);
     assert_eq!(pol(&full_r).reasons.iter().map(|x| &x.rule).collect::<Vec<_>>(), pr.reasons.iter().map(|x| &x.rule).collect::<Vec<_>>());
     assert!(pol(&full_r).areas.iter().all(|a| a.example.is_some()));
-    let r = run(&bare, &[m("README.md")]);
-    assert_eq!(pol(&r).risk, Risk::Low);
 }
 
 // ---- name lookups: callers first, heirs apart, mentions with no edge -------
@@ -1221,6 +1232,31 @@ fn complexity_over_and_max_method() {
     let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &inv, &EvalOptions { signals: Some(ready_signals()), ..full() });
     assert!(pol(&r).reasons.is_empty());
     assert!(r.warnings.iter().any(|w| w.code == "rule_signal_not_ready" && w.message.contains("needs complexity")), "{:#?}", r.warnings);
+}
+
+#[test]
+fn top_percent_conditions_rank_within_the_repository() {
+    // Two source files carry metrics: invoice.rb (120) and lib/util.rb (2).
+    let inv = [m("app/models/invoice.rb")];
+    let s = msg("{complexity_top_percent: 50}", &inv).expect("fires");
+    assert!(s.contains("complexity in the top 50% of the repository (at least 120): `app/models/invoice.rb` (complexity 120, #1 of 2)"), "{s}");
+    assert_eq!(msg("{complexity_top_percent: 50}", &[m("lib/util.rb")]), None);
+    assert!(msg("{complexity_top_percent: 100}", &[m("lib/util.rb")]).is_some());
+    let s = msg("{max_method_complexity_top_percent: 50}", &inv).expect("fires");
+    assert!(s.contains("(a method of complexity 30, #1 of 2)"), "{s}");
+    // Without methods there is no rank to be in.
+    assert_eq!(msg("{max_method_complexity_top_percent: 100}", &[m("lib/util.rb")]), None);
+    // Dependents rank over every non-test source file of the graph.
+    let s = msg("{dependents_top_percent: 20}", &inv).expect("fires");
+    assert!(s.contains("dependents in the top 20%"), "{s}");
+    assert_eq!(msg("{dependents_top_percent: 20}", &[m("lib/util.rb")]), None);
+    assert!(msg("{dependents_over: 0}", &inv).is_some() && msg("{dependents_over: 5}", &inv).is_none());
+    // Joined with changed_lines_over: the same file.
+    assert!(msg("{complexity_top_percent: 50, changed_lines_over: 10}", &[m("app/models/invoice.rb").lines(8, 5), m("lib/util.rb").lines(100, 0)]).is_some());
+    assert!(msg("{complexity_top_percent: 50, changed_lines_over: 20}", &[m("app/models/invoice.rb").lines(8, 5), m("lib/util.rb").lines(100, 0)]).is_none());
+    // Validation.
+    assert!(parse_config("rules:\n  - {id: r, risk: high, when: {complexity_top_percent: 0}}\n", "t").is_err());
+    assert!(parse_config("rules:\n  - {id: r, risk: high, when: {dependents_top_percent: 101}}\n", "t").is_err());
 }
 
 #[test]

@@ -292,6 +292,15 @@ fn init_and_config_check() {
     let o = env.run(&["config", "check"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let text = String::from_utf8_lossy(&o.stdout);
+    // The written file is all comments: the built-ins apply, and only those
+    // matching files here are listed.
+    assert!(text.contains("area payments") && text.contains("(built-in)") && !text.contains("matches no files") && !text.contains("area jobs"), "{text}");
+    assert!(text.contains("default.touches_high"), "{text}");
+    let o = env.run(&["init", "--stdout"]);
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("#   payments:"));
+    env.repo.write("ripple.yml", "version: 1\nareas:\n  billing: {tier: high, paths: [nowhere/**]}\n");
+    let text = String::from_utf8_lossy(&env.run(&["config", "check"]).stdout).to_string();
     assert!(text.contains("area billing") && text.contains("matches no files"), "{text}");
     env.repo.write("ripple.yml", "version: 1\nrules:\n  - id: x\n    when: { touches: [nope] }\n    risk: high\n");
     let o = env.run(&["config", "check"]);
@@ -348,7 +357,7 @@ spec/purchase_spec.txt app/purchase.txt#charge!
 ";
 
 fn scoped_env() -> Env {
-    let cfg = "version: 1\nareas:\n  auth:\n    tier: critical\n    paths: [app/session.txt]\nci:\n  fail_on: critical\n";
+    let cfg = "version: 1\ndefaults: {areas: false}\nareas:\n  auth:\n    tier: critical\n    paths: [app/session.txt]\nci:\n  fail_on: critical\n";
     let files = [
         ("app/purchase.txt", PURCHASE),
         ("app/svc.txt", "s\n"),
@@ -573,4 +582,173 @@ fn config_flag_selects_another_file_and_its_own_daemon() {
     let o = env.run(&["--config", "nope.yml", "impact"]);
     assert_eq!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stderr));
     let _ = env.run(&["--config", alt, "daemon", "stop"]);
+}
+
+// ---- zero-config, CI contract, Unix behaviour, skill ------------------------
+
+impl Env {
+    fn run_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut child = self.cmd().args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    }
+}
+
+fn stderr_of(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// `--fail-on` takes a level, actions, or both; exit 1 when reached, 2 on a bad value.
+#[test]
+fn fail_on_levels_and_actions() {
+    let env = billing();
+    let run = |extra: &[&str]| {
+        let mut a = vec!["impact", "--files", "billing/invoice.txt", "--format", "json"];
+        a.extend_from_slice(extra);
+        env.run(&a)
+    };
+    let o = run(&["--fail-on", "critical"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr_of(&o));
+    assert!(stderr_of(&o).contains("risk is critical"), "{}", stderr_of(&o));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_schema(&v);
+    // Built-in rules require human_review for a critical area.
+    let o = run(&["--fail-on", "human_review"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr_of(&o).contains("requires human_review"), "{}", stderr_of(&o));
+    assert_eq!(run(&["--fail-on", "high,never"]).status.code(), Some(0), "never clears what came before");
+    assert_eq!(run(&["--fail-on", "no such!"]).status.code(), Some(2));
+    let o = run(&["--fail-on", "dba_signoff"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(stderr_of(&o).contains("no rule in effect requires `dba_signoff`"), "{}", stderr_of(&o));
+    // A change reaching nothing configured passes.
+    let o = env.run(&["impact", "--files", "app/ui.txt", "--fail-on", "high"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr_of(&o));
+}
+
+#[test]
+fn impact_markdown_and_github_formats() {
+    let env = billing();
+    let o = env.run(&["impact", "--files", "billing/invoice.txt", "--format", "markdown"]);
+    assert!(o.status.success());
+    let md = String::from_utf8_lossy(&o.stdout);
+    assert!(md.contains("critical") && md.contains("billing/invoice.txt") && !md.contains("\x1b["), "{md}");
+    let out = env.repo.root.join("gh-output");
+    let o = env.cmd().args(["impact", "--files", "billing/invoice.txt", "--format", "github", "--fail-on", "critical"]).env("GITHUB_OUTPUT", &out).output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("::error title=ripple::"), "{}", String::from_utf8_lossy(&o.stdout));
+    assert!(std::fs::read_to_string(&out).unwrap().contains("risk=critical"));
+}
+
+/// `-` reads paths from stdin: `impact -` and `ripple file -` (JSON lines).
+#[test]
+fn paths_from_stdin() {
+    let env = billing();
+    let o = env.run_stdin(&["impact", "-", "--format", "json"], "billing/invoice.txt\n\n");
+    assert!(o.status.success(), "{}", stderr_of(&o));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(changed(&v), vec![("billing/invoice.txt".into(), "modified".into(), None)]);
+    let o = env.run_stdin(&["impact", "-"], "");
+    assert_eq!(o.status.code(), Some(2), "no paths on stdin is an error");
+    let o = env.run_stdin(&["file", "-"], "billing/invoice.txt\napp/ui.txt\n");
+    assert!(o.status.success(), "{}", stderr_of(&o));
+    let rows: Vec<Value> = String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.iter().map(|r| r["file"].as_str().unwrap()).collect::<Vec<_>>(), ["billing/invoice.txt", "app/ui.txt"]);
+    let schema: Value = serde_json::from_str(&String::from_utf8_lossy(&env.run(&["schema", "file"]).stdout)).unwrap();
+    for r in &rows {
+        let errors = ripple_policy::schema::validate(&schema, r);
+        assert!(errors.is_empty(), "{errors:#?}\n{r}");
+    }
+}
+
+/// `ripple schema impact|file|rank` print the published schemas, and real
+/// output validates against them.
+#[test]
+fn schemas_match_docs_and_output() {
+    let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let env = billing();
+    for kind in ["impact", "file", "rank"] {
+        let o = env.run(&["schema", kind]);
+        assert!(o.status.success());
+        let name = if kind == "impact" { "report" } else { kind };
+        let published = std::fs::read_to_string(docs.join(format!("{name}.schema.json"))).unwrap();
+        assert!(published.as_bytes() == o.stdout.as_slice(), "docs/{name}.schema.json differs from `ripple schema {kind}`");
+    }
+    let schema = |k: &str| -> Value { serde_json::from_slice(&env.run(&["schema", k]).stdout).unwrap() };
+    let v = env.json(&["file", "billing/invoice.txt", "--format", "json"]);
+    assert_eq!(ripple_policy::schema::validate(&schema("file"), &v), Vec::<String>::new(), "{v}");
+    let o = env.run(&["rank", "--format", "json"]);
+    assert!(matches!(o.status.code(), Some(0 | 4)), "{}", stderr_of(&o));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(ripple_policy::schema::validate(&schema("rank"), &v), Vec::<String>::new(), "{v}");
+}
+
+#[test]
+fn config_show_doctor_history_status_completions() {
+    let env = billing();
+    let v = env.json(&["config", "show", "--format", "json"]);
+    let area = |n: &str| v["areas"].as_array().unwrap().iter().find(|a| a["name"] == n).cloned().unwrap();
+    assert_eq!(area("billing")["builtin"], false);
+    assert_eq!(area("billing")["files"], 1);
+    assert_eq!(area("payments")["builtin"], true);
+    assert!(v["rules"].as_array().unwrap().iter().any(|r| r["id"] == "default.touches_critical" && r["builtin"] == true));
+    let text = String::from_utf8_lossy(&env.run(&["config", "show"]).stdout).to_string();
+    assert!(text.contains("billing") && text.contains("ripple.yml") && !text.contains("payments"), "built-in areas without files are not listed: {text}");
+    let o = env.run(&["doctor", "--format", "json"]);
+    assert!(matches!(o.status.code(), Some(0 | 1)), "{}", stderr_of(&o));
+    let d: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(d["config"]["ok"], true);
+    assert!(d["fixes"].is_array() && d["suggestions"].is_array());
+    let o = env.run(&["status"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("config   ok"), "alias");
+    let h = env.json(&["history", "status", "--format", "json"]);
+    assert!(h["state"].is_string(), "{h}");
+    let o = env.run(&["completions", "bash"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("ripple"));
+    env.repo.write("ripple.yml", "version: 1\nrules: [}\n");
+    assert_eq!(env.run(&["doctor"]).status.code(), Some(2));
+    assert_eq!(env.run(&["config", "show"]).status.code(), Some(2));
+}
+
+/// The first-run hint needs a terminal: never in pipes, so stdout and
+/// stderr stay clean for scripts.
+#[test]
+fn no_hint_or_color_outside_a_terminal() {
+    let env = Env::new(&[("app/a.txt", "1\n"), ("app/b.txt", "1\n")], "app/b.txt app/a.txt\n");
+    let o = env.run(&["impact", "--files", "app/a.txt"]);
+    assert!(o.status.success(), "{}", stderr_of(&o));
+    assert!(!stderr_of(&o).contains("ripple.yml"), "{}", stderr_of(&o));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("\x1b["));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("risk"), "the risk section appears without a config");
+}
+
+/// `ripple skill` with HOME pointed at a temporary directory.
+#[test]
+fn skill_install_status_uninstall() {
+    let env = billing();
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| env.cmd().args(args).env("HOME", home.path()).output().unwrap();
+    let o = run(&["skill", "install", "--user", "--agent", "claude", "--agent", "codex"]);
+    assert!(o.status.success(), "{}", stderr_of(&o));
+    let user = home.path().join(".claude/skills/ripple/SKILL.md");
+    assert!(user.exists() && home.path().join(".codex/skills/ripple/SKILL.md").exists());
+    assert!(std::fs::read_to_string(&user).unwrap().contains(&format!("<!-- ripple-skill {}", env!("CARGO_PKG_VERSION"))));
+    let o = run(&["skill", "install"]);
+    assert!(o.status.success());
+    assert!(env.repo.root.join(".claude/skills/ripple/SKILL.md").exists());
+    let o = run(&["skill", "status", "--format", "json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr_of(&o));
+    let s: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let current = s["locations"].as_array().unwrap().iter().filter(|l| l["state"] == "current").count();
+    assert_eq!(current, 3, "{s}");
+    std::fs::write(&user, "edited").unwrap();
+    assert_eq!(run(&["skill", "status"]).status.code(), Some(1));
+    assert_eq!(run(&["skill", "update", "--user"]).status.code(), Some(2), "an edited skill is not overwritten");
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), "edited");
+    assert!(run(&["skill", "update", "--user", "--force"]).status.success());
+    assert!(run(&["-q", "skill", "uninstall", "--user", "--agent", "claude", "--agent", "codex"]).stdout.is_empty());
+    assert!(!home.path().join(".claude").exists() && !home.path().join(".codex").exists());
+    let printed = run(&["skill", "print"]);
+    assert!(String::from_utf8_lossy(&printed.stdout).starts_with("---\nname: ripple"));
 }

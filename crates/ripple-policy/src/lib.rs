@@ -9,7 +9,8 @@
 //! * [`render`]: JSON, Markdown (PR comment), terminal text and GitHub Actions output.
 
 mod changed;
-mod defaults;
+pub mod codeowners;
+pub mod defaults;
 mod error;
 mod eval;
 mod findings;
@@ -23,13 +24,14 @@ pub mod schema;
 mod signals;
 
 pub use changed::{Change, ChangeKind, ChangedFile, DefLine, FileStatus, Hunk, WholeFileReason, classify_change, def_name, def_names, scopes_for_hunks};
-pub use defaults::default_rules;
+pub use codeowners::CodeOwners;
+pub use defaults::{default_areas, default_rules};
 pub use error::{Issue, PolicyError};
 pub use eval::{EvalOptions, evaluate, evaluate_with, path_hops, summary_line};
 pub use findings::mention_line;
 pub use lang::{Language, Side};
 pub use load::{CONFIG_FILE_NAMES, LoadedConfig, config_override, find_config, is_config_file, load_config, parse_config, set_config_override};
-pub use policy::{CompiledArea, FileClass, Policy, PolicyIndex};
+pub use policy::{CompiledArea, Distribution, FileClass, Policy, PolicyIndex};
 pub use report::*;
 pub use signals::*;
 pub use glob::PathFilter;

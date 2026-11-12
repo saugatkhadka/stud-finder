@@ -1,7 +1,16 @@
 # Example ripple.yml for a Rails + React monorepo with billing and auth.
 # Every `when` key is used at least once; see README.md for the reference.
+# Without a ripple.yml ripple uses built-in areas and `default.*` rules
+# (`ripple config show`). This file adds to them; here the built-in rules are
+# dropped (the rules below replace them) and one built-in area is disabled.
 
 version: 1
+
+defaults:
+  rules: false               # only the rules below
+  areas: true                # built-in areas stay, where their files exist...
+  disable: [shared_components]  # ...except this one
+  codeowners: true           # owners from CODEOWNERS join the report
 
 areas:
   billing:
@@ -105,6 +114,32 @@ rules:
 
   - id: large-change
     when: { changed_files_over: 30 }
+    risk: medium
+
+  # Relative thresholds: measured against this repository, so they need no
+  # tuning per codebase. An absolute floor next to one keeps small repos quiet.
+  - id: big-share-of-the-repo
+    when:
+      impacted_files_over_percent: 10   # of the repository's non-test files
+      impacted_files_over: 100
+    risk: high
+    require: [run_full_suite]
+
+  - id: top-complexity-file
+    when:
+      complexity_top_percent: 2         # among this repository's files
+      changed_lines_over: 30
+    risk: high
+    require: [human_review]
+
+  - id: top-complexity-method
+    when: { max_method_complexity_top_percent: 2, changed_lines_over: 10 }
+    risk: medium
+
+  - id: most-depended-on
+    when:
+      dependents_top_percent: 1
+      dependents_over: 10               # direct dependents of that file
     risk: medium
 
   - id: untested-billing-change
