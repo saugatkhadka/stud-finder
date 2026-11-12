@@ -607,7 +607,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     // Files mentioning a changed method name with no edge to it.
     let mut exclude: BTreeSet<NodeId> = ctx.seeds.iter().map(|(n, _)| *n).collect();
     exclude.extend(main.impact.hits.iter().filter(|h| h.depth <= 1).map(|h| h.node));
-    let (also_mentioned, also_total) = crate::findings::also_mentioned(&ctx, opts, &fresh_names, &exclude);
+    let sweep = crate::findings::Sweep::new(graph, crate::findings::sweep_ids(&ctx, &fresh_names));
+    let mut texts = crate::findings::Texts::default();
+    let (also_mentioned, also_total) = crate::findings::also_mentioned(&ctx, opts, &fresh_names, &exclude, &sweep, &mut texts);
     counts.also_mentioned = also_total;
     truncated |= also_mentioned.iter().any(|a| a.files.len() < a.total);
     let mut blind_spots = Vec::new();
@@ -692,7 +694,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
         imp.impacted().filter(|h| !ctx.class(h.node).test).count()
     };
 
-    let (removed_methods, removed_total) = crate::findings::removed_methods(&ctx, opts);
+    let (removed_methods, removed_total) = crate::findings::removed_methods(&ctx, opts, &sweep, &mut texts);
     counts.removed_methods = removed_total;
     truncated |= removed_methods.len() < removed_total || removed_methods.iter().any(|r| r.mentions.len() < r.mentions_total);
     let mut incomplete = crate::findings::incomplete(&ctx);

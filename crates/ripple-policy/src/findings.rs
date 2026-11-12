@@ -52,6 +52,140 @@ pub(crate) fn read(root: Option<&Path>, file: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Texts of files read for line numbers, shared by every finding of one
+/// evaluation. `prefetch` reads a batch in parallel (on GitLab, reading a
+/// few hundred candidate files one after another took ~10 ms).
+#[derive(Default)]
+pub(crate) struct Texts {
+    map: std::collections::HashMap<String, Option<String>>,
+}
+
+impl Texts {
+    pub(crate) fn get(&mut self, root: Option<&Path>, file: &str) -> Option<&str> {
+        if !self.map.contains_key(file) {
+            let t = read(root, file);
+            self.map.insert(file.to_string(), t);
+        }
+        self.map[file].as_deref()
+    }
+
+    pub(crate) fn prefetch(&mut self, root: Option<&Path>, files: &[&str]) {
+        let Some(root) = root else { return };
+        let mut todo: Vec<&str> = files.iter().copied().filter(|f| !self.map.contains_key(*f)).collect();
+        todo.sort_unstable();
+        todo.dedup();
+        if todo.len() < 8 {
+            for f in todo {
+                self.map.insert(f.to_string(), read(Some(root), f));
+            }
+            return;
+        }
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
+        let chunk = todo.len().div_ceil(threads);
+        let read_back: Vec<(String, Option<String>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = todo.chunks(chunk).map(|part| s.spawn(move || part.iter().map(|f| (f.to_string(), read(Some(root), f))).collect::<Vec<_>>())).collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+        });
+        self.map.extend(read_back);
+    }
+}
+
+/// For a set of method-name ids: the files defining and the files
+/// mentioning each, in node order. One pass over the workspace (split
+/// across threads) serves every by-name finding of an evaluation.
+#[derive(Default)]
+pub(crate) struct Sweep {
+    ids: Vec<u32>,
+    defs: Vec<Vec<NodeId>>,
+    mentions: Vec<Vec<NodeId>>,
+}
+
+impl Sweep {
+    pub(crate) fn new(g: &ripple_core::Graph, mut ids: Vec<u32>) -> Self {
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Self::default();
+        }
+        let n = g.node_count();
+        let scan = |from: usize, to: usize| {
+            let mut defs = vec![Vec::new(); ids.len()];
+            let mut mentions = vec![Vec::new(); ids.len()];
+            for node in from as NodeId..to as NodeId {
+                let Some(m) = g.mentions(node) else { continue };
+                for d in m.defs.iter() {
+                    // `ids` is small and sorted: a binary search beats hashing.
+                    if let Ok(k) = ids.binary_search(d) {
+                        defs[k].push(node);
+                    }
+                }
+                // Both lists are sorted: each search starts where the last ended.
+                let p = &m.pairs;
+                let (Some(first), Some(last)) = (p.first(), p.last()) else { continue };
+                let mut lo = 0;
+                for (k, &id) in ids.iter().enumerate() {
+                    if id < first.0 {
+                        continue;
+                    }
+                    if id > last.0 {
+                        break;
+                    }
+                    lo += p[lo..].partition_point(|&(x, _)| x < id);
+                    if lo < p.len() && p[lo].0 == id {
+                        mentions[k].push(node);
+                    }
+                }
+            }
+            (defs, mentions)
+        };
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
+        let chunk = n.div_ceil(threads).max(4096);
+        let parts: Vec<(Vec<Vec<NodeId>>, Vec<Vec<NodeId>>)> = if n <= chunk {
+            vec![scan(0, n)]
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..n).step_by(chunk).map(|from| s.spawn(move || scan(from, (from + chunk).min(n)))).collect();
+                handles.into_iter().map(|h| h.join().expect("sweep thread")).collect()
+            })
+        };
+        let mut defs = vec![Vec::new(); ids.len()];
+        let mut mentions = vec![Vec::new(); ids.len()];
+        for (d, m) in parts {
+            for (k, v) in d.into_iter().enumerate() {
+                defs[k].extend(v);
+            }
+            for (k, v) in m.into_iter().enumerate() {
+                mentions[k].extend(v);
+            }
+        }
+        Self { ids, defs, mentions }
+    }
+
+    fn slot(&self, id: u32) -> Option<usize> {
+        self.ids.binary_search(&id).ok()
+    }
+    /// Files defining `id` (empty when it was not swept).
+    pub(crate) fn defining(&self, id: u32) -> &[NodeId] {
+        self.slot(id).map_or(&[], |k| &self.defs[k])
+    }
+    /// Files mentioning `id`.
+    pub(crate) fn mentioning(&self, id: u32) -> &[NodeId] {
+        self.slot(id).map_or(&[], |k| &self.mentions[k])
+    }
+}
+
+/// Name ids the by-name findings will ask a [`Sweep`] about.
+pub(crate) fn sweep_ids(ctx: &Ctx, of: &[NamesOf]) -> Vec<u32> {
+    let g = ctx.graph;
+    let mut ids: Vec<u32> = of.iter().filter(|o| g.mentions(o.node).is_some()).flat_map(|o| o.names.iter().map(|n| name_id(n))).collect();
+    for c in &ctx.changed {
+        if let Some(ch) = &c.file.change {
+            ids.extend(ch.removed_methods.iter().map(|n| name_id(n)));
+        }
+    }
+    ids
+}
+
 /// Is `node` worth checking for a Ruby method name (not JS/TS)?
 fn rubyish(ctx: &Ctx, node: NodeId) -> bool {
     ctx.class(node).language != Language::Js
@@ -61,11 +195,23 @@ fn rubyish(ctx: &Ctx, node: NodeId) -> bool {
 /// mention its name: the file itself, its direct dependents (and those of
 /// its old path), then any other file by name. Returns the entries (within
 /// the budget) and the number of entries before the budget.
-pub(crate) fn removed_methods(ctx: &Ctx, opts: &EvalOptions) -> (Vec<RemovedMethod>, usize) {
+pub(crate) fn removed_methods(ctx: &Ctx, opts: &EvalOptions, sweep: &Sweep, texts: &mut Texts) -> (Vec<RemovedMethod>, usize) {
     let root = opts.root.as_deref();
     let g = ctx.graph;
     let per_name = if opts.all { usize::MAX } else { opts.limit.unwrap_or(budget::MENTIONS) };
-    let mut out = Vec::new();
+    // One query per (changed file, removed name).
+    struct Query<'c> {
+        changed: &'c crate::eval::Changed,
+        name: &'c String,
+        id: u32,
+        /// The changed file's nodes (new and old path).
+        nodes: Vec<NodeId>,
+        /// Their direct dependents (shared by the file's names).
+        direct: std::rc::Rc<BTreeSet<NodeId>>,
+        others: Vec<NodeId>,
+        other_definitions: usize,
+    }
+    let mut queries: Vec<Query> = Vec::new();
     for c in &ctx.changed {
         let Some(change) = &c.file.change else { continue };
         if change.removed_methods.is_empty() {
@@ -80,73 +226,102 @@ pub(crate) fn removed_methods(ctx: &Ctx, opts: &EvalOptions) -> (Vec<RemovedMeth
                 }
             }
         }
-        let own_text = if c.file.status == FileStatus::Deleted { None } else { read(root, &c.file.path) };
+        let direct = std::rc::Rc::new(direct);
         for name in &change.removed_methods {
-            let id = [name_id(name)];
-            let mut mentions: Vec<Mention> = Vec::new();
-            let mut total = 0;
-            // The file itself (a private helper's callers live here).
-            if c.file.status != FileStatus::Deleted {
-                let line = own_text.as_deref().and_then(|t| mention_line(t, name));
-                let by_facts = c.node.and_then(|n| g.mentions(n)).map(|m| m.mentions_any(&id));
-                if line.is_some() || (own_text.is_none() && by_facts == Some(true)) {
-                    total += 1;
-                    mentions.push(Mention { file: c.file.path.clone(), line, how: MentionHow::SameFile });
+            queries.push(Query { changed: c, name, id: name_id(name), nodes: nodes.clone(), direct: direct.clone(), others: Vec::new(), other_definitions: 0 });
+        }
+    }
+    if queries.is_empty() {
+        return (Vec::new(), 0);
+    }
+    for q in &mut queries {
+        q.other_definitions = sweep.defining(q.id).iter().filter(|n| !q.nodes.contains(n)).count();
+        q.others = sweep.mentioning(q.id).iter().copied().filter(|n| !q.nodes.contains(n) && !q.direct.contains(n)).collect();
+        if opts.all || q.other_definitions < budget::COMMON_NAME_DEFINITIONS {
+            // Nearest first: same directory tree, then path.
+            let file = &q.changed.file.path;
+            q.others.sort_by_cached_key(|&n| (std::cmp::Reverse(shared_dirs(g.path(n), file)), g.path(n).to_string()));
+        }
+    }
+    // Read every file a line number will be looked up in, in parallel.
+    let mut want: Vec<&str> = Vec::new();
+    for q in &queries {
+        let c = q.changed;
+        if c.file.status != FileStatus::Deleted {
+            want.push(&c.file.path);
+        }
+        let id = [q.id];
+        want.extend(q.direct.iter().filter(|&&d| rubyish(ctx, d) && !g.mentions(d).is_some_and(|m| !m.opaque && !m.mentions_any(&id))).map(|&d| g.path(d)));
+        if opts.all || q.other_definitions < budget::COMMON_NAME_DEFINITIONS {
+            want.extend(q.others.iter().take(per_name.saturating_add(5)).map(|&n| g.path(n)));
+        }
+    }
+    texts.prefetch(root, &want);
+    let mut out = Vec::new();
+    for q in queries {
+        let c = q.changed;
+        let name = q.name;
+        let id = [q.id];
+        let mut mentions: Vec<Mention> = Vec::new();
+        let mut total = 0;
+        // The file itself (a private helper's callers live here).
+        if c.file.status != FileStatus::Deleted {
+            let own_text = texts.get(root, &c.file.path);
+            let line = own_text.and_then(|t| mention_line(t, name));
+            let by_facts = c.node.and_then(|n| g.mentions(n)).map(|m| m.mentions_any(&id));
+            if line.is_some() || (own_text.is_none() && by_facts == Some(true)) {
+                total += 1;
+                mentions.push(Mention { file: c.file.path.clone(), line, how: MentionHow::SameFile });
+            }
+        }
+        // Direct dependents: the facts decide when known, else the text.
+        for &d in q.direct.iter() {
+            if !rubyish(ctx, d) {
+                continue;
+            }
+            let path = g.path(d);
+            let facts = g.mentions(d);
+            // Facts that say "no" settle it without reading the file.
+            if facts.is_some_and(|m| !m.opaque && !m.mentions_any(&id)) {
+                continue;
+            }
+            let line = texts.get(root, path).and_then(|t| mention_line(t, name));
+            let hit = match facts {
+                Some(m) => m.opaque && line.is_some() || m.mentions_any(&id),
+                None => line.is_some(),
+            };
+            if hit {
+                total += 1;
+                if mentions.len() < per_name {
+                    mentions.push(Mention { file: path.to_string(), line, how: MentionHow::Dependent });
                 }
             }
-            // Direct dependents: the facts decide when known, else the text.
-            for &d in &direct {
-                if !rubyish(ctx, d) {
+        }
+        // Anywhere else, by name (method facts only; no edge links them).
+        let others = q.others;
+        total += others.len();
+        // Another class defining the name makes by-name matches doubtful:
+        // past a few definitions they are counted, not listed.
+        let other_definitions = q.other_definitions;
+        let common = !opts.all && other_definitions >= budget::COMMON_NAME_DEFINITIONS;
+        if !common {
+            for n in others {
+                if mentions.len() >= per_name {
+                    break;
+                }
+                let path = g.path(n);
+                let line = texts.get(root, path).and_then(|t| mention_line(t, name));
+                // Read but not found as a word (a hash collision, or only
+                // in a comment): not a mention after all.
+                if root.is_some() && line.is_none() {
+                    total -= 1;
                     continue;
                 }
-                let path = g.path(d);
-                let text = read(root, path);
-                let line = text.as_deref().and_then(|t| mention_line(t, name));
-                let hit = match g.mentions(d) {
-                    Some(m) => m.opaque && line.is_some() || m.mentions_any(&id),
-                    None => line.is_some(),
-                };
-                if hit {
-                    total += 1;
-                    if mentions.len() < per_name {
-                        mentions.push(Mention { file: path.to_string(), line, how: MentionHow::Dependent });
-                    }
-                }
+                mentions.push(Mention { file: path.to_string(), line, how: MentionHow::ByName });
             }
-            // Anywhere else, by name (method facts only; no edge links them).
-            let mut others: Vec<NodeId> = (0..g.node_count() as NodeId)
-                .filter(|n| !nodes.contains(n) && !direct.contains(n))
-                .filter(|&n| g.mentions(n).is_some_and(|m| m.mentions_any(&id)))
-                .collect();
-            total += others.len();
-            // Another class defining the name makes by-name matches doubtful:
-            // past a few definitions they are counted, not listed.
-            let other_definitions = (0..g.node_count() as NodeId)
-                .filter(|n| !nodes.contains(n))
-                .filter(|&n| g.mentions(n).is_some_and(|m| m.defs.contains(&id[0])))
-                .count();
-            let common = !opts.all && other_definitions >= budget::COMMON_NAME_DEFINITIONS;
-            // Nearest first: same directory tree, then path.
-            others.sort_by_cached_key(|&n| (std::cmp::Reverse(shared_dirs(g.path(n), &c.file.path)), g.path(n).to_string()));
-            if !common {
-                for n in others {
-                    if mentions.len() >= per_name {
-                        break;
-                    }
-                    let path = g.path(n);
-                    let line = read(root, path).as_deref().and_then(|t| mention_line(t, name));
-                    // Read but not found as a word (a hash collision, or only
-                    // in a comment): not a mention after all.
-                    if root.is_some() && line.is_none() {
-                        total -= 1;
-                        continue;
-                    }
-                    mentions.push(Mention { file: path.to_string(), line, how: MentionHow::ByName });
-                }
-            }
-            if total > 0 {
-                out.push(RemovedMethod { file: c.file.path.clone(), method: name.clone(), mentions, mentions_total: total, other_definitions });
-            }
+        }
+        if total > 0 {
+            out.push(RemovedMethod { file: c.file.path.clone(), method: name.clone(), mentions, mentions_total: total, other_definitions });
         }
     }
     out.sort_by(|a, b| (&a.file, &a.method).cmp(&(&b.file, &b.method)));
@@ -261,51 +436,47 @@ fn shared_dirs(a: &str, b: &str) -> usize {
 /// have no edge to the changed file (`exclude`: the changed files and their
 /// direct dependents). Listed nearest first, confirmed in the file text when
 /// it can be read. Returns the entries and the total number of files.
-pub(crate) fn also_mentioned(ctx: &Ctx, opts: &EvalOptions, of: &[NamesOf], exclude: &BTreeSet<NodeId>) -> (Vec<AlsoMentioned>, usize) {
+pub(crate) fn also_mentioned(ctx: &Ctx, opts: &EvalOptions, of: &[NamesOf], exclude: &BTreeSet<NodeId>, sweep: &Sweep, texts: &mut Texts) -> (Vec<AlsoMentioned>, usize) {
     let g = ctx.graph;
     let root = opts.root.as_deref();
     let cap = if opts.all { usize::MAX } else { opts.limit.unwrap_or(budget::ALSO_MENTIONED) };
-    // One pass over the workspace for every (changed file, name) pair:
-    // about 3 ms on GitLab's 61k files.
     // One entry per name: the exclusion set is shared, so a name changed
     // in two files has the same candidates.
     let mut queries: Vec<(&NamesOf, &String, u32)> =
         of.iter().filter(|o| g.mentions(o.node).is_some()).flat_map(|o| o.names.iter().map(move |n| (o, n, name_id(n)))).collect();
     let mut seen_names = std::collections::HashSet::new();
     queries.retain(|(_, n, _)| seen_names.insert(n.as_str()));
-    let mut definitions = vec![0usize; queries.len()];
-    let mut cands: Vec<Vec<NodeId>> = vec![Vec::new(); queries.len()];
-    if !queries.is_empty() {
-        for n in 0..g.node_count() as NodeId {
-            let Some(m) = g.mentions(n) else { continue };
-            let excluded = exclude.contains(&n);
-            for (q, (o, _, id)) in queries.iter().enumerate() {
-                if n != o.node && m.defs.contains(id) {
-                    definitions[q] += 1;
-                }
-                if !excluded && m.mentions_any(&[*id]) {
-                    cands[q].push(n);
-                }
-            }
+    let definitions: Vec<usize> = queries.iter().map(|(o, _, id)| sweep.defining(*id).iter().filter(|&&n| n != o.node).count()).collect();
+    let mut cands: Vec<Vec<NodeId>> = queries.iter().map(|(_, _, id)| sweep.mentioning(*id).iter().copied().filter(|n| !exclude.contains(n)).collect()).collect();
+    let list_caps: Vec<usize> = queries
+        .iter()
+        .enumerate()
+        .map(|(q, (o, name, _))| if opts.all { cap } else if definitions[q] + 1 > budget::COMMON_NAME_DEFINITIONS || o.singleton.contains(name) { 0 } else { cap })
+        .collect();
+    for (q, (o, _, _)) in queries.iter().enumerate() {
+        // Nearest first (only lists that are shown need an order).
+        if list_caps[q] > 0 {
+            cands[q].sort_by_cached_key(|&n| (std::cmp::Reverse(shared_dirs(g.path(n), &o.file)), g.path(n).to_string()));
         }
     }
+    let want: Vec<&str> = cands.iter().zip(&list_caps).flat_map(|(c, &lc)| c.iter().take(lc.saturating_add(5)).map(|&n| g.path(n))).collect();
+    texts.prefetch(root, &want);
     let mut out = Vec::new();
     let mut grand = 0;
     for (q, (o, name, _)) in queries.iter().enumerate() {
-        let mut cands = std::mem::take(&mut cands[q]);
-        cands.sort_by_cached_key(|&n| (std::cmp::Reverse(shared_dirs(g.path(n), &o.file)), g.path(n).to_string()));
+        let cands = std::mem::take(&mut cands[q]);
         let mut total = cands.len();
         let mut files = Vec::new();
         // A common name (several definitions) or a singleton method: the
         // mentions are mostly other methods, so only the count is given.
         let singleton = o.singleton.contains(name);
-        let list_cap = if opts.all { cap } else if definitions[q] + 1 > budget::COMMON_NAME_DEFINITIONS || singleton { 0 } else { cap };
+        let list_cap = list_caps[q];
         for n in cands {
             if files.len() >= list_cap {
                 break;
             }
             let path = g.path(n);
-            let line = read(root, path).as_deref().and_then(|t| mention_line(t, name));
+            let line = texts.get(root, path).and_then(|t| mention_line(t, name));
             if root.is_some() && line.is_none() {
                 // A hash collision, or only in a comment.
                 total -= 1;
