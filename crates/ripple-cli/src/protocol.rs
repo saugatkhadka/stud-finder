@@ -14,10 +14,16 @@
 //! check, the query, policy evaluation and rendering.
 //!
 //! Methods and params:
-//! * `impact {files?: [path], changed?: [ChangedFile], max_depth?, min_confidence?, format?: json|text|markdown, color?, limit?, max_listed?, sync?}`
+//! * `impact {files?: [path], changed?: [ChangedFile], scopes?: [name], file_level?, max_depth?, min_confidence?, format?: json|text|markdown, color?, limit?, max_listed?, sync?}`
 //!   → the [`ripple_policy::Report`] for `format: json` (default), else a string.
-//! * `dependents {file, depth? = 1, min_confidence?}` / `dependencies {file, depth? = 1, min_confidence?}`
-//! * `why {from, to}` → shortest dependency path between two files.
+//!   A `changed` entry may carry `hunks` (new-side `git diff -U0` hunks,
+//!   computed by the client); the daemon maps them onto the file's method
+//!   scopes from its own index, so line numbers always match what it indexed.
+//!   `scopes` limits the bare `files` (exactly one) to those methods / actions.
+//!   `file_level: true` ignores every scope (seeds and edges).
+//! * `dependents {file, scopes?, depth? = 1, min_confidence?}` / `dependencies {file, depth? = 1, min_confidence?}`
+//! * `why {from, to, scopes?}` → shortest dependency path between two files
+//!   (`scopes`: only through these methods / actions of `to`).
 //! * `areas {file}` → how the policy classifies a file.
 //! * `stats` → index and daemon statistics. `reload` → full re-index. `shutdown`.
 //!
@@ -73,8 +79,12 @@ pub enum Format {
 pub struct ImpactParams {
     /// Changed paths without diff details (status inferred from the file system).
     pub files: Vec<String>,
-    /// Changed files with status / line counts.
+    /// Changed files with status / line counts / hunks.
     pub changed: Vec<ChangedFile>,
+    /// Only these methods / actions of the (single) file in `files` changed.
+    pub scopes: Vec<String>,
+    /// Ignore method / action scopes on seeds and edges.
+    pub file_level: bool,
     pub max_depth: Option<u32>,
     pub min_confidence: Option<Confidence>,
     pub format: Format,
@@ -102,6 +112,8 @@ impl ImpactParams {
 #[serde(default)]
 pub struct FileParams {
     pub file: String,
+    /// `dependents` only: start from these methods / actions of `file`.
+    pub scopes: Vec<String>,
     pub depth: Option<u32>,
     pub min_confidence: Option<Confidence>,
     pub sync: bool,
@@ -112,6 +124,8 @@ pub struct FileParams {
 pub struct WhyParams {
     pub from: String,
     pub to: String,
+    /// Only paths that go through these methods / actions of `to`.
+    pub scopes: Vec<String>,
     pub sync: bool,
 }
 

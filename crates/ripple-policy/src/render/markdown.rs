@@ -1,7 +1,7 @@
 //! Markdown for a pull-request comment / step summary. Written for a reader
 //! who has never heard of ripple.
 
-use super::{conf_str, kind_str, path_line};
+use super::{conf_str, detail_with_scope, kind_str, mode_line, path_line, scope_list, thousands};
 use crate::eval::{plural, risk_word};
 use crate::report::{ImpactedFile, Report};
 use ripple_core::Risk;
@@ -34,6 +34,16 @@ fn lines(added: Option<u32>, deleted: Option<u32>) -> String {
     }
 }
 
+/// "**212** impacted files (method-level; 1,362 if whole files are assumed changed)".
+fn impacted_head(r: &Report) -> String {
+    let (n, whole) = (r.impacted.total, r.impacted.file_level_total);
+    let mut s = format!("**{}** impacted file{}", thousands(n), plural(n));
+    if !r.query.file_level && whole != n {
+        s.push_str(&format!(" (method-level; {} if whole files are assumed changed)", thousands(whole)));
+    }
+    s
+}
+
 /// Renders the report. At most `max_listed` impacted files are listed (the
 /// counts are always complete).
 pub fn render(report: &Report, max_listed: usize) -> String {
@@ -44,8 +54,8 @@ pub fn render(report: &Report, max_listed: usize) -> String {
     let mut head = vec![
         badge(r.risk).to_string(),
         format!("**{}** changed file{}", r.changed.len(), plural(r.changed.len())),
-        format!("**{}** impacted file{}", r.impacted.total, plural(r.impacted.total)),
-        format!("**{}** test{} to run", r.tests_total(), plural(r.tests_total())),
+        impacted_head(r),
+        format!("**{}** test{} to run", thousands(r.tests_total()), plural(r.tests_total())),
     ];
     if !r.require.is_empty() {
         head.push(format!("requires {}", r.require.iter().map(|s| code(s)).collect::<Vec<_>>().join(", ")));
@@ -125,6 +135,14 @@ pub fn render(report: &Report, max_listed: usize) -> String {
         if !c.in_graph {
             notes.push("not indexed");
         }
+        if let Some(scopes) = &c.scopes {
+            let label = if scopes.len() == 1 { "method" } else { "methods" };
+            if scopes.is_empty() {
+                file.push_str(" · no method changed");
+            } else {
+                file.push_str(&format!(" · {label}: {}", scope_list(scopes, 4, code)));
+            }
+        }
         let deps = if c.in_graph { c.dependents.to_string() } else { "?".into() };
         let _ = writeln!(
             o,
@@ -167,8 +185,11 @@ pub fn render(report: &Report, max_listed: usize) -> String {
                 if let Some(k) = f.kind {
                     why.push(kind_str(k).to_string());
                 }
-                if let Some(d) = &f.detail {
-                    why.push(code(d));
+                if let Some(d) = detail_with_scope(f.detail.as_deref(), f.to_scope.as_deref()) {
+                    why.push(code(&d));
+                }
+                if let Some(fs) = &f.from_scope {
+                    why.push(format!("in {}", code(fs)));
                 }
                 if let Some(c) = f.path_confidence.filter(|c| *c != ripple_core::Confidence::Exact) {
                     why.push(conf_str(c).to_string());
@@ -213,7 +234,8 @@ pub fn render(report: &Report, max_listed: usize) -> String {
 
     let _ = writeln!(
         o,
-        "<sub>ripple · index generation {} · {} files, {} dependencies · depth limit {} · min confidence {}</sub>",
+        "<sub>ripple · {} · index generation {} · {} files, {} dependencies · depth limit {} · min confidence {}</sub>",
+        mode_line(r),
         r.index.generation,
         r.index.nodes,
         r.index.edges,

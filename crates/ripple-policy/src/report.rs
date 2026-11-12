@@ -110,6 +110,15 @@ pub struct Hop {
     /// Evidence text: constant, import specifier, URL, `controller#action`, ...
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The method / action of `file` the reference sits in (absent: the file as a whole).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_scope: Option<String>,
+    /// The method / action of the next hop that is referenced (absent: the file as a whole).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_scope: Option<String>,
+    /// `file` inherits from / includes the next hop (superclass, mixin).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -125,6 +134,11 @@ pub struct ChangedEntry {
     pub deleted: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_line: Option<u32>,
+    /// The methods / actions the diff is confined to, which is what the impact
+    /// query started from. Absent = the whole file is treated as changed
+    /// (no diff, a change outside every method, `--file-level`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
     pub language: Language,
     pub areas: Vec<String>,
     /// Number of files that directly depend on this one (any confidence).
@@ -141,6 +155,11 @@ pub struct ChangedEntry {
 pub struct ImpactedSummary {
     /// Impacted non-test files, excluding the changed files.
     pub total: usize,
+    /// What `total` would be if every changed file were wholly changed and
+    /// method / action scopes on dependencies were ignored (a superset).
+    /// Equal to `total` in file-level mode.
+    #[serde(default)]
+    pub file_level_total: usize,
     /// Impacted test files (see `tests_to_run`).
     pub tests: usize,
     /// Deepest hop count reached.
@@ -180,6 +199,12 @@ pub struct ImpactedFile {
     pub line: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Method / action of `file` that holds the reference to `via`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_scope: Option<String>,
+    /// Method / action of `via` that is referenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_scope: Option<String>,
     pub language: Language,
     pub areas: Vec<String>,
 }
@@ -204,6 +229,10 @@ pub struct QueryInfo {
     /// 0 = unlimited.
     pub max_depth: u32,
     pub min_confidence: Confidence,
+    /// True when the query ignored method / action scopes (`--file-level`):
+    /// every changed file counted as wholly changed.
+    #[serde(default)]
+    pub file_level: bool,
 }
 
 /// Microseconds spent per phase on the side that produced the report.

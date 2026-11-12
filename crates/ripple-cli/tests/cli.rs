@@ -155,7 +155,15 @@ fn stale_socket_after_kill() {
     first.kill().unwrap();
     first.wait().unwrap();
     assert!(paths.socket.exists(), "socket file should be left behind by SIGKILL");
-    assert!(ripple_cli::client::Client::connect(&paths).is_none());
+    // Nothing accepts any more. A child the daemon was spawning at the moment
+    // of the kill can hold a copy of the listening socket for a few
+    // milliseconds (until it execs, which closes it), and connects queue on it
+    // meanwhile; so poll rather than assert on the first attempt.
+    let t = Instant::now();
+    while ripple_cli::client::Client::connect(&paths).is_some() {
+        assert!(t.elapsed() < Duration::from_secs(5), "the killed daemon's socket still accepts connections");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // The next command detects the dead socket, autostarts a new daemon and answers.
     let r = env.json(&["impact", "--files", "app/charge.txt", "--format", "json"]);
     assert_eq!(impacted_of(&r), vec!["app/ui.txt"]);
@@ -303,4 +311,190 @@ fn query_commands_text() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("area billing (critical)"));
     let o = env.run(&["--no-daemon", "dependencies", "nope.txt"]);
     assert_eq!(o.status.code(), Some(2));
+}
+
+// ---- method-level scopes ----------------------------------------------------
+
+/// purchase.txt is laid out like a Ruby model: refund! on lines 4-7, charge!
+/// on 9-11. svc#run calls refund!, session#login calls charge!, report uses
+/// the class body, sub inherits; spec covers charge!.
+const PURCHASE: &str = "class Purchase\n  has_many :refunds\n\n  def refund!\n    a\n    b\n  end\n\n  def charge!\n    c\n  end\nend\n";
+const SCOPED_EDGES: &str = "\
+@scope app/purchase.txt refund! 4 7
+@scope app/purchase.txt charge! 9 11
+app/svc.txt#run app/purchase.txt#refund! ruby_constant exact 12 Purchase
+app/session.txt#login app/purchase.txt#charge! ruby_constant exact 5 Purchase
+app/report.txt app/purchase.txt#@body ruby_constant exact 9 Purchase
+@inherit app/sub.txt app/purchase.txt ruby_constant exact 1 Purchase
+app/caller.txt app/svc.txt#run
+spec/purchase_spec.txt app/purchase.txt#charge!
+";
+
+fn scoped_env() -> Env {
+    let cfg = "version: 1\nareas:\n  auth:\n    tier: critical\n    paths: [app/session.txt]\nci:\n  fail_on: critical\n";
+    let files = [
+        ("app/purchase.txt", PURCHASE),
+        ("app/svc.txt", "s\n"),
+        ("app/session.txt", "s\n"),
+        ("app/report.txt", "r\n"),
+        ("app/sub.txt", "s\n"),
+        ("app/caller.txt", "c\n"),
+        ("spec/purchase_spec.txt", "t\n"),
+        ("ripple.yml", cfg),
+    ];
+    Env::new(&files, SCOPED_EDGES)
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+fn strip_timing(mut v: Value) -> Value {
+    v["timing"] = Value::Null;
+    v
+}
+
+#[test]
+fn scope_flag_and_file_level() {
+    let env = scoped_env();
+    let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--scope", "refund!", "--format", "json"]);
+    assert_eq!(impacted_of(&r), ["app/caller.txt", "app/sub.txt", "app/svc.txt"]);
+    assert_eq!(r["changed"][0]["scopes"], serde_json::json!(["refund!"]));
+    assert_eq!((r["impacted"]["total"].as_u64(), r["impacted"]["file_level_total"].as_u64()), (Some(3), Some(5)));
+    assert_eq!(r["risk"], "low", "refund! does not reach auth");
+    // The svc hop names the method it sits in and the one it calls.
+    let svc = r["impacted"]["files"].as_array().unwrap().iter().find(|f| f["file"] == "app/svc.txt").unwrap();
+    assert_eq!((svc["from_scope"].as_str(), svc["to_scope"].as_str()), (Some("run"), Some("refund!")));
+
+    let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--scope", "charge!", "--format", "json"]);
+    assert_eq!(impacted_of(&r), ["app/session.txt", "app/sub.txt"]);
+    assert_eq!(r["tests_to_run"][0]["file"], "spec/purchase_spec.txt");
+    assert_eq!(r["risk"], "high", "reaches the critical auth area in one hop");
+
+    let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--scope", "refund!", "--file-level", "--format", "json"]);
+    assert_eq!(impacted_of(&r), ["app/caller.txt", "app/report.txt", "app/session.txt", "app/sub.txt", "app/svc.txt"]);
+    assert!(r["changed"][0]["scopes"].is_null());
+    assert_eq!(r["query"]["file_level"], true);
+
+    // Unknown method: warned, nothing impacted.
+    let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--scope", "nope", "--format", "json"]);
+    assert_eq!(r["impacted"]["total"], 0);
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w["code"] == "scope_unknown"), "{}", r["warnings"]);
+    // --scope needs exactly one explicit file.
+    let o = env.run(&["--no-daemon", "impact", "--scope", "refund!"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--scope needs exactly one"));
+
+    // dependents / why / stats.
+    let o = env.run(&["--no-daemon", "dependents", "app/purchase.txt", "--scope", "refund!", "--depth", "0"]);
+    let t = String::from_utf8_lossy(&o.stdout);
+    assert!(t.starts_with("3 dependents of app/purchase.txt#refund! (all depths)"), "{t}");
+    assert!(t.contains("1 app/svc.txt#run  (ruby_constant `Purchase#refund!` line 12)"), "{t}");
+    let w = env.json(&["--no-daemon", "why", "app/caller.txt", "app/purchase.txt", "--format", "json"]);
+    assert_eq!(w["found"], true);
+    assert_eq!(w["path"][1]["from_scope"], "run");
+    let w = env.json(&["--no-daemon", "why", "app/caller.txt", "app/purchase.txt", "--scope", "charge!", "--format", "json"]);
+    assert_eq!((w["found"].as_bool(), w["file_level_path"].as_bool()), (Some(false), Some(true)));
+    let o = env.run(&["--no-daemon", "why", "app/caller.txt", "app/purchase.txt", "--scope", "charge!"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("not through the methods"), "{}", String::from_utf8_lossy(&o.stdout));
+    let o = env.run(&["--no-daemon", "why", "app/caller.txt", "app/purchase.txt"]);
+    let t = String::from_utf8_lossy(&o.stdout);
+    assert!(t.contains("app/svc.txt#run\n") && t.contains("`Purchase#refund!` line 12"), "{t}");
+    let s = env.json(&["--no-daemon", "stats", "--format", "json"]);
+    assert_eq!((s["files_with_scopes"].as_u64(), s["scopes"].as_u64()), (Some(1), Some(2)));
+    let o = env.run(&["--no-daemon", "stats"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("scopes 2 in 1 files"));
+}
+
+#[test]
+fn diff_lines_map_to_methods() {
+    let env = scoped_env();
+    let root = &env.repo.root;
+    git(root, &["checkout", "-q", "-b", "feature"]);
+    let edit = |from: &str, to: &str| env.repo.write("app/purchase.txt", &PURCHASE.replace(from, to));
+
+    // A body line of refund!: only its callers.
+    edit("    a\n", "    a2\n");
+    let r = env.json(&["--no-daemon", "impact", "--format", "json"]);
+    assert_eq!(r["changed"][0]["scopes"], serde_json::json!(["refund!"]));
+    assert_eq!(impacted_of(&r), ["app/caller.txt", "app/sub.txt", "app/svc.txt"]);
+    // Same through the daemon, and identical JSON.
+    let d = env.json(&["impact", "--format", "json"]);
+    assert_eq!(strip_timing(d), strip_timing(r.clone()));
+
+    // check --base: the markdown says what was narrowed and by how much.
+    env.repo.commit("edit refund!");
+    let o = env.run(&["check", "--base", "main", "--format", "markdown"]);
+    let md = String::from_utf8_lossy(&o.stdout);
+    assert!(md.contains("**3** impacted files (method-level; 5 if whole files are assumed changed)"), "{md}");
+    assert!(md.contains("| `app/purchase.txt` · method: `refund!` | modified | +1 −1 |"), "{md}");
+    assert!(md.contains("method-level analysis (1 of 1 changed file narrowed"), "{md}");
+    let o = env.run(&["check", "--base", "main", "--format", "markdown", "--file-level"]);
+    let md = String::from_utf8_lossy(&o.stdout);
+    assert!(md.contains("**5** impacted files ·") && md.contains("file-level analysis"), "{md}");
+
+    // Both methods; a pure deletion inside charge! counts as charge!.
+    edit("    a\n", "    a2\n");
+    std::fs::write(root.join("app/purchase.txt"), PURCHASE.replace("    a\n", "    a2\n").replace("    c\n", "")).unwrap();
+    let r = env.json(&["--no-daemon", "impact", "--base", "main", "--format", "json"]);
+    assert_eq!(r["changed"][0]["scopes"], serde_json::json!(["charge!", "refund!"]));
+    assert_eq!(sorted(impacted_of(&r)), ["app/caller.txt", "app/session.txt", "app/sub.txt", "app/svc.txt"]);
+
+    // The def line itself, a class-level line, or a removed method: whole file.
+    for (from, to) in [("  def refund!\n", "  def refund!(x)\n"), ("  has_many :refunds\n", "  has_many :refunds2\n"), ("  def charge!\n    c\n  end\n", "")] {
+        edit(from, to);
+        let r = env.json(&["--no-daemon", "impact", "--format", "json"]);
+        assert!(r["changed"][0]["scopes"].is_null(), "{from:?}: {}", r["changed"][0]);
+        assert_eq!(r["impacted"]["total"], 5, "{from:?}");
+    }
+
+    // --staged with unstaged edits on top: line numbers would not match the
+    // indexed working tree, so the file is whole.
+    edit("    b\n", "    b2\n");
+    git(root, &["add", "app/purchase.txt"]);
+    let r = env.json(&["--no-daemon", "impact", "--staged", "--format", "json"]);
+    assert_eq!(r["changed"][0]["scopes"], serde_json::json!(["refund!"]));
+    env.repo.write("app/purchase.txt", &PURCHASE.replace("    b\n", "    b2\n").replace("    c\n", "    c2\n"));
+    let r = env.json(&["--no-daemon", "impact", "--staged", "--format", "json"]);
+    assert!(r["changed"][0]["scopes"].is_null(), "{}", r["changed"][0]);
+
+    // --files carries no diff: whole file.
+    let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--format", "json"]);
+    assert!(r["changed"][0]["scopes"].is_null());
+    env.stop();
+}
+
+#[test]
+fn scopes_follow_incremental_updates_in_the_daemon() {
+    let env = scoped_env();
+    let edit = |from: &str, to: &str| env.repo.write("app/purchase.txt", &PURCHASE.replace(from, to));
+    edit("    c\n", "    c2\n");
+    let r = env.json(&["impact", "--format", "json"]);
+    assert_eq!(r["changed"][0]["scopes"], serde_json::json!(["charge!"]));
+    // The scope table moves (a line inserted above refund!): the daemon must
+    // re-read it, or line 10 would still look like charge!.
+    std::fs::write(&env.edges, SCOPED_EDGES.replace("refund! 4 7", "refund! 5 8").replace("charge! 9 11", "charge! 10 12")).unwrap();
+    env.repo.write("app/purchase.txt", &PURCHASE.replace("  has_many :refunds\n", "  has_many :refunds\n  # note\n").replace("    a\n", "    a2\n"));
+    let r = env.json(&["impact", "--format", "json"]);
+    assert!(r["changed"][0]["scopes"].is_null(), "a class-level line was added: {}", r["changed"][0]);
+    env.repo.commit("shift");
+    env.repo.write("app/purchase.txt", &PURCHASE.replace("  has_many :refunds\n", "  has_many :refunds\n  # note\n").replace("    a\n", "    a3\n"));
+    let r = env.json(&["impact", "--format", "json"]);
+    assert_eq!(r["changed"][0]["scopes"], serde_json::json!(["refund!"]), "line 6 is refund! after the shift");
+    let s = env.json(&["stats", "--format", "json"]);
+    assert_eq!(s["scopes"], 2);
+    env.stop();
+}
+
+#[test]
+fn deleted_js_file_lists_importers_in_a_cold_run() {
+    let env = Env::new(&[("app/javascript/a.ts", "import { b } from './b';\nexport const a = b;\n"), ("app/javascript/b.ts", "export const b = 1;\n")], "");
+    git(&env.repo.root, &["checkout", "-q", "-b", "feature"]);
+    env.repo.remove("app/javascript/b.ts");
+    env.repo.commit("drop b");
+    let r = env.json(&["--no-daemon", "impact", "--base", "main", "--format", "json"]);
+    let w: Vec<&Value> = r["warnings"].as_array().unwrap().iter().filter(|w| w["code"] == "deleted_file_still_imported").collect();
+    assert_eq!(w.len(), 1, "{}", r["warnings"]);
+    assert!(w[0]["message"].as_str().unwrap().contains("app/javascript/a.ts"), "{}", w[0]);
 }

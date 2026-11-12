@@ -8,6 +8,7 @@
 use crate::edgefile::EdgeFileExtractor;
 use crate::files::{self, Listing};
 use anyhow::Result;
+use ripple_core::model::ScopeRange;
 use ripple_core::{ChangeSet, Edge, ExtractOutput, Extractor, Facts, Graph, Linker, RelPath, Warning, Workspace};
 use ripple_policy::{CONFIG_FILE_NAMES, Policy, PolicyIndex};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -68,6 +69,19 @@ pub struct Snapshot {
     /// Deleted files whose former dependents are kept in the graph.
     pub tombstones: usize,
     pub built_at: SystemTime,
+    /// Line ranges of the named scopes (methods, controller actions) per
+    /// file, merged from every extractor's [`Facts::scopes`]. Lets a diff be
+    /// turned into method-level seeds. Shared between generations until an
+    /// extractor reports different ranges.
+    pub scopes: Arc<BTreeMap<RelPath, Vec<ScopeRange>>>,
+}
+
+impl Snapshot {
+    /// Scope ranges of `file`, sorted by start line; `None` when the
+    /// extractors report none (the file then always counts as wholly changed).
+    pub fn scopes_of(&self, file: &str) -> Option<&[ScopeRange]> {
+        self.scopes.get(file).map(Vec::as_slice).filter(|v| !v.is_empty())
+    }
 }
 
 impl Snapshot {
@@ -119,6 +133,7 @@ pub struct Engine {
     generation: u64,
     listing: Listing,
     current: Option<Arc<Snapshot>>,
+    scopes: Arc<BTreeMap<RelPath, Vec<ScopeRange>>>,
 }
 
 fn load_policy(root: &Path) -> (Policy, Option<Warning>) {
@@ -158,6 +173,7 @@ impl Engine {
             generation: 0,
             listing: Listing::Git,
             current: None,
+            scopes: Arc::default(),
         };
         let snap = engine.full_build()?;
         Ok((engine, snap))
@@ -396,6 +412,17 @@ impl Engine {
         for o in &self.outputs {
             facts.merge(o.facts.clone());
         }
+        // Extractor outputs are complete (not deltas), so the merged map is the
+        // current truth; a failed extractor keeps its previous output and facts.
+        let mut scopes = std::mem::take(&mut facts.scopes);
+        for ranges in scopes.values_mut() {
+            ranges.sort_by_key(|r| (r.start, r.end));
+        }
+        scopes.retain(|_, v| !v.is_empty());
+        if *self.scopes != scopes {
+            self.scopes = Arc::new(scopes.clone());
+        }
+        facts.scopes = scopes;
         for (i, linker) in self.pipeline.linkers.iter_mut().enumerate() {
             let t = Instant::now();
             let name = linker.name().to_string();
@@ -446,6 +473,7 @@ impl Engine {
             listing: self.listing.as_str(),
             tombstones: self.tombstones.len(),
             built_at: SystemTime::now(),
+            scopes: self.scopes.clone(),
         });
         self.current = Some(snap.clone());
         snap

@@ -39,6 +39,7 @@ ripple impact                                # working tree vs HEAD (untracked f
 ripple impact --base main                    # everything since merge-base(main, HEAD)
 ripple impact app/models/user.rb             # explicit files
 ripple dependents app/models/user.rb --depth 0
+ripple impact --files app/models/purchase.rb --scope refund!   # only what reaches Purchase#refund!
 ripple why app/javascript/checkout/pay.ts app/models/billing/invoice.rb
 ```
 
@@ -49,12 +50,12 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 
 | Command | What it does |
 |---|---|
-| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--limit N` (cap the listed files; counts stay exact), `--sync` (also wait for unrelated pending edits). |
-| `check --base REF` | CI entry point. `--format github\|markdown\|json\|text` (github is the default under `GITHUB_ACTIONS`), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`. Never starts a daemon, but uses one that is already running. |
-| `dependents FILE` / `dependencies FILE` | Direct neighbours by default; `--depth N` (0 = all). |
-| `why FROM TO` | Shortest dependency path between two files, in either direction. |
+| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--limit N` (cap the listed files; counts stay exact), `--sync` (also wait for unrelated pending edits), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
+| `check --base REF` | CI entry point. `--format github\|markdown\|json\|text` (github is the default under `GITHUB_ACTIONS`), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`, `--file-level`. Never starts a daemon, but uses one that is already running. |
+| `dependents FILE` / `dependencies FILE` | Direct neighbours by default; `--depth N` (0 = all). `dependents --scope NAME`: only what depends on that method / action. |
+| `why FROM TO` | Shortest dependency path between two files, in either direction. `--scope NAME`: only paths into that method / action of TO (says so when only a file-level path exists). |
 | `areas FILE` | How `ripple.yml` classifies a file: areas, test, global, language. |
-| `stats` | Index size, per-phase timings, extractor counters, warnings, daemon info. |
+| `stats` | Index size, scope ranges (`files_with_scopes`, `scopes`), per-phase timings, extractor counters, warnings, daemon info. |
 | `init [--force]`, `config check` | Starter config; validation plus how many files each area matches. |
 | `daemon status\|start\|stop`, `serve [--foreground]` | Manage the daemon. |
 
@@ -170,6 +171,40 @@ All the conditions in a rule must hold for it to fire. A rule with an empty
 
 If no rule fires, the risk is low.
 
+### Method-level analysis
+
+Extractors can report, per file, the line ranges of its methods and controller
+actions (`Facts.scopes`), and, per edge, which method of the dependent it sits
+in (`from_scope`) and which method of the dependency it uses (`to_scope`; the
+class body is `@body`). When both are known, an edit inside `Purchase#refund!`
+seeds only `refund!`: callers of `charge!` are not impacted. Everything is
+conservative, so method-level results are always a subset of file-level ones:
+
+- The diff is read with `git diff -U0`; only new-side hunks matter. A hunk
+  with new lines `[a, b]` belongs to method `m` iff `m.start < a` and
+  `b <= m.end` (the `def` line itself is not "inside": renaming or changing a
+  signature breaks callers by name). A pure deletion after new line `p`
+  belongs to `m` iff `m.start <= p` and `p + 1 <= m.end`. Nested methods: all
+  containing ranges are seeds.
+- The whole file is the seed when: the file was added, deleted or renamed; it
+  is binary or has no textual diff; it has no scope ranges; any hunk falls
+  outside every method (class body, between methods); a hunk contains a
+  method's `def` line; or the removed side of a hunk contains a `def` line (a
+  method was deleted or merged). `--files` without `--scope` is whole-file,
+  and so is `--staged` for files that also have unstaged edits (the line
+  numbers would not match the indexed working tree).
+- Hunks are computed by the client and mapped onto scopes by whoever holds the
+  index (the daemon or the in-process engine), so line numbers always match
+  what was indexed.
+- Every query uses the narrowed seeds: reach, `touches` of other files,
+  `untested` (a file counts as tested if a test reaches one of its changed
+  methods), `crosses_boundary`. The per-file `dependents` count stays the
+  file-level fan-in.
+- `--file-level` turns all of this off (seeds and edge scopes). The report
+  always carries `impacted.file_level_total`, and the markdown headline reads
+  e.g. "**212** impacted files (method-level; 1,362 if whole files are assumed
+  changed)". The footer states which mode was used.
+
 ## JSON report (`--format json`, `schema_version: 1`)
 
 The report is deterministic: the same index and inputs give byte-identical
@@ -191,19 +226,21 @@ output, apart from `timing`. All lists are sorted. Abridged:
   }],
   "require": ["human_review", "payments_review"],
   "changed": [{ "path": "…", "status": "modified|added|deleted|renamed", "old_path": "…", "added": 5, "deleted": 1, "first_line": 4,
+                "scopes": ["refund!"],              // only these methods changed; absent = the whole file
                 "language": "ruby|js|template|other", "areas": ["billing"], "dependents": 2, "in_graph": true, "is_test": false, "is_global": false }],
   "impacted": {
-    "total": 5, "tests": 1, "max_depth": 4,
+    "total": 5, "file_level_total": 9, "tests": 1, "max_depth": 4,  // file_level_total: impacted if whole files had changed
     "by_depth": { "1": 1, "2": 1 }, "by_language": { "ruby": 2 }, "by_edge_kind": { "ruby_constant": 2 }, "by_min_confidence": { "exact": 3, "inferred": 2 },
     "files": [{ "file": "…", "depth": 1, "via": "…", "root": "<changed file it traces to>", "kind": "ruby_constant", "confidence": "exact",
-                "path_confidence": "<weakest edge on the path>", "line": 4, "detail": "Billing::Invoice", "language": "ruby", "areas": ["billing"] }],
+                "path_confidence": "<weakest edge on the path>", "line": 4, "detail": "Billing::Invoice", "language": "ruby", "areas": ["billing"],
+                "from_scope": "run", "to_scope": "refund!" }],   // methods the first edge sits in / uses, when known (never `@body`)
     "truncated": false                     // true when --limit cut `files` / `tests_to_run`
   },
   "tests_to_run": [ /* same shape as impacted.files; changed test files have depth 0 */ ],
   "areas_reached": [{ "area": "billing", "tier": "critical", "owners": ["@acme/payments"], "touched": true, "files": 2, "min_depth": 0, "example": { /* path */ } }],
   "owners": ["@acme/payments"],
   "warnings": [{ "code": "global_file_changed", "message": "global: static impact is not reliable for this file …", "file": "config/initializers/money.rb" }],
-  "query": { "max_depth": 0, "min_confidence": "heuristic" },
+  "query": { "max_depth": 0, "min_confidence": "heuristic", "file_level": false },
   "timing": { "refresh_us": 6, "query_us": 5, "evaluate_us": 9 },
   "index": { "generation": 1, "nodes": 61037, "edges": 397567, "pending_changes": 0 }
 }
@@ -216,6 +253,9 @@ Warning codes include:
 - `deleted_file_not_indexed`
 - `changed_file_ignored`
 - `no_line_counts`
+- `scope_unknown` (`--scope` names a method missing from the file's scope ranges)
+- `deleted_file_still_imported` (cold index only: JS/TS files whose imports of
+  a deleted file no longer resolve)
 - `config_invalid`
 - extractor warnings about the changed files themselves
 
@@ -288,9 +328,9 @@ Methods:
 
 | Method | Params |
 |---|---|
-| `impact` | `files`, `changed`, `max_depth`, `min_confidence`, `format`, `color`, `limit`, `max_listed`, `sync` |
-| `dependents`, `dependencies` | `file`, `depth`, `min_confidence` |
-| `why` | `from`, `to` |
+| `impact` | `files`, `changed` (entries may carry `hunks`: `[{start, count, removes_definition?}]`), `scopes`, `file_level`, `max_depth`, `min_confidence`, `format`, `color`, `limit`, `max_listed`, `sync` |
+| `dependents`, `dependencies` | `file`, `scopes` (dependents only), `depth`, `min_confidence` |
+| `why` | `from`, `to`, `scopes` |
 | `areas` | `file` |
 | `stats` | — |
 | `reload` | — |
@@ -359,7 +399,11 @@ per-extractor counters.
   dynamic imports and runtime configuration are invisible. `global_files`
   covers the worst cases.
 - A cold index cannot list the dependents of a deleted file. Only a running
-  daemon keeps them, as tombstones.
+  daemon keeps them, as tombstones. For JS/TS the cold report does list the
+  files whose imports of it no longer resolve (`deleted_file_still_imported`);
+  Ruby constant references to a deleted file are not recoverable cold.
+- Method-level narrowing is only as good as the scope data: files without
+  scope ranges, and edges without a `to_scope`, count as whole-file.
 - Each incremental pass rebuilds the whole graph. On a 400k-edge graph that
   costs about 0.3 s. Queries that do not name a pending file are not blocked
   during the pass.
@@ -376,6 +420,6 @@ per-extractor counters.
 | `RIPPLE_NO_DAEMON=1` | Disables daemon autostart. `CI` and `GITHUB_ACTIONS` do the same. |
 | `RIPPLE_SOCKET_DIR` | Directory for the socket, lock and log files. |
 | `NO_COLOR` | Plain text output. |
-| `RIPPLE_EDGE_FILE` | Extra edges from a file: `FROM TO [KIND [CONF [LINE [DETAIL]]]]` per line. For tests, benchmarks and custom integrations. |
+| `RIPPLE_EDGE_FILE` | Extra edges from a file: `FROM TO [KIND [CONF [LINE [DETAIL]]]]` per line; either endpoint may be `path#method` (`#@body` = class body); `@inherit FROM TO ...` adds an inheritance edge; `@scope FILE NAME START END` declares a method's line range. `#` after whitespace starts a comment. For tests, benchmarks and custom integrations. |
 | `RIPPLE_EXTRACTORS` | Comma list of the extractors and linkers to run, by name. For debugging and benchmarks. |
 | `RIPPLE_DEBUG` | Logs watcher events and indexing batches to the daemon log. |

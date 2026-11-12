@@ -59,6 +59,10 @@ fn build_then_query() {
 fn edit_then_query_reflects_edit() {
     let repo = chain();
     let d = Daemon::start(&repo.root);
+    // Let the initial index finish first: a write it already sees would not
+    // need a second generation.
+    let (r, _) = d.call("impact", json!({"files": ["lib/a.txt"]}));
+    assert_eq!(impacted_of(&r), vec!["lib/b.txt", "lib/c.txt"]);
     // d now depends on c: impact of a grows by one, without naming d in the request (sync drains the watcher).
     repo.write("app/d.txt", "use lib/c.txt\n");
     let (r, g) = d.call("impact", json!({"files": ["lib/a.txt"], "sync": true}));

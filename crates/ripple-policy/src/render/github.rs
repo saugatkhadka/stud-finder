@@ -1,6 +1,6 @@
 //! GitHub Actions output: workflow-command annotations on stdout, the
 //! markdown report appended to `$GITHUB_STEP_SUMMARY`, and step outputs
-//! (`risk`, `require`, `impacted`, `tests`, `changed`) appended to `$GITHUB_OUTPUT`.
+//! (`risk`, `require`, `impacted`, `impacted_file_level`, `tests`, `changed`) appended to `$GITHUB_OUTPUT`.
 
 use crate::eval::risk_word;
 use crate::report::Report;
@@ -56,10 +56,11 @@ pub fn workflow_commands(report: &Report) -> String {
 /// `key=value` lines for `$GITHUB_OUTPUT`.
 pub fn outputs(report: &Report) -> String {
     format!(
-        "risk={}\nrequire={}\nimpacted={}\ntests={}\nchanged={}\n",
+        "risk={}\nrequire={}\nimpacted={}\nimpacted_file_level={}\ntests={}\nchanged={}\n",
         risk_word(report.risk).to_lowercase(),
         report.require.join(","),
         report.impacted.total,
+        report.impacted.file_level_total,
         report.tests_total(),
         report.changed.len()
     )

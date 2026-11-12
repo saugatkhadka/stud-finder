@@ -21,6 +21,15 @@
 //! * `min_confidence`: edges below it are ignored for this rule's `reaches*`,
 //!   `impacted_files_over`, `crosses_boundary` and `untested`; default is the
 //!   query's effective minimum (config `query.min_confidence` or CLI flag).
+//!
+//! **Method-level seeds.** A [`ChangedFile`] whose `scopes` is `Some(names)`
+//! seeds every impact query above with only those methods / actions (see
+//! [`ripple_core::Graph::impact_scoped`]); `None` seeds the whole file. With
+//! [`EvalOptions::file_level`] every seed is whole-file and edge scopes are
+//! ignored. `untested` follows the same seeds: a whole-file seed keeps the
+//! plain "any test among the file's dependents" walk, a scoped seed asks
+//! whether a test depends on one of the changed methods. The per-file
+//! `dependents` count in the report is always the file-level fan-in.
 
 use crate::changed::{ChangedFile, FileStatus};
 use crate::policy::{CompiledRule, FileClass, Policy, PolicyIndex};
@@ -41,6 +50,8 @@ pub struct EvalOptions {
     /// Keep at most this many entries in `impacted.files` and `tests_to_run`.
     /// Counts and reasons are always computed over the full set.
     pub limit: Option<usize>,
+    /// Ignore method / action scopes: every changed file is wholly changed.
+    pub file_level: bool,
 }
 
 /// Evaluates with default options, classifying the graph on the fly.
@@ -76,6 +87,8 @@ struct Changed {
     /// Areas of the new path and (for renames) the old path.
     touch_areas: Vec<u16>,
     node: Option<NodeId>,
+    /// Effective seed scopes (`None` = whole file).
+    scopes: Option<Vec<String>>,
 }
 
 struct Ctx<'a> {
@@ -83,7 +96,7 @@ struct Ctx<'a> {
     graph: &'a Graph,
     index: &'a PolicyIndex,
     changed: Vec<Changed>,
-    seeds: Vec<NodeId>,
+    seeds: Vec<(NodeId, Option<Vec<String>>)>,
     eff: QueryOpts,
     reaches: Vec<Reach>,
     has_lines: bool,
@@ -127,14 +140,15 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             let class = class_of(&file.path);
             let node = graph.id(&file.path);
             let mut touch_areas = class.areas.clone();
-            seeds.extend(node);
+            let scopes = if opts.file_level || file.status != FileStatus::Modified { None } else { file.scopes.clone() };
+            seeds.extend(node.map(|n| (n, scopes.clone())));
             if let Some(old) = &file.old_path {
                 touch_areas.extend(class_of(old).areas);
-                seeds.extend(graph.id(old));
+                seeds.extend(graph.id(old).map(|n| (n, None)));
             }
             touch_areas.sort_unstable();
             touch_areas.dedup();
-            Changed { file, class, touch_areas, node }
+            Changed { file, class, touch_areas, node, scopes }
         })
         .collect();
     let has_lines = changed.iter().any(|c| c.file.added.is_some() || c.file.deleted.is_some());
@@ -143,7 +157,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     let eff = QueryOpts {
         max_depth: opts.max_depth.unwrap_or(cfg.max_depth),
         min_confidence: opts.min_confidence.unwrap_or(cfg.min_confidence),
-        file_level: false,
+        file_level: opts.file_level,
     };
     let mut ctx = Ctx { policy, graph, index, changed, seeds, eff, reaches: Vec::new(), has_lines };
 
@@ -206,6 +220,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             added: c.file.added,
             deleted: c.file.deleted,
             first_line: c.file.first_line,
+            scopes: c.scopes.clone(),
             language: c.class.language,
             areas: policy.area_names(&c.class.areas),
             dependents: c.node.map(|n| graph.fan_in(n)).unwrap_or(0),
@@ -259,6 +274,8 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             path_confidence: None,
             line: None,
             detail: None,
+            from_scope: None,
+            to_scope: None,
             language: c.class.language,
             areas: policy.area_names(&c.class.areas),
         })
@@ -274,7 +291,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
         }
         let class = ctx.class(hit.node);
         let (_, _, data) = graph.edge(hit.edge);
-        let entry = || ImpactedFile {
+        let entry = || {
+            let (from_scope, to_scope, _) = shown_scopes(graph, hit.edge);
+            ImpactedFile {
             file: graph.path(hit.node).to_string(),
             depth: hit.depth,
             via: Some(graph.path(hit.via).to_string()),
@@ -284,8 +303,11 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             path_confidence: Some(main.minc[i]),
             line: (data.line != 0).then_some(data.line),
             detail: graph.edge_detail(hit.edge).map(str::to_string),
+            from_scope,
+            to_scope,
             language: class.language,
             areas: policy.area_names(&class.areas),
+            }
         };
         summary.max_depth = summary.max_depth.max(hit.depth);
         if class.test {
@@ -305,6 +327,15 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             }
         }
     }
+    // The same query with every file wholly changed, so readers can see how
+    // much the method-level analysis narrowed the result.
+    summary.file_level_total = if eff.file_level {
+        summary.total
+    } else {
+        let whole: Vec<(NodeId, Option<Vec<String>>)> = ctx.seeds.iter().map(|(n, _)| (*n, None)).collect();
+        let imp = graph.impact_scoped(&whole, QueryOpts { file_level: true, ..eff });
+        imp.impacted().filter(|h| !ctx.class(h.node).test).count()
+    };
     if let Some(limit) = opts.limit {
         tests_to_run.truncate(limit); // changed test files may exceed it on their own
         summary.truncated = summary.total > summary.files.len() || tests_total > tests_to_run.len();
@@ -349,13 +380,14 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     warnings.dedup();
 
     let summary_line = format!(
-        "{} risk: {} changed file{}, {} impacted file{}{}, {} test{} to run, {} rule{} fired",
+        "{} risk: {} changed file{}, {} impacted file{}{}{}, {} test{} to run, {} rule{} fired",
         risk_word(risk),
         changed_entries.len(),
         plural(changed_entries.len()),
         summary.total,
         plural(summary.total),
         if summary.total > 0 { format!(" (up to {} hop{})", summary.max_depth, plural(summary.max_depth as usize)) } else { String::new() },
+        if summary.file_level_total != summary.total { format!(" [method-level; {} if whole files are assumed changed]", summary.file_level_total) } else { String::new() },
         tests_total,
         plural(tests_total),
         reasons.len(),
@@ -375,7 +407,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
         areas_reached,
         owners,
         warnings,
-        query: QueryInfo { max_depth: eff.max_depth, min_confidence: eff.min_confidence },
+        query: QueryInfo { max_depth: eff.max_depth, min_confidence: eff.min_confidence, file_level: eff.file_level },
         timing: Timing { refresh_us: 0, query_us, evaluate_us: total_us.saturating_sub(query_us) },
         index: IndexInfo { generation: opts.generation, nodes: graph.node_count(), edges: graph.edge_count(), pending_changes: 0 },
     }
@@ -395,7 +427,43 @@ pub(crate) fn plural(n: usize) -> &'static str {
 }
 
 fn hop0(file: &str) -> Hop {
-    Hop { file: file.to_string(), kind: None, confidence: None, line: None, detail: None }
+    Hop { file: file.to_string(), kind: None, confidence: None, line: None, detail: None, from_scope: None, to_scope: None, inherit: false }
+}
+
+/// `(from_scope, to_scope, inherit)` of an edge as shown to readers: the
+/// class-level marker `@body` is left out, and inheritance edges carry no scopes.
+pub(crate) fn shown_scopes(graph: &Graph, edge: u32) -> (Option<String>, Option<String>, bool) {
+    if graph.edge_inherits(edge) {
+        return (None, None, true);
+    }
+    let (f, t) = graph.edge_scopes(edge);
+    let keep = |s: Option<&str>| s.filter(|s| *s != ripple_core::model::SCOPE_BODY).map(str::to_string);
+    (keep(f), keep(t), false)
+}
+
+/// The hop list of `imp.path(node)` (the file, then each file closer to the change).
+pub fn path_hops(graph: &Graph, imp: &Impact, node: NodeId) -> Vec<Hop> {
+    imp.path(node)
+        .into_iter()
+        .map(|(n, e)| {
+            if e == u32::MAX {
+                hop0(graph.path(n))
+            } else {
+                let (_, _, d) = graph.edge(e);
+                let (from_scope, to_scope, inherit) = shown_scopes(graph, e);
+                Hop {
+                    file: graph.path(n).to_string(),
+                    kind: Some(d.kind),
+                    confidence: Some(d.confidence),
+                    line: (d.line != 0).then_some(d.line),
+                    detail: graph.edge_detail(e).map(str::to_string),
+                    from_scope,
+                    to_scope,
+                    inherit,
+                }
+            }
+        })
+        .collect()
 }
 
 fn tier_word(r: Risk) -> &'static str {
@@ -424,21 +492,16 @@ impl Ctx<'_> {
         if let Some(i) = self.reaches.iter().position(|r| r.conf == conf && covers(r.depth, depth)) {
             return i;
         }
-        let impact = self.graph.impact(&self.seeds, QueryOpts { max_depth: depth, min_confidence: conf, file_level: false });
+        let impact = self.graph.impact_scoped(&self.seeds, QueryOpts { max_depth: depth, min_confidence: conf, file_level: self.eff.file_level });
         let mut root = Vec::with_capacity(impact.hits.len());
         let mut minc = Vec::with_capacity(impact.hits.len());
-        // Hits are in BFS order, so a hit's `via` always precedes it.
-        let mut pos = vec![u32::MAX; self.graph.node_count()];
-        for (i, h) in impact.hits.iter().enumerate() {
-            pos[h.node as usize] = i as u32;
-            if h.depth == 0 {
-                root.push(h.node);
-                minc.push(Confidence::Exact);
-            } else {
-                let p = pos[h.via as usize] as usize;
-                root.push(root[p]);
-                minc.push(minc[p].min(self.graph.edge(h.edge).2.confidence));
-            }
+        // Follow the explanation path, not the `via` chain: with scoped seeds
+        // the file a hit's `via` was first reached from need not be the seed
+        // whose change actually reaches the hit.
+        for h in &impact.hits {
+            let path = impact.path(h.node);
+            root.push(path.last().map_or(h.node, |&(n, _)| n));
+            minc.push(path.iter().filter(|&&(_, e)| e != u32::MAX).map(|&(_, e)| self.graph.edge(e).2.confidence).min().unwrap_or(Confidence::Exact));
         }
         self.reaches.push(Reach { conf, depth, impact, root, minc });
         self.reaches.len() - 1
@@ -462,24 +525,7 @@ impl Ctx<'_> {
     }
 
     fn impact_path(&self, reach: &Reach, node: NodeId) -> ImpactPath {
-        let chain = reach.impact.path(node);
-        let path = chain
-            .iter()
-            .map(|&(n, e)| {
-                if e == u32::MAX {
-                    hop0(self.graph.path(n))
-                } else {
-                    let (_, _, d) = self.graph.edge(e);
-                    Hop {
-                        file: self.graph.path(n).to_string(),
-                        kind: Some(d.kind),
-                        confidence: Some(d.confidence),
-                        line: (d.line != 0).then_some(d.line),
-                        detail: self.graph.edge_detail(e).map(str::to_string),
-                    }
-                }
-            })
-            .collect();
+        let path = path_hops(self.graph, &reach.impact, node);
         ImpactPath { file: self.graph.path(node).to_string(), depth: reach.impact.get(node).map(|h| h.depth).unwrap_or(0), path }
     }
 
@@ -506,16 +552,35 @@ impl Ctx<'_> {
 
     fn untested(&self, conf: Confidence) -> Vec<String> {
         let mut out = Vec::new();
+        let reach = &self.reaches[self.reach_idx(conf, self.eff.max_depth)];
         for c in &self.changed {
             if c.class.test || !c.class.language.is_source() || c.file.status == FileStatus::Deleted {
                 continue;
             }
-            let tested = c.node.is_some_and(|n| self.has_test_dependent(n, conf, self.eff.max_depth));
+            let tested = c.node.is_some_and(|n| match &c.scopes {
+                None => self.has_test_dependent(n, conf, self.eff.max_depth),
+                // Nothing another file can depend on changed.
+                Some(s) if s.is_empty() => true,
+                Some(s) => self.has_scoped_test_dependent(reach, n, s, conf),
+            });
             if !tested {
                 out.push(c.file.path.clone());
             }
         }
         out
+    }
+
+    /// Does a test depend on one of `scopes` of `node`? The shared BFS answers
+    /// "yes" cheaply when it traced a test back to `node`; otherwise (another
+    /// changed file may have reached that test first) ask the graph directly.
+    fn has_scoped_test_dependent(&self, reach: &Reach, node: NodeId, scopes: &[String], conf: Confidence) -> bool {
+        let limit = self.eff.max_depth;
+        let quick = reach.impact.hits.iter().enumerate().any(|(i, h)| reach.root[i] == node && within(h.depth, limit) && self.class(h.node).test);
+        if quick {
+            return true;
+        }
+        let imp = self.graph.impact_scoped(&[(node, Some(scopes.to_vec()))], QueryOpts { max_depth: limit, min_confidence: conf, file_level: false });
+        imp.impacted().any(|h| self.class(h.node).test)
     }
 
     /// Reverse BFS from `node` that stops at the first test file.

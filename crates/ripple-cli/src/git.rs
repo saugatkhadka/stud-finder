@@ -7,10 +7,16 @@
 //!
 //! Renames are detected (`-M`) and reported as one `renamed` entry with
 //! `old_path`; deletions are reported with status `deleted`.
+//!
+//! Each modified file also carries its new-side hunks (from `git diff -U0`),
+//! which the query side maps onto method scopes. For `--staged` the new side
+//! is the index, while the engine indexes the working tree: files that also
+//! have unstaged edits get no hunks (whole-file), since their line numbers
+//! would not match.
 
 use crate::files::run_git;
 use anyhow::{Context, Result};
-use ripple_policy::{ChangedFile, FileStatus};
+use ripple_policy::{ChangedFile, FileStatus, Hunk};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -52,16 +58,27 @@ pub fn changed_files(root: &Path, spec: &DiffSpec) -> Result<Vec<ChangedFile>> {
     let raw = run_git(root, &args)?;
     let mut files = parse_raw_numstat(&raw);
 
-    let mut args = vec!["diff", "-U0", "--no-color", "-M", "--relative", "--no-ext-diff"];
+    // Explicit prefixes: `diff.noprefix` / `diff.mnemonicPrefix` would change them.
+    let mut args = vec!["diff", "-U0", "--no-color", "-M", "--relative", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"];
     if cached {
         args.push("--cached");
     }
     args.push(&target);
     args.push("--");
     if let Ok(patch) = run_git(root, &args) {
-        for (path, line) in first_lines(&patch) {
+        let unstaged: std::collections::HashSet<String> = if cached {
+            run_git(root, &["diff", "--name-only", "-z", "--relative", "--no-ext-diff", "--"])
+                .map(|o| o.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        for (path, hunks) in parse_hunks(&patch) {
             if let Some(f) = files.get_mut(&path) {
-                f.first_line = Some(line);
+                f.first_line = hunks.first().map(|h| h.start.max(1));
+                if f.status == FileStatus::Modified && !unstaged.contains(&path) {
+                    f.hunks = Some(hunks);
+                }
             }
         }
     }
@@ -151,24 +168,65 @@ pub(crate) fn parse_raw_numstat(out: &[u8]) -> BTreeMap<String, ChangedFile> {
     files
 }
 
-/// First changed line in the new version of each file, from `git diff -U0`.
-pub(crate) fn first_lines(patch: &[u8]) -> Vec<(String, u32)> {
+/// Does this removed source line open a definition whose callers may break?
+/// Today's scope ranges are Ruby methods, so this looks for `def`.
+fn opens_definition(line: &str) -> bool {
+    let t = line.trim_start();
+    t == "def" || t.strip_prefix("def").is_some_and(|rest| rest.starts_with([' ', '\t', '(']))
+}
+
+/// New-side hunks per file (in diff order) from `git diff -U0` with `a/` /
+/// `b/` prefixes. Files whose new side is `/dev/null` (deleted) are skipped.
+pub(crate) fn parse_hunks(patch: &[u8]) -> Vec<(String, Vec<Hunk>)> {
     let text = String::from_utf8_lossy(patch);
-    let mut out = Vec::new();
-    let mut current: Option<String> = None;
+    let mut out: Vec<(String, Vec<Hunk>)> = Vec::new();
+    // In the header of a file's section (before its first `@@`), or in a hunk.
+    let mut in_header = false;
+    let mut current = false;
     for line in text.lines() {
-        if let Some(p) = line.strip_prefix("+++ ") {
-            let p = p.trim_matches('"');
-            current = p.strip_prefix("b/").map(str::to_string);
-        } else if let Some(h) = line.strip_prefix("@@ ") {
-            let Some(path) = current.take() else { continue };
-            // "-a,b +c,d @@"
+        if line.starts_with("diff --git ") {
+            in_header = true;
+            current = false;
+            continue;
+        }
+        if in_header {
+            if let Some(p) = line.strip_prefix("+++ ") {
+                let p = p.trim_matches('"');
+                current = match p.strip_prefix("b/") {
+                    Some(path) => {
+                        out.push((path.to_string(), Vec::new()));
+                        true
+                    }
+                    None => false,
+                };
+                continue;
+            }
+            if !line.starts_with("@@ ") {
+                continue;
+            }
+        }
+        if let Some(h) = line.strip_prefix("@@ ") {
+            in_header = false;
+            if !current {
+                continue;
+            }
+            // "-a,b +c,d @@ context"; a missing count means 1.
             let plus = h.split_whitespace().find(|t| t.starts_with('+')).unwrap_or("+1");
             let mut nums = plus[1..].split(',');
             let start: u32 = nums.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-            out.push((path, start.max(1)));
+            let count: u32 = nums.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+            if let Some((_, hunks)) = out.last_mut() {
+                hunks.push(Hunk::new(start, count));
+            }
+        } else if let Some(removed) = line.strip_prefix('-')
+            && current
+            && opens_definition(removed)
+            && let Some(h) = out.last_mut().and_then(|(_, hunks)| hunks.last_mut())
+        {
+            h.removes_definition = true;
         }
     }
+    out.retain(|(_, h)| !h.is_empty());
     out
 }
 
@@ -196,8 +254,14 @@ mod tests {
     }
 
     #[test]
-    fn first_changed_lines() {
-        let patch = b"diff --git a/x.rb b/x.rb\n--- a/x.rb\n+++ b/x.rb\n@@ -3,0 +4,2 @@\n+a\n+b\n@@ -9 +11 @@\n-c\n+d\ndiff --git a/y.rb b/y.rb\n--- a/y.rb\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
-        assert_eq!(first_lines(patch), [("x.rb".to_string(), 4)]);
+    fn hunks_per_file() {
+        let patch = b"diff --git a/x.rb b/x.rb\n--- a/x.rb\n+++ b/x.rb\n@@ -3,0 +4,2 @@\n+a\n+b\n@@ -9 +11 @@\n-c\n+d\n@@ -20,2 +22,0 @@ def run\n-  def gone\n---- not a header\ndiff --git a/y.rb b/y.rb\n--- a/y.rb\n+++ /dev/null\n@@ -1 +0,0 @@\n-def x\ndiff --git a/z.rb b/z.rb\nindex 1..2\n--- a/z.rb\n+++ b/z.rb\n@@ -1,0 +1 @@\n+--- y\n";
+        let h = parse_hunks(patch);
+        let x = |s, c, d| Hunk { start: s, count: c, removes_definition: d };
+        assert_eq!(
+            h,
+            [("x.rb".to_string(), vec![x(4, 2, false), x(11, 1, false), x(22, 0, true)]), ("z.rb".to_string(), vec![x(1, 1, false)])]
+        );
+        assert!(opens_definition("  def self.x") && opens_definition("def(") && !opens_definition("  default = 1") && !opens_definition("# def x"));
     }
 }

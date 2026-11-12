@@ -1,6 +1,6 @@
 //! Compact terminal output, optionally with ANSI colours.
 
-use super::{kind_str, path_line};
+use super::{kind_str, mode_line, path_line, scope_list};
 use crate::eval::{plural, risk_word};
 use crate::report::Report;
 use ripple_core::Risk;
@@ -42,7 +42,12 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
         st.risk(r.risk),
         r.changed.len(),
         r.impacted.total,
-        if r.impacted.total > 0 { format!(" (depth ≤{})", r.impacted.max_depth) } else { String::new() },
+        match (r.impacted.total > 0, !r.query.file_level && r.impacted.file_level_total != r.impacted.total) {
+            (true, true) => format!(" (depth ≤{}; {} if whole files changed)", r.impacted.max_depth, r.impacted.file_level_total),
+            (true, false) => format!(" (depth ≤{})", r.impacted.max_depth),
+            (false, true) => format!(" ({} if whole files changed)", r.impacted.file_level_total),
+            (false, false) => String::new(),
+        },
         r.tests_total(),
         plural(r.tests_total()),
         st.dim(&format!("gen {}", r.index.generation))
@@ -82,6 +87,9 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
         if !c.areas.is_empty() {
             extra.push(format!("[{}]", c.areas.join(",")));
         }
+        if let Some(scopes) = &c.scopes {
+            extra.push(if scopes.is_empty() { "no method changed".into() } else { format!("methods: {}", scope_list(scopes, 4, |s| s.to_string())) });
+        }
         extra.push(if c.in_graph { format!("{} dependent{}", c.dependents, plural(c.dependents)) } else { "not indexed".into() });
         if c.is_global {
             extra.push("GLOBAL".into());
@@ -98,7 +106,12 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
         for f in r.impacted.files.iter().take(max_listed) {
             let via = f.via.as_deref().unwrap_or("");
             let kind = f.kind.map(kind_str).unwrap_or("");
-            let _ = writeln!(o, "  {} {}  {}", f.depth, f.file, st.dim(&format!("<- {via} ({kind})")));
+            let target = f.to_scope.as_deref().map(|t| format!("#{t}")).unwrap_or_default();
+            let file = match &f.from_scope {
+                Some(s) => format!("{}#{s}", f.file),
+                None => f.file.clone(),
+            };
+            let _ = writeln!(o, "  {} {}  {}", f.depth, file, st.dim(&format!("<- {via}{target} ({kind})")));
         }
         let listed = r.impacted.files.len().min(max_listed);
         if r.impacted.total > listed {
@@ -114,5 +127,6 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
         let file = w.file.as_deref().map(|f| format!("{f}: ")).unwrap_or_default();
         let _ = writeln!(o, "{} {file}{}", st.paint("33", "warning:"), w.message);
     }
+    let _ = writeln!(o, "{}", st.dim(&mode_line(r)));
     o
 }

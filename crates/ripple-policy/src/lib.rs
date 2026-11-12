@@ -19,10 +19,10 @@ mod policy;
 pub mod render;
 mod report;
 
-pub use changed::{ChangedFile, FileStatus};
+pub use changed::{ChangedFile, FileStatus, Hunk, scopes_for_hunks};
 pub use defaults::default_rules;
 pub use error::{Issue, PolicyError};
-pub use eval::{EvalOptions, evaluate, evaluate_with};
+pub use eval::{EvalOptions, evaluate, evaluate_with, path_hops};
 pub use lang::{Language, Side};
 pub use load::{CONFIG_FILE_NAMES, LoadedConfig, find_config, load_config, parse_config};
 pub use policy::{CompiledArea, FileClass, Policy, PolicyIndex};

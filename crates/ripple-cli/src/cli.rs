@@ -40,10 +40,13 @@ enum Cmd {
     Dependents(NeighbourArgs),
     /// Files FILE depends on.
     Dependencies(NeighbourArgs),
-    /// Shortest dependency path between two files.
+    /// Shortest dependency path between two files (FROM depends on TO, or the reverse).
     Why {
         from: String,
         to: String,
+        /// Only paths through this method / controller action of TO (repeatable).
+        #[arg(long = "scope", value_name = "NAME")]
+        scopes: Vec<String>,
         #[arg(long, value_enum, default_value_t = OutFormat::Text)]
         format: OutFormat,
     },
@@ -152,6 +155,10 @@ struct QueryArgs {
     depth: Option<u32>,
     #[arg(long, value_enum)]
     min_confidence: Option<ConfArg>,
+    /// Treat every changed file as wholly changed and ignore method / action
+    /// scopes on dependencies (the coarser, wider answer).
+    #[arg(long)]
+    file_level: bool,
 }
 
 #[derive(Args)]
@@ -168,6 +175,10 @@ struct ImpactArgs {
     /// Ask the daemon to wait until every file event before this command is indexed.
     #[arg(long)]
     sync: bool,
+    /// Only this method / controller action of the one file given changed
+    /// (repeatable): "what depends on Purchase#refund!".
+    #[arg(long = "scope", value_name = "NAME")]
+    scopes: Vec<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -201,6 +212,9 @@ struct CheckArgs {
 #[derive(Args)]
 struct NeighbourArgs {
     file: String,
+    /// `dependents` only: start from this method / controller action of FILE (repeatable).
+    #[arg(long = "scope", value_name = "NAME")]
+    scopes: Vec<String>,
     /// Hops to follow (0 = unlimited).
     #[arg(long, default_value_t = 1)]
     depth: u32,
@@ -288,7 +302,7 @@ fn run(cli: Cli) -> Result<u8> {
         Cmd::Check(a) => check(&root, a, cli.no_daemon),
         Cmd::Dependents(a) => neighbours(&root, a, false, open(true)?),
         Cmd::Dependencies(a) => neighbours(&root, a, true, open(true)?),
-        Cmd::Why { from, to, format } => why(&root, &from, &to, format, open(true)?),
+        Cmd::Why { from, to, scopes, format } => why(&root, &from, &to, &scopes, format, open(true)?),
         Cmd::Areas { file, format } => {
             let mut b = open(true)?;
             let out = result_of(b.call("areas", &json!({"file": to_rel(&root, &file)}))?)?;
@@ -336,8 +350,15 @@ fn diff_params(root: &Path, d: &DiffArgs) -> Result<ImpactParams> {
 
 fn impact(root: &Path, a: ImpactArgs, mut backend: Backend) -> Result<u8> {
     let mut p = diff_params(root, &a.diff)?;
+    if !a.scopes.is_empty() {
+        if p.files.len() != 1 {
+            bail!("--scope needs exactly one changed file given explicitly (ripple impact --files FILE --scope NAME)");
+        }
+        p.scopes = a.scopes.clone();
+    }
     p.max_depth = a.query.depth;
     p.min_confidence = a.query.min_confidence.map(Into::into);
+    p.file_level = a.query.file_level;
     p.format = a.format;
     p.color = a.format == Format::Text && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     p.limit = a.limit;
@@ -374,6 +395,7 @@ fn check(root: &Path, a: CheckArgs, no_daemon: bool) -> Result<u8> {
     let mut p = diff_params(root, &diff)?;
     p.max_depth = a.query.depth;
     p.min_confidence = a.query.min_confidence.map(Into::into);
+    p.file_level = a.query.file_level;
     p.format = Format::Json;
     // CI never autostarts a daemon, but uses one that is already running.
     let mut backend = Backend::open(root, no_daemon, false)?;
@@ -416,13 +438,16 @@ fn word(r: Risk) -> String {
 }
 
 fn neighbours(root: &Path, a: NeighbourArgs, forward: bool, mut b: Backend) -> Result<u8> {
-    let params = json!({"file": to_rel(root, &a.file), "depth": a.depth, "min_confidence": a.min_confidence.map(Confidence::from)});
+    if forward && !a.scopes.is_empty() {
+        bail!("--scope applies to `dependents`, not `dependencies`");
+    }
+    let params = json!({"file": to_rel(root, &a.file), "scopes": a.scopes, "depth": a.depth, "min_confidence": a.min_confidence.map(Confidence::from)});
     let out = result_of(b.call(if forward { "dependencies" } else { "dependents" }, &params)?)?;
     print_value(&out, a.format, crate::output::neighbours)
 }
 
-fn why(root: &Path, from: &str, to: &str, format: OutFormat, mut b: Backend) -> Result<u8> {
-    let out = result_of(b.call("why", &json!({"from": to_rel(root, from), "to": to_rel(root, to)}))?)?;
+fn why(root: &Path, from: &str, to: &str, scopes: &[String], format: OutFormat, mut b: Backend) -> Result<u8> {
+    let out = result_of(b.call("why", &json!({"from": to_rel(root, from), "to": to_rel(root, to), "scopes": scopes}))?)?;
     print_value(&out, format, crate::output::why)
 }
 
