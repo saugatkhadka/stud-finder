@@ -10,7 +10,7 @@ use crate::files::{self, Listing};
 use anyhow::Result;
 use ripple_core::model::ScopeRange;
 use ripple_core::{ChangeSet, Edge, ExtractOutput, Extractor, Facts, Graph, Linker, RelPath, Warning, Workspace};
-use ripple_policy::{CONFIG_FILE_NAMES, Policy, PolicyIndex};
+use ripple_policy::{Policy, PolicyIndex};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -321,7 +321,7 @@ impl Engine {
         let mut config = false;
         let mut case = files::ExactCase::new(&self.root);
         for p in paths {
-            if CONFIG_FILE_NAMES.contains(&p.as_str()) {
+            if ripple_policy::is_config_file(&self.root, p.as_str()) {
                 config = true;
             }
             let abs = self.root.join(p);

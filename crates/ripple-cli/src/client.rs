@@ -83,12 +83,12 @@ pub fn spawn_daemon(root: &Path, paths: &DaemonPaths) -> Result<()> {
     paths.create_dir()?;
     let exe = std::env::current_exe().context("locating the ripple executable")?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&paths.log)?;
-    Command::new(exe)
-        .arg("serve")
-        .arg("--foreground")
-        .arg("--root")
-        .arg(root)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(exe);
+    cmd.arg("serve").arg("--foreground").arg("--root").arg(root);
+    if let Some(cfg) = ripple_policy::config_override() {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
         .process_group(0)

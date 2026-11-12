@@ -259,7 +259,7 @@ mod tests {
         assert!(p.is_ignored("node_modules/react/index.js"));
         assert!(!p.is_ignored("app/x.js"));
         assert!(p.uses_default_rules());
-        assert_eq!(p.rules().count(), 8);
+        assert_eq!(p.rules().count(), 14);
     }
 
     #[test]

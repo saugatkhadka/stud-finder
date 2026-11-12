@@ -42,8 +42,9 @@ fn build_then_query() {
     assert_eq!(impacted_of(&r), vec!["lib/b.txt", "lib/c.txt"]);
     assert_eq!(r["tests"][0]["file"], "spec/a_spec.txt");
     assert_eq!(r["tests"].as_array().unwrap().len(), 1);
-    // reaches critical area `core` at depth 2 -> medium (default rule), not high (that needs 1 hop).
-    assert_eq!(risk_of(&r), "medium");
+    // reaches critical area `core` at depth 2 -> low (default rule), not medium (that needs 1 hop).
+    assert_eq!(risk_of(&r), "low");
+    assert!(r["policy"]["reasons"].as_array().unwrap().iter().any(|x| x["rule"] == "default.reaches_critical"), "{}", r["policy"]);
     let (deps, _) = d.call("dependents", json!({"file": "lib/a.txt"}));
     assert_schema(&deps);
     let direct: Vec<&str> = deps["dependents"].as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap()).collect();

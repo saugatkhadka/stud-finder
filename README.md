@@ -50,22 +50,24 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 
 | Command | What it does |
 |---|---|
-| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--all` (list everything), `--limit N` (cap every list; counts stay exact), `--sync` (wait until every earlier edit is indexed, however long that takes), `--no-wait` (answer from the current index at once; may be marked stale), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
+| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--all` (list everything), `--limit N` (cap every list but `changed`; counts stay exact), `--sync` (wait until every earlier edit is indexed, however long that takes), `--no-wait` (answer from the current index at once; may be marked stale), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
 | `check --base REF` | CI entry point. `--format github\|markdown\|json\|text` (github is the default under `GITHUB_ACTIONS`), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`, `--file-level`. Never starts a daemon, but uses one that is already running. |
 | `dependents FILE` | The `impact` report of FILE as if it had changed (same sections and budgets). `--scope NAME` (repeatable): as if only that method / action changed. `--depth N`, `--all`, `--limit N`, `--format text\|json`. |
 | `dependencies FILE` | Direct dependencies; `--depth N` (0 = all). |
 | `schema` | Print the JSON Schema of the report (`schema_version` 2). |
 | `why FROM TO` | Shortest dependency path between two files, in either direction. `--scope NAME`: only paths into that method / action of TO (says so when only a file-level path exists). |
 | `areas FILE` | How `ripple.yml` classifies a file: areas, test, global, language. |
-| `file FILE` | One file's profile in at most ~40 lines: language, areas / tier / owners, test and global flags, size and complexity, the 5 most complex methods with line ranges (and their coverage), churn, coverage and uncovered methods, dependents (count and the most depended-on few), dependencies, direct tests, co-change partners, hotspot rank and the state of every signal. `--format text\|json`. |
-| `rank` | Riskiest files first (see [Hotspot ranking](#hotspot-ranking)). `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`, `--format text\|json`. Each row says why it ranks where it does. |
+| `file FILE` | One file's profile in at most ~40 lines: language, areas / tier / owners, test and global flags, size and complexity, the 5 most complex methods with line ranges (and their coverage), churn, coverage and uncovered methods, dependents (count and the most depended-on few), dependencies, direct tests, co-change partners, hotspot rank and the state of every signal. `--format text\|json`. On a freshly started daemon it waits up to 5 s for git history, coverage and the ranking (`--no-wait`: answer at once); what is still not ready is named on a `not ready:` line. |
+| `rank` | Riskiest files first (see [Hotspot ranking](#hotspot-ranking)). `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`, `--format text\|json`. Each row says why it ranks where it does. Waits up to 5 s for git history and coverage to load (`--no-wait`: answer at once); with no ranking yet it says `ranking not ready: …` and exits 4. |
 | `stats` | Index size, scope ranges (`files_with_scopes`, `scopes`), per-phase timings, extractor counters, warnings, daemon info. |
 | `init [--force]`, `config check` | Starter config; validation plus how many files each area matches. |
 | `daemon status\|start\|stop`, `serve [--foreground]` | Manage the daemon. |
 | `history build`, `history status` | Build or update the git-history sidecar now (one-shot mode only reads it); show its state, size, and whether co-change is on. See [Git history in the daemon](#git-history-in-the-daemon). |
 
 Global flags: `--root DIR` (or `RIPPLE_ROOT`; default is the enclosing git
-work tree) and `--no-daemon` (index in this process).
+work tree), `--config PATH` (or `RIPPLE_CONFIG`; use this file instead of
+`<root>/ripple.yml`; the file must exist, and a separate daemon, keyed by
+root and config path, serves it) and `--no-daemon` (index in this process).
 
 Paths can be given relative to the current directory or as absolute paths.
 They are normalised to paths relative to the repository root.
@@ -78,6 +80,7 @@ They are normalised to paths relative to the repository root.
 | 1 | `check` found a risk at or above the fail-on level |
 | 2 | Usage error, configuration error, bad git ref, file not in the index, or internal error |
 | 3 | `daemon status` found no daemon running |
+| 4 | `rank` has no ranking yet: git history or coverage was still loading after the wait (or at once with `--no-wait`); it prints `ranking not ready: …` (JSON: `"ready": false`, `"not_ready"`) instead of an empty list |
 
 ### What `--base` compares
 
@@ -127,7 +130,8 @@ ripple: ripple.yml: invalid configuration:
 | `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
 | `history` | see right | Co-change from git history ("usually changes with this"), a separate signal that is never a graph edge and never feeds risk: `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`; bigger commits are sweeps), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). Defaults chosen by `ripple-eval` replay. |
 | `coverage` | see right | Existing test-coverage reports, read and never produced (ripple never runs tests): `enabled` (`true`), `paths` (`[]` = auto-detect `coverage/.resultset.json`, `coverage/lcov.info`, `coverage/lcov/*.lcov`, `coverage/coverage-final.json`; entries are files, directories or `*` globs in the last component), `max_age_days` (none; older reports are labelled stale, not hidden). |
-| `rank.hotspot_percent` | `5` | Files in this top share of `ripple rank` are hotspots (the `hotspot` rule condition, `metrics.hotspot.hotspot`). |
+| `rank.hotspot_percent` | `1` | Files in this top share of `ripple rank` are hotspots (the `hotspot` rule condition, `metrics.hotspot.hotspot`). |
+| `rank.weights` | `churn: 3`, `complexity: 1`, `dependents: 0.5`, `uncovered: 1` | Weights of the factors of the `ripple rank` score (see [Hotspot ranking](#hotspot-ranking)); each 0 or more, `complexity` or `dependents` above 0. |
 | `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
 
 **Globs** follow gitignore conventions:
@@ -160,10 +164,10 @@ All the conditions in a rule must hold for it to fire. A rule with an empty
 | `within: N` | Limits `reaches` and `reaches_tier` to N hops. The default is `query.max_depth`. |
 | `impacted_files_over: N` | There are more than N impacted non-test files. Changed files are not counted. |
 | `changed_files_over: N` | There are more than N changed files, not counting ignored ones. |
-| `changed_lines_over: N` | There are more than N added plus deleted lines. Never fires without a diff (for example with `impact FILES`). |
+| `changed_lines_over: N` | There are more than N added plus deleted lines. Never fires without a diff (for example with `impact FILES`). Next to a per-file condition (below) or `untested: true`, it counts the lines of that same file: `{complexity_over: 300, changed_lines_over: 20}` skips a one-line edit to a huge file. |
 | `crosses_boundary: true\|false` | An impacted file is on the other side of the Ruby/JS boundary from the changed file it traces back to. Ruby files and templates are the server side; JS/TS files are the client side. |
 | `touches_global: true\|false` | A changed file matches `global_files`. |
-| `untested: true\|false` | A changed, non-deleted source file has no test among its transitive dependents. |
+| `untested: true\|false` | A changed, non-deleted source file has no test among its transitive dependents. With `true` next to a per-file condition or `changed_lines_over`, it must be that same file (`{untested: true, changed_lines_over: 50}`: a source file with no tests got more than 50 changed lines). |
 | `min_confidence: C` | For this rule, ignores edges below C in `reaches*`, `impacted_files_over`, `crosses_boundary` and `untested`. |
 | `churn_over: N` | A changed source file (not a test, not deleted) changed in more than N commits in the last 90 days of the history window. |
 | `complexity_over: N` | A changed source file's complexity (sum of its methods' plus decisions outside methods) is above N. |
@@ -173,6 +177,17 @@ All the conditions in a rule must hold for it to fire. A rule with an empty
 | `uncovered: true\|false` | A changed source file has known 0% coverage. With `uncovered_includes_unknown: true`, a file in no report counts too. |
 | `hotspot: true\|false` | A changed source file is in the top `rank.hotspot_percent` of `ripple rank`. |
 | `missing_cochange: true\|false` | A file outside the diff changed together with a changed file in at least `cochange_min_confidence` (0–1, default `0.5`) of that file's commits (from git history; graph neighbours count too). |
+
+**Per-file conditions.** `churn_over`, `complexity_over`,
+`max_method_complexity_over`, `coverage_under`, `changed_lines_coverage_under`,
+`uncovered: true` and `hotspot: true` (and, next to any of them,
+`untested: true` and `changed_lines_over`) must all hold on **the same**
+changed file: a churny file plus a different complex file does not satisfy
+`{churn_over: 20, complexity_over: 300}`. The reason names the files that
+satisfy all of them, for example
+`complexity above 300 and more than 20 changed lines in the same file: \`app/models/purchase.rb\` (complexity 433, 57 lines changed)`.
+`uncovered: false` and `hotspot: false` hold when no changed file is
+uncovered / a hotspot.
 
 The last eight read **signals** besides the graph: complexity (from the
 index), churn and co-change (git history), coverage (existing reports) and
@@ -188,12 +203,29 @@ rule's reason names the files and numbers, for example
 |---|---|---|---|
 | `default.touches_critical` | Touches an area of tier critical | critical | `human_review` |
 | `default.touches_high` | Touches an area of tier high or above | high | `human_review` |
-| `default.touches_global` | Touches a global file | high | `run_full_suite` |
-| `default.reaches_critical_direct` | Reaches a critical area within 1 hop | high | — |
-| `default.reaches_critical` | Reaches a critical area at any depth | medium | — |
-| `default.impacted_over_200` | More than 200 impacted files | high | — |
-| `default.impacted_over_50` | More than 50 impacted files | medium | — |
-| `default.crosses_boundary` | Crosses the Ruby/JS boundary | medium | — |
+| `default.complex_file` | One changed file: complexity over 150 and over 20 changed lines | high | `human_review` |
+| `default.hotspot_churning` | One changed file: hotspot and churn over 10 | high | `human_review` |
+| `default.hotspot_change` | One changed file: hotspot and over 10 changed lines | high | `human_review` |
+| `default.impacted_over_1500` | More than 1500 impacted files | high | `run_full_suite` |
+| `default.impacted_over_200` | More than 200 impacted files | medium | — |
+| `default.reaches_critical_direct` | Reaches a critical area within 1 hop | medium | — |
+| `default.complex_method` | One changed file: a method over 25 and over 10 changed lines | medium | — |
+| `default.untested_change` | One changed file: no test reaches it and over 50 changed lines | medium | `add_tests` |
+| `default.reaches_critical` | Reaches a critical area at any depth | low | — |
+| `default.touches_global` | Touches a global file | low | `run_full_suite` |
+| `default.missing_cochange` | A usual co-change partner (confidence 0.7+) is missing | low | `check_cochange_partners` |
+| `default.crosses_boundary` | Crosses the Ruby/JS boundary | low | — |
+
+The built-in metric rules skip quietly (no warning) until history and
+metrics are ready. The thresholds come from replaying about 300 recent
+commits each of two Rails apps (Gumroad, Mastodon) with these thresholds
+(and medium-risk area rules): they put 21% of Gumroad's and 5% of Mastodon's commits
+at high or above, and those commits were followed by a fix to the same
+files about three times as often as the rest (63% vs 22%, 40% vs 7%).
+Global files and boundary crossings fire on a large share of ordinary
+commits (5–70%), so on their own they only add their required action.
+No single generic set put both apps in a 10–15% band; tune
+`complexity_over` and `impacted_files_over` to your codebase.
 
 If no rule fires, the risk is low.
 
@@ -260,7 +292,8 @@ subset of file-level ones:
 `ripple schema` prints its JSON Schema (draft 2020-12). The report is
 deterministic, apart from `timing`. Every list is cut to a small budget
 (see below) and its exact size is in `counts`. `--all` lists everything, and
-`--limit N` caps every list at N.
+`--limit N` caps every list at N, except `changed`, which keeps at least
+its default budget (a larger N raises it).
 
 ### JSON shape
 
@@ -351,7 +384,7 @@ What each section means:
   described under Configuration.
 - **`changed[].metrics`** (source files: not tests, not deleted, not "other"; each part absent when
   unknown or its signal is not ready):
-  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, percentile, hotspot}}`.
+  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, of, percentile, hotspot}}`.
   `coverage` is absent for a file in no report (unknown, not 0%); `hotspot`
   is present only for a hotspot (`ripple file` shows any file's rank);
   `changed_lines_percent` needs a diff; `stale` (only when true) means the
@@ -437,7 +470,7 @@ Warning codes include:
   - The socket, lock file and log live in `$RIPPLE_SOCKET_DIR`, else
     `$XDG_RUNTIME_DIR/ripple`, else `/tmp/ripple-$UID`. The directory has mode
     0700 and must be owned by you. The files are named
-    `<fnv1a64(canonical root)>.sock|.lock|.log`. Socket paths are limited to
+    `<fnv1a64(canonical root [+ NUL + --config path])>.sock|.lock|.log`. Socket paths are limited to
     100 bytes; if the path would be longer, ripple says so and runs
     in-process.
   - An exclusive `flock` on the `.lock` file makes the daemon a singleton.
@@ -531,12 +564,16 @@ replies say `"state": "building"` and carry no history data.
   shallow clone, or git failed; the reason is given). Churn and co-change
   are flagged separately (`churn_available`, `cochange` +
   `cochange_reason`).
-- **Sidecar.** `<git common dir>/ripple/history.bin`, shared by linked
-  worktrees and written atomically (temporary file + rename). A daemon
-  starts from it at once. If it is behind HEAD, it is updated
-  incrementally (only the new commits are read) when the old head is an
-  ancestor, and rebuilt otherwise. An unreadable or corrupt file is
-  rebuilt.
+- **Sidecar.** `<git common dir>/ripple/history.bin` for the main work
+  tree and `history-<name>.bin` next to it for a linked worktree (`<name>`
+  as in `.git/worktrees/<name>`), written atomically (temporary file +
+  rename). Each work tree writes only its own file, so worktrees at
+  diverged HEADs do not overwrite each other's cache. A daemon starts from
+  its own file at once, or, if that is missing or unusable, from any
+  sibling's file whose head is an ancestor of its HEAD. If the file is
+  behind HEAD, it is updated incrementally (only the new commits are read);
+  with no usable file, it is rebuilt. An unreadable or corrupt file is
+  rebuilt. Files of removed worktrees are deleted on the next save.
 - **Updates.** HEAD moves are taken from the existing watcher (`HEAD`,
   `refs/heads/*` and `packed-refs`) and from the diff cache's HEAD check.
   They are debounced (500 ms), and deferred while a rebase, cherry-pick or
@@ -586,15 +623,15 @@ memory).
 ### Hotspot ranking
 
 `ripple rank` scores non-test Ruby and JS/TS files of the index. The formula
-lives in one place, `RANK_FORMULA` in `crates/ripple-cli/src/signals.rs`, and
-`rank --format json` prints it:
+lives in one place, `rank_formula` in `crates/ripple-cli/src/signals.rs`, and
+`rank --format json` prints it with the weights in effect:
 
 ```
-score = 100 * (2*churn + 2*complexity + 1*dependents + 1*uncovered) / (sum of the weights used)
+score = 100 * (3*churn + 1*complexity + 0.5*dependents + 1*uncovered) / (sum of the weights used)
 churn      = percentile of (commits in the last 90 days, then all commits in the window)
 complexity = mean(percentile of file complexity, percentile of the most complex method);
              a file without methods counts 0 for both (the max-method guard)
-dependents = percentile of direct dependents (fan-in)
+dependents = percentile of direct non-test dependents (fan-in)
 uncovered  = 1 - line coverage, only for files in a coverage report (else the weight is dropped;
              churn's too when git history is unavailable)
 percentile(x) = share of ranked files with a strictly smaller value
@@ -602,6 +639,12 @@ hotspot    = rank <= ceil(files * rank.hotspot_percent / 100)
 ```
 
 Percentiles rather than raw products keep one huge value from dominating.
+The default weights (`rank.weights` in `ripple.yml`) come from a replay of 301
+commits each of Mastodon and Gumroad, scored by which files later fix commits
+touched: churn predicted best and dependents worst. With 3/1/0.5 the score
+finds as many fix-touched files as churn alone in the top 5% (Gumroad 37% vs
+34%, Mastodon 26% vs 26%) and more in the top 20% (69% vs 64%, 58% vs 53%);
+the previous 2/2/1 trailed churn alone at the top.
 The ranking is computed lazily, once per (index generation, history head,
 coverage load), and cached. `impact` never computes it: it uses the cached
 ranking and starts one background recompute when the cache is out of date
@@ -724,6 +767,7 @@ per-extractor counters.
 | Variable | Effect |
 |---|---|
 | `RIPPLE_ROOT` | Repository root, the same as `--root`. |
+| `RIPPLE_CONFIG` | Config file, the same as `--config`. |
 | `RIPPLE_NO_DAEMON=1` | Disables daemon autostart. `CI` and `GITHUB_ACTIONS` do the same. |
 | `RIPPLE_SOCKET_DIR` | Directory for the socket, lock and log files. |
 | `NO_COLOR` | Plain text output. |

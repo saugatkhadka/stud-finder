@@ -518,7 +518,12 @@ fn rank(snap: &Arc<Snapshot>, p: &RankParams, src: &Sources) -> QueryResult {
     let (churn, cochange) = src.history_status();
     let signals = signal_states(snap, ripple_policy::Signals { complexity: ripple_policy::SignalStatus::ready(), churn, cochange, coverage: src.coverage.status(), hotspot });
     let Some(r) = ranking else {
-        return to_json(&json!({"by": by, "formula": crate::signals::RANK_FORMULA, "files": 0, "matching": 0, "rows": [], "signals": signals}));
+        // Not an empty ranking: say why there is none yet.
+        let why = match &signals.hotspot.reason {
+            Some(r) => format!("ranking not ready: {r}; try again in a moment"),
+            None => format!("ranking not ready ({})", signals.hotspot.state.as_str()),
+        };
+        return to_json(&json!({"ready": false, "not_ready": why, "by": by, "formula": crate::signals::rank_formula(&snap.policy.config.rank.weights), "files": null, "matching": null, "rows": [], "signals": signals}));
     };
     let mut rows: Vec<&crate::signals::RankRow> = r.rows.iter().filter(|x| filter.is_match(&x.path) && area.is_none_or(|a| x.areas.contains(&a))).collect();
     match by {
@@ -542,8 +547,9 @@ fn rank(snap: &Arc<Snapshot>, p: &RankParams, src: &Sources) -> QueryResult {
         })
         .collect();
     to_json(&json!({
+        "ready": true,
         "by": by,
-        "formula": crate::signals::RANK_FORMULA,
+        "formula": crate::signals::rank_formula(&snap.policy.config.rank.weights),
         "files": r.rows.len(),
         "matching": matching,
         "hotspot_percent": r.hotspot_percent,

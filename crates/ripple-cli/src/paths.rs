@@ -63,9 +63,15 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 }
 
 impl DaemonPaths {
-    /// Paths for `root`, which must already be canonical. Does not create anything.
+    /// Paths for `root`, which must already be canonical. Does not create
+    /// anything. A `--config` file gets its own daemon (it is part of the hash).
     pub fn for_root(root: &Path) -> Result<Self> {
-        let hash = format!("{:016x}", fnv1a64(root.as_os_str().as_encoded_bytes()));
+        let mut key = root.as_os_str().as_encoded_bytes().to_vec();
+        if let Some(cfg) = ripple_policy::config_override() {
+            key.push(0);
+            key.extend_from_slice(cfg.as_os_str().as_encoded_bytes());
+        }
+        let hash = format!("{:016x}", fnv1a64(&key));
         let dirs = candidate_dirs();
         let dir = dirs
             .iter()

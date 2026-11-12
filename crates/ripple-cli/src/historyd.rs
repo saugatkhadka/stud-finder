@@ -42,10 +42,17 @@
 //!
 //! # Sidecar
 //!
-//! `<git common dir>/ripple/history.bin`, shared by the work trees of one
-//! repository, written atomically (temp file + rename) after every build or
-//! update. One-shot mode (`--no-daemon`) only reads it; `ripple history
-//! build` writes it in the foreground.
+//! `<git common dir>/ripple/history.bin` for the main work tree and
+//! `<git common dir>/ripple/history-<name>.bin` for a linked work tree
+//! (`<name>` as in `.git/worktrees/<name>`), written atomically (temp file +
+//! rename) after every build or update. Each work tree writes only its own
+//! file, so two work trees at diverged HEADs no longer overwrite each
+//! other's cache and rebuild in turn; they still share work: when its own
+//! file is missing or unusable, a work tree starts from any sibling's file
+//! whose head is an ancestor of its HEAD (an incremental update instead of
+//! a full build). Files of work trees that no longer exist are removed on
+//! save. One-shot mode (`--no-daemon`) only reads them; `ripple history
+//! build` writes the work tree's own file in the foreground.
 
 use crate::engine::Snapshot;
 use anyhow::{Context, Result, bail};
@@ -60,7 +67,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The sidecar, relative to the git common dir.
+/// The main work tree's sidecar, relative to the git common dir.
 pub const SIDECAR: &str = "ripple/history.bin";
 /// Quiet period after the last HEAD move before updating.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -400,8 +407,77 @@ impl GitDirs {
         Ok(Self { gitdir: PathBuf::from(g), common: PathBuf::from(c), shallow: s.trim() == "true" })
     }
 
+    /// This work tree's sidecar: `history.bin` for the main work tree,
+    /// `history-<name>.bin` for a linked one.
     pub fn sidecar(&self) -> PathBuf {
-        self.common.join(SIDECAR)
+        match self.linked_name() {
+            None => self.common.join(SIDECAR),
+            Some(name) => self.common.join(format!("ripple/history-{name}.bin")),
+        }
+    }
+
+    /// `<name>` of `<common>/worktrees/<name>` for a linked work tree.
+    fn linked_name(&self) -> Option<String> {
+        let parent = self.gitdir.parent()?;
+        if self.gitdir == self.common || parent.file_name()? != "worktrees" || parent.parent()? != self.common {
+            return None;
+        }
+        Some(self.gitdir.file_name()?.to_string_lossy().into_owned())
+    }
+
+    /// This work tree's sidecar first, then the other work trees' (newest first).
+    pub fn sidecar_candidates(&self) -> Vec<PathBuf> {
+        let own = self.sidecar();
+        let mut others: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(self.common.join("ripple"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p != &own && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("history") && n.ends_with(".bin")))
+            .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH), p))
+            .collect();
+        others.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        std::iter::once(own).chain(others.into_iter().map(|(_, p)| p)).collect()
+    }
+
+    /// Removes the sidecars of linked work trees that no longer exist.
+    fn prune_sidecars(&self) {
+        for e in std::fs::read_dir(self.common.join("ripple")).into_iter().flatten().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if let Some(name) = n.strip_prefix("history-").and_then(|r| r.strip_suffix(".bin"))
+                && !self.common.join("worktrees").join(name).is_dir()
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    /// Saves `h` as this work tree's sidecar (and prunes stale ones).
+    fn save(&self, h: &History) -> Result<PathBuf> {
+        let p = self.sidecar();
+        h.save(&p).with_context(|| format!("writing {}", p.display()))?;
+        self.prune_sidecars();
+        Ok(p)
+    }
+
+    /// The first candidate sidecar with these options whose head is HEAD or
+    /// an ancestor of it. `Err` describes why this work tree's own file was
+    /// not usable (`None` = it does not exist) when none is.
+    fn load_usable(&self, root: &Path, opts: &ripple_history::Options, head: &str) -> Result<(History, PathBuf), Option<String>> {
+        let mut own_problem = None;
+        for (i, p) in self.sidecar_candidates().into_iter().enumerate() {
+            let why = match History::load(&p) {
+                Ok(h) if h.options() != opts => "was built with other settings".to_string(),
+                Ok(h) if h.head() == head || ripple_history::is_ancestor(root, h.head(), head).unwrap_or(false) => return Ok((h, p)),
+                Ok(_) => "is for another line of history".to_string(),
+                Err(_) if !p.exists() => continue,
+                Err(e) => format!("is unreadable ({e:#})"),
+            };
+            if i == 0 {
+                own_problem = Some(why);
+            }
+        }
+        Err(own_problem)
     }
 
     /// A rebase, `git am` or cherry-pick / revert sequence is running.
@@ -666,7 +742,7 @@ impl HistoryD {
                 return;
             }
         };
-        let sidecar = dirs.sidecar();
+        let mut sidecar = dirs.sidecar();
         let mut cur: Option<Arc<History>> = None;
         let mut info = BuildInfo::default();
         let mut seen = 0u64;
@@ -696,22 +772,24 @@ impl HistoryD {
             }
             let t = Instant::now();
             if cur.is_none() {
-                match History::load(&sidecar) {
-                    Ok(h) if h.options() == &opts && (h.head() == head || ripple_history::is_ancestor(&self.root, h.head(), &head).unwrap_or(false)) => {
+                match dirs.load_usable(&self.root, &opts, &head) {
+                    Ok((h, from)) => {
                         let h = Arc::new(h);
-                        info = BuildInfo { from_sidecar: true, build_ms: t.elapsed().as_millis() as u64, finished_unix: now_unix(), sidecar_bytes: file_len(&sidecar), ..BuildInfo::default() };
-                        self.publish_ready(&h, &sidecar, &info, h.head() != head);
+                        let note = (from != sidecar).then(|| format!("started from {}", from.display()));
+                        info = BuildInfo { from_sidecar: true, build_ms: t.elapsed().as_millis() as u64, finished_unix: now_unix(), sidecar_bytes: file_len(&from), note, ..BuildInfo::default() };
+                        self.publish_ready(&h, &from, &info, h.head() != head);
                         cur = Some(h);
                         if cur.as_ref().is_some_and(|h| h.head() == head) {
                             continue;
                         }
                     }
-                    Ok(_) => info.note = Some("sidecar was for other options or another line of history; rebuilt".into()),
-                    Err(e) if sidecar.exists() => {
-                        eprintln!("ripple: ignoring the history cache {} ({e:#}); rebuilding", sidecar.display());
-                        info.note = Some(format!("unreadable sidecar rebuilt: {e:#}"));
+                    Err(Some(why)) => {
+                        if why.starts_with("is unreadable") {
+                            eprintln!("ripple: the history cache {} {why}; rebuilding", sidecar.display());
+                        }
+                        info.note = Some(format!("sidecar {why}; rebuilt"));
                     }
-                    Err(_) => {}
+                    Err(None) => {}
                 }
             }
             let job = if cur.is_some() { Job::Update } else { Job::Build };
@@ -736,8 +814,9 @@ impl HistoryD {
                     let counter = if st.incremental { &self.counters.updates } else { &self.counters.builds };
                     counter.fetch_add(1, Ordering::Relaxed);
                     let build_ms = t.elapsed().as_millis() as u64;
-                    if let Err(e) = h.save(&sidecar) {
-                        eprintln!("ripple: could not write the history cache {}: {e:#}", sidecar.display());
+                    match dirs.save(&h) {
+                        Ok(p) => sidecar = p,
+                        Err(e) => eprintln!("ripple: could not write the history cache: {e:#}"),
                     }
                     if debug {
                         eprintln!("ripple: history at {} ({} commits, walked {}, incremental {}) in {build_ms} ms", h.head(), h.commit_count(), st.walked, st.incremental);
@@ -823,24 +902,17 @@ pub fn oneshot_view(root: &Path, cfg: &Config) -> View {
         Ok(d) => d,
         Err(r) => return View::new(State::Unavailable(r)),
     };
-    let sidecar = dirs.sidecar();
     let rebuild = "run `ripple history build`";
-    let h = match History::load(&sidecar) {
-        Ok(h) => h,
-        Err(_) if !sidecar.exists() => return View::new(State::Unavailable(format!("no history cache; {rebuild}"))),
-        Err(e) => return View::new(State::Unavailable(format!("history cache unreadable ({e:#}); {rebuild}"))),
-    };
-    if h.options() != &options_for(cfg) {
-        return View::new(State::Unavailable(format!("history cache was built with other settings; {rebuild}")));
-    }
     let head = match head_of(root) {
         Ok(h) => h,
         Err(r) => return View::new(State::Unavailable(r)),
     };
+    let (h, sidecar) = match dirs.load_usable(root, &options_for(cfg), &head) {
+        Ok(found) => found,
+        Err(None) => return View::new(State::Unavailable(format!("no history cache; {rebuild}"))),
+        Err(Some(why)) => return View::new(State::Unavailable(format!("history cache {why}; {rebuild}"))),
+    };
     let behind = h.head() != head;
-    if behind && !ripple_history::is_ancestor(root, h.head(), &head).unwrap_or(false) {
-        return View::new(State::Unavailable(format!("history cache is for another line of history; {rebuild}")));
-    }
     let h = Arc::new(h);
     View {
         state: State::Ready,
@@ -864,7 +936,6 @@ pub fn cli_build(root: &Path, at: Option<&str>) -> Result<u8> {
     if dirs.shallow {
         bail!("{SHALLOW}");
     }
-    let sidecar = dirs.sidecar();
     let head = match at {
         Some(rev) => ripple_history::resolve_rev(root, rev)?,
         None => head_of(root).map_err(|r| anyhow::anyhow!("{r}"))?,
@@ -872,18 +943,25 @@ pub fn cli_build(root: &Path, at: Option<&str>) -> Result<u8> {
     let opts = options_for(&cfg);
     let no = AtomicBool::new(false);
     let t = Instant::now();
-    let (h, how) = match History::load(&sidecar) {
-        Ok(old) => {
+    let own = dirs.sidecar();
+    let (h, how) = match dirs.load_usable(root, &opts, &head) {
+        Ok((old, from)) => {
             let (h, st) = old.update(root, &head, &opts, &no)?;
-            let how = if st.incremental { format!("updated ({} new commits)", st.walked) } else { format!("rebuilt ({})", st.reason.unwrap_or_default()) };
+            let mut how = if st.incremental { format!("updated ({} new commits)", st.walked) } else { format!("rebuilt ({})", st.reason.unwrap_or_default()) };
+            if from != own {
+                how.push_str(&format!(" from {}", from.display()));
+            }
             (h, how)
         }
-        Err(e) => {
-            let how = if sidecar.exists() { format!("rebuilt (cache unreadable: {e:#})") } else { "built".to_string() };
+        Err(why) => {
+            let how = match why {
+                Some(why) => format!("rebuilt (cache {why})"),
+                None => "built".to_string(),
+            };
             (History::build(root, &head, &opts, &no)?, how)
         }
     };
-    h.save(&sidecar).with_context(|| format!("writing {}", sidecar.display()))?;
+    let sidecar = dirs.save(&h)?;
     let ms = t.elapsed().as_millis();
     println!("{how} in {ms} ms: {}", sidecar.display());
     print_summary(&h, file_len(&sidecar));

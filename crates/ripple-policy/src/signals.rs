@@ -144,9 +144,8 @@ pub struct CoverageMetric {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct HotspotMetric {
     pub rank: u32,
-    /// Files ranked (not serialised: the same for every file; `ripple rank`
-    /// and `ripple file` show it).
-    #[serde(default, skip_serializing)]
+    /// Files ranked, so `rank` reads as "`rank` of `of`".
+    #[serde(default)]
     pub of: u32,
     /// Share of the ranked files with a lower score, in percent (one decimal).
     pub percentile: f64,

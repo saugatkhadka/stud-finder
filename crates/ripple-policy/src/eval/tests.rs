@@ -245,7 +245,7 @@ fn default_rules() {
     assert_eq!(pol(&r).require, ["human_review"]);
 
     let r = run(&p, &[m("config/initializers/stripe.rb")]);
-    assert_eq!((pol(&r).risk, ids(&r)), (Risk::High, vec!["default.touches_global".to_string()]));
+    assert_eq!((pol(&r).risk, ids(&r)), (Risk::Low, vec!["default.touches_global".to_string()]));
     assert_eq!(pol(&r).require, ["run_full_suite"]);
 
     // lib/token.rb is tier high; session.rb (critical) depends on it directly.
@@ -268,17 +268,24 @@ fn default_rules_reach_any_depth_and_blast_radius() {
     let g = Graph::build(&edges, []);
     let p = Policy::compile(parse_config("areas: {c: {paths: [app/crit.rb], tier: critical}}", "t").unwrap()).unwrap();
     let r = evaluate(&p, &g, &[m("app/hub.rb")]);
-    assert_eq!(pol(&r).risk, Risk::Medium);
-    assert_eq!(pol(&r).reasons[0].rule, "default.impacted_over_50");
+    assert!(r.policy.is_none(), "60 impacted files is ordinary: no rule fires");
     let r = evaluate(&p, &g, &[m("app/x.rb")]);
-    assert_eq!(pol(&r).risk, Risk::Medium);
+    assert_eq!(pol(&r).risk, Risk::Low);
     assert_eq!(pol(&r).reasons.iter().map(|x| x.rule.as_str()).collect::<Vec<_>>(), ["default.reaches_critical"]);
 
     let edges: Vec<Edge> = (0..201).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
     let g = Graph::build(&edges, []);
     let r = evaluate(&p, &g, &[m("app/hub.rb")]);
-    assert_eq!(pol(&r).risk, Risk::High);
+    assert_eq!(pol(&r).risk, Risk::Medium);
     assert_eq!(pol(&r).reasons[0].rule, "default.impacted_over_200");
+
+    let edges: Vec<Edge> = (0..1501).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
+    let g = Graph::build(&edges, []);
+    let r = evaluate(&p, &g, &[m("app/hub.rb")]);
+    assert_eq!(pol(&r).risk, Risk::High);
+    assert_eq!(pol(&r).reasons.iter().map(|x| x.rule.as_str()).collect::<Vec<_>>(), ["default.impacted_over_1500"], "lower rung dropped");
+    assert_eq!(pol(&r).require, ["run_full_suite"]);
+    assert!(r.warnings.iter().all(|w| w.code != "rule_signal_not_ready"), "built-in metric rules skip quietly");
 }
 
 #[test]
@@ -349,10 +356,11 @@ fn limit_truncates_lists_not_counts() {
     let p = policy("");
     let opts = EvalOptions { limit: Some(1), ..Default::default() };
     let g = fixture_graph();
-    let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &[m("app/models/invoice.rb")], &opts);
+    let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &[m("app/models/invoice.rb"), m("README.md"), m("lib/util.rb")], &opts);
     assert_eq!(r.further.files.len(), 1);
     assert_eq!((r.counts.impacted, r.counts.further_notable), (4, 2));
     assert!(r.truncated);
+    assert_eq!(r.changed.len(), 3, "--limit never cuts the changed files");
 }
 
 /// hub.rb with `n` direct dependents (every 10th in a critical area), each
@@ -488,7 +496,7 @@ fn github_snapshot() {
     let lines: Vec<&str> = cmds.lines().collect();
     assert!(lines.iter().any(|l| l.starts_with("::warning file=app/models/invoice.rb,line=1,title=ripple%3A critical risk (default.touches_critical)::Changes `app/models/invoice.rb` in billing (critical) (also: ")), "{cmds}");
     assert_eq!(lines.iter().filter(|l| l.starts_with("::warning file=app/models/invoice.rb")).count(), 1, "one annotation per changed file");
-    assert!(lines.iter().any(|l| l.starts_with("::warning file=config/initializers/stripe.rb,line=7,title=ripple%3A high risk (default.touches_global)::")), "{cmds}");
+    assert!(lines.iter().any(|l| l.starts_with("::warning file=config/initializers/stripe.rb,line=7,title=ripple%3A low risk (default.touches_global)::")), "{cmds}");
     assert!(lines.iter().any(|l| l.starts_with("::notice file=config/initializers/stripe.rb,title=ripple: global file::global:")), "{cmds}");
     assert_eq!(*lines.last().unwrap(), format!("::notice title=ripple::{}", r.summary));
     assert_eq!(
@@ -1301,8 +1309,16 @@ fn signal_conditions_are_anded_with_each_other_and_the_rest() {
     assert!(s.contains("41 commits") && s.contains("complexity 120") && s.contains("12% of 200 lines"), "{s}");
     assert_eq!(msg("{touches: [auth], churn_over: 10}", &inv), None);
     assert_eq!(msg("{churn_over: 10, coverage_under: 5}", &inv), None);
-    // Several files: each condition may hold on a different file.
-    assert!(msg("{churn_over: 10, uncovered: true}", &[m("app/models/invoice.rb"), m("lib/util.rb")]).is_some());
+    // Several files: every per-file condition must hold on the same file.
+    let two = [m("app/models/invoice.rb"), m("lib/util.rb")];
+    assert_eq!(msg("{churn_over: 10, uncovered: true}", &two), None, "churn is invoice's, 0% coverage util's");
+    assert_eq!(msg("{complexity_over: 100, coverage_under: 5}", &two), None);
+    let s = msg("{churn_over: 10, complexity_over: 100}", &two).expect("both on invoice");
+    assert!(
+        s.contains("changed in more than 10 commits in the last 90 days and complexity above 100 in the same file: `app/models/invoice.rb` (41 commits, complexity 120)"),
+        "{s}"
+    );
+    assert!(!s.contains("util"), "{s}");
     // One blocked signal blocks the whole rule, with one warning naming it.
     let (fired, r) = sig_fires(
         "{churn_over: 10, coverage_under: 50}",
@@ -1355,4 +1371,40 @@ fn report_metrics_signals_and_usually_changes_with() {
     assert_eq!(crate::schema::validate_report(&v), Vec::<String>::new());
     let t = crate::render::text::render(&serde_json::from_value(v).unwrap(), 30, false);
     assert!(t.contains("usually changes with (not in the diff):\n  app/views/invoices/show.html.erb  with app/models/invoice.rb in 12 of its 20 commits (60%)\n"), "{t}");
+}
+
+#[test]
+fn changed_lines_over_is_per_file_next_to_metric_conditions() {
+    // invoice (complexity 120) barely touched, util (complexity 2) rewritten.
+    let tiny_edit = [m("app/models/invoice.rb").lines(3, 2), m("lib/util.rb").lines(80, 40)];
+    assert_eq!(msg("{complexity_over: 100, changed_lines_over: 50}", &tiny_edit), None, "125 lines in the diff, 5 in the complex file");
+    // Alone it is still the whole diff.
+    let s = msg("{changed_lines_over: 50}", &tiny_edit).expect("fires");
+    assert!(s.contains("125 lines changed (more than 50)"), "{s}");
+    let big_edit = [m("app/models/invoice.rb").lines(40, 20), m("lib/util.rb").lines(1, 0)];
+    let (s, r) = sig_fires("{complexity_over: 100, changed_lines_over: 50}", &big_edit, Some(ready_signals()));
+    let s = s.expect("fires");
+    assert!(s.contains("complexity above 100 and more than 50 changed lines in the same file: `app/models/invoice.rb` (complexity 120, 60 lines changed)"), "{s}");
+    let ev = &pol(&r).reasons[0].evidence;
+    assert_eq!((ev.counts.get("complexity"), ev.counts.get("changed_lines")), (Some(&120), Some(&60)));
+    assert_eq!(ev.changed, vec!["app/models/invoice.rb".to_string()]);
+    // Without a diff: no fire and a warning.
+    let (fired, r) = sig_fires("{complexity_over: 100, changed_lines_over: 1}", &[m("app/models/invoice.rb")], Some(ready_signals()));
+    assert_eq!(fired, None);
+    assert!(r.warnings.iter().any(|w| w.code == "no_line_counts"), "{:#?}", r.warnings);
+}
+
+#[test]
+fn untested_joins_the_per_file_conditions() {
+    // charge.rb has no test among its dependents; invoice.rb has a spec.
+    let both = [m("app/models/invoice.rb").lines(200, 0), m("app/services/charge.rb").lines(2, 0)];
+    assert_eq!(msg("{untested: true, changed_lines_over: 50}", &both), None, "the big edit is to the tested file");
+    let both = [m("app/models/invoice.rb").lines(2, 0), m("app/services/charge.rb").lines(60, 0)];
+    let s = msg("{untested: true, changed_lines_over: 50}", &both).expect("fires");
+    assert!(s.contains("no test among its dependents and more than 50 changed lines in the same file: `app/services/charge.rb` (no test depends on it, 60 lines changed)"), "{s}");
+    // Alone, `untested` keeps its own message.
+    let s = msg("{untested: true}", &both).expect("fires");
+    assert!(s.contains("no test depends on `app/services/charge.rb`"), "{s}");
+    // With a metric condition: invoice is complex but tested, charge untested but has no metrics.
+    assert_eq!(msg("{untested: true, complexity_over: 100}", &both), None);
 }

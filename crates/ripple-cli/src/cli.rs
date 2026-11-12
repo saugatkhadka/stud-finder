@@ -26,6 +26,9 @@ pub struct Cli {
     /// Index in this process instead of using (or starting) the daemon.
     #[arg(long, global = true)]
     no_daemon: bool,
+    /// Use this config file instead of `<root>/ripple.yml` (a separate daemon serves it).
+    #[arg(long, global = true, env = "RIPPLE_CONFIG", value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -64,6 +67,10 @@ enum Cmd {
         file: String,
         #[arg(long, value_enum, default_value_t = OutFormat::Text)]
         format: OutFormat,
+        /// Answer at once from the current index, even while git history,
+        /// coverage or the ranking are still loading (default: wait up to 5 s for them).
+        #[arg(long)]
+        no_wait: bool,
     },
     /// The riskiest non-test source files: recent churn, complexity,
     /// missing coverage and dependents, as percentile ranks.
@@ -89,7 +96,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
-    /// The git-history cache (churn, co-change) at `<git dir>/ripple/history.bin`.
+    /// The git-history cache (churn, co-change) at `<git common dir>/ripple/history[-<worktree>].bin`.
     History {
         #[command(subcommand)]
         cmd: HistoryCmd,
@@ -291,6 +298,10 @@ struct RankArgs {
     by: RankBy,
     #[arg(long, value_enum, default_value_t = OutFormat::Text)]
     format: OutFormat,
+    /// Answer at once from the current index, even while git history or
+    /// coverage are still loading (default: wait up to 5 s; without a ranking the exit code is 4).
+    #[arg(long)]
+    no_wait: bool,
 }
 
 #[derive(Args)]
@@ -306,7 +317,8 @@ struct NeighbourArgs {
 }
 
 /// Entry point used by `main`. Exit codes: 0 ok, 1 `check` risk at/above
-/// threshold, 2 usage or configuration error (also any other failure).
+/// threshold, 2 usage or configuration error (also any other failure),
+/// 3 `daemon status` found no daemon, 4 `rank` has no ranking yet (signals still loading).
 pub fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
@@ -377,6 +389,13 @@ fn result_of(reply: Reply) -> Result<String> {
 
 fn run(cli: Cli) -> Result<u8> {
     let root = resolve_root(cli.root.as_deref())?;
+    if let Some(p) = &cli.config {
+        let abs = std::fs::canonicalize(p).with_context(|| format!("--config {}", p.display()))?;
+        if !abs.is_file() {
+            bail!("--config {}: not a file", p.display());
+        }
+        ripple_policy::set_config_override(abs);
+    }
     let open = |autostart: bool| Backend::open(&root, cli.no_daemon, autostart);
     match cli.cmd {
         Cmd::Impact(a) => impact(&root, a, open(true)?),
@@ -393,9 +412,9 @@ fn run(cli: Cli) -> Result<u8> {
             let out = result_of(b.call("areas", &json!({"file": to_rel(&root, &file)}))?)?;
             print_value(&out, format, crate::output::areas)
         }
-        Cmd::File { file, format } => {
+        Cmd::File { file, format, no_wait } => {
             let mut b = open(true)?;
-            let out = result_of(b.call("file", &json!({"file": to_rel(&root, &file)}))?)?;
+            let out = call_waiting_for_signals(&mut b, "file", &json!({"file": to_rel(&root, &file), "no_wait": no_wait}), !no_wait)?;
             print_value(&out, format, crate::output::file_profile)
         }
         Cmd::Rank(a) => {
@@ -406,8 +425,11 @@ fn run(cli: Cli) -> Result<u8> {
                 RankBy::Complexity => "complexity",
                 RankBy::Coverage => "coverage",
             };
-            let out = result_of(b.call("rank", &json!({"limit": a.limit, "path": a.path, "area": a.area, "by": by}))?)?;
-            print_value(&out, a.format, crate::output::rank)
+            let out = call_waiting_for_signals(&mut b, "rank", &json!({"limit": a.limit, "path": a.path, "area": a.area, "by": by, "no_wait": a.no_wait}), !a.no_wait)?;
+            print_value(&out, a.format, crate::output::rank)?;
+            // No ranking yet (signals still loading): not an empty success.
+            let ready = serde_json::from_str::<Value>(&out).map(|v| v["ready"] != Value::Bool(false)).unwrap_or(true);
+            Ok(if ready { 0 } else { 4 })
         }
         Cmd::Stats { format } => {
             let mut b = open(true)?;
@@ -428,6 +450,30 @@ fn run(cli: Cli) -> Result<u8> {
         }
         Cmd::Serve { foreground } => serve(&root, foreground),
         Cmd::Bench(a) => crate::bench::run(&root, a),
+    }
+}
+
+/// How long `rank` and `file` wait for git history, coverage and the
+/// ranking to load (a fresh daemon) before answering with what there is.
+pub const SIGNAL_WAIT: Duration = Duration::from_secs(5);
+
+/// Calls `method` (`rank`, `file`) and, when `wait`, repeats it for up to
+/// [`SIGNAL_WAIT`] while one of the reply's `signals` is still building or
+/// loading. They are explicit requests for those signals; `impact` never
+/// waits for them.
+fn call_waiting_for_signals(b: &mut Backend, method: &str, params: &Value, wait: bool) -> Result<String> {
+    let deadline = std::time::Instant::now() + SIGNAL_WAIT;
+    loop {
+        let out = result_of(b.call(method, params)?)?;
+        if !wait || std::time::Instant::now() >= deadline {
+            return Ok(out);
+        }
+        let v: Value = serde_json::from_str(&out)?;
+        let loading = v["signals"].as_object().is_some_and(|m| m.values().any(|s| matches!(s["state"].as_str(), Some("building" | "loading"))));
+        if !loading {
+            return Ok(out);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

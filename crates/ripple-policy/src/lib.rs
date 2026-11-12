@@ -28,7 +28,7 @@ pub use error::{Issue, PolicyError};
 pub use eval::{EvalOptions, evaluate, evaluate_with, path_hops, summary_line};
 pub use findings::mention_line;
 pub use lang::{Language, Side};
-pub use load::{CONFIG_FILE_NAMES, LoadedConfig, find_config, load_config, parse_config};
+pub use load::{CONFIG_FILE_NAMES, LoadedConfig, config_override, find_config, is_config_file, load_config, parse_config, set_config_override};
 pub use policy::{CompiledArea, FileClass, Policy, PolicyIndex};
 pub use report::*;
 pub use signals::*;

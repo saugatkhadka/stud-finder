@@ -149,10 +149,10 @@
         "hotspot": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["rank", "percentile"],
+          "required": ["rank", "of", "percentile"],
           "properties": {
             "rank": { "type": "integer", "minimum": 1 },
-            "of": { "$ref": "#/$defs/count" },
+            "of": { "$ref": "#/$defs/count", "description": "Files ranked: `rank` of `of`." },
             "percentile": { "$ref": "#/$defs/percent" },
             "hotspot": { "type": "boolean" }
           }

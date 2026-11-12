@@ -15,13 +15,38 @@ pub struct LoadedConfig {
     pub path: Option<PathBuf>,
 }
 
+/// The conventional config file at `root` (ignores `--config`; used to
+/// find the repository root).
 pub fn find_config(root: &Path) -> Option<PathBuf> {
     CONFIG_FILE_NAMES.iter().map(|n| root.join(n)).find(|p| p.is_file())
 }
 
-/// Loads and validates the config at `root`. A missing file yields defaults.
+static CONFIG_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `--config PATH` (absolute): this process loads its config from `path`
+/// instead of `<root>/ripple.yml`. Set once, before any config is loaded.
+pub fn set_config_override(path: PathBuf) {
+    let _ = CONFIG_OVERRIDE.set(path);
+}
+
+/// The `--config` path, if one was given.
+pub fn config_override() -> Option<&'static Path> {
+    CONFIG_OVERRIDE.get().map(PathBuf::as_path)
+}
+
+/// Is `rel` (relative to `root`) this process's config file?
+pub fn is_config_file(root: &Path, rel: &str) -> bool {
+    match config_override() {
+        Some(p) => p == root.join(rel),
+        None => CONFIG_FILE_NAMES.contains(&rel),
+    }
+}
+
+/// Loads and validates the config: the `--config` file if one was given
+/// (it must exist), otherwise the one at `root`. A missing file at `root`
+/// yields defaults.
 pub fn load_config(root: &Path) -> Result<LoadedConfig, PolicyError> {
-    let Some(path) = find_config(root) else {
+    let Some(path) = config_override().map(Path::to_path_buf).or_else(|| find_config(root)) else {
         return Ok(LoadedConfig { config: Config::default(), path: None });
     };
     let src = std::fs::read_to_string(&path).map_err(|source| PolicyError::Io { path: path.clone(), source })?;
@@ -125,6 +150,15 @@ pub fn validate(config: &Config, src: Option<&str>) -> Vec<Issue> {
     let hp = config.rank.hotspot_percent;
     if !(hp > 0.0 && hp <= 100.0) {
         issues.push(Issue::new("rank.hotspot_percent", "a percentage above 0, at most 100"));
+    }
+    let rw = &config.rank.weights;
+    for (key, v) in [("churn", rw.churn), ("complexity", rw.complexity), ("dependents", rw.dependents), ("uncovered", rw.uncovered)] {
+        if !(v.is_finite() && v >= 0.0) {
+            issues.push(Issue::new(format!("rank.weights.{key}"), "a weight of 0 or more"));
+        }
+    }
+    if rw.complexity + rw.dependents <= 0.0 {
+        issues.push(Issue::new("rank.weights", "`complexity` or `dependents` must be above 0 (they are the only factors every file has)"));
     }
     for (name, area) in &config.areas {
         if area.paths.is_empty() {
@@ -267,7 +301,14 @@ rules:
         )
         .unwrap();
         assert_eq!(ok.rank.hotspot_percent, 2.5);
-        assert_eq!(parse_config("", "ripple.yml").unwrap().rank.hotspot_percent, 5.0);
+        let d = parse_config("", "ripple.yml").unwrap().rank;
+        assert_eq!(d.hotspot_percent, 1.0);
+        assert_eq!((d.weights.churn, d.weights.complexity, d.weights.dependents, d.weights.uncovered), (3.0, 1.0, 0.5, 1.0));
+        let w = parse_config("rank: {weights: {churn: 1, dependents: 0}}\n", "ripple.yml").unwrap().rank.weights;
+        assert_eq!((w.churn, w.complexity, w.dependents, w.uncovered), (1.0, 1.0, 0.0, 1.0));
+        let e = err("rank: {weights: {churn: -1, complexity: 0, dependents: 0}}\n");
+        assert!(e.contains("rank.weights.churn") && e.contains("must be above 0"), "{e}");
+        assert!(err("rank: {weights: {age: 1}}\n").contains("age"));
         let e = err("rank: {hotspot_percent: 0}\nrules:\n  - {id: a, risk: high, when: {coverage_under: 120, cochange_min_confidence: 0.5, uncovered_includes_unknown: true}}\n");
         for want in ["rank.hotspot_percent", "rules[0].when.coverage_under", "rules[0].when.cochange_min_confidence", "rules[0].when.uncovered_includes_unknown"] {
             assert!(e.contains(want), "{want}: {e}");

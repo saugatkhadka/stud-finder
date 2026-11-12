@@ -11,17 +11,27 @@
 //! * `impacted_files_over`: impacted non-test files (excluding changed) > N.
 //! * `changed_files_over`: changed files (after `ignore`) > N.
 //! * `changed_lines_over`: sum of added + deleted lines > N. Never fires when
-//!   no changed file carries line counts (no diff available).
+//!   no changed file carries line counts (no diff available). Next to a
+//!   per-file condition (below) it is the lines of that same file instead.
 //! * `crosses_boundary: B`: holds iff (some impacted non-test file is on the
 //!   other side of the Ruby/JS boundary from the changed file it traces back
 //!   to) == B. Ruby and templates are the server side, JS/TS the client side.
 //! * `touches_global: B`: holds iff (a changed file matches `global_files`) == B.
 //! * `untested: B`: holds iff (some changed, non-deleted, non-test source
-//!   file has no test file among its transitive dependents) == B.
+//!   file has no test file among its transitive dependents) == B. With
+//!   `true` next to a per-file condition, it must be that same file.
 //! * Signal conditions look at the changed, non-deleted, non-test source
 //!   files ("candidates") and need their signal ([`SignalInput`]) to be
 //!   ready; a rule using a signal that is not ready does not fire and adds a
-//!   `rule_signal_not_ready` warning instead. Thresholds are exclusive.
+//!   `rule_signal_not_ready` warning instead (built-in rules skip quietly).
+//!   Thresholds are exclusive.
+//!   **Per-file conditions** (`churn_over`, `complexity_over`,
+//!   `max_method_complexity_over`, `coverage_under`,
+//!   `changed_lines_coverage_under`, `uncovered: true`, `hotspot: true`,
+//!   and with them `untested: true` and `changed_lines_over`) must all hold
+//!   on one and the same candidate; the reason names the files that
+//!   satisfy all of them ([`per_file_group`]). `uncovered: false` and
+//!   `hotspot: false` are about every candidate.
 //!   * `churn_over: N`: a candidate changed in more than N commits in the
 //!     last 90 days of the history window.
 //!   * `complexity_over: N` / `max_method_complexity_over: N`: a candidate's
@@ -226,7 +236,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     for r in &policy.rules {
         let blocked = ctx.blocked_signals(&r.rule.when);
         if !blocked.is_empty() {
-            if !ctx.changed.is_empty() {
+            // Built-in metric rules are opportunistic: without history or
+            // metrics they stay quiet (the `signals` block says why).
+            if !ctx.changed.is_empty() && !policy.uses_default_rules() {
                 let what: Vec<String> = blocked
                     .iter()
                     .map(|(name, st)| match &st.reason {
@@ -286,7 +298,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     let changed_entries: Vec<ChangedEntry> = ctx
         .changed
         .iter()
-        .take(opts.cap(budget::CHANGED))
+        // `--limit` caps the output lists, never the input: `changed` keeps
+        // at least its default budget.
+        .take(opts.cap(budget::CHANGED).max(budget::CHANGED))
         .map(|c| ChangedEntry {
             path: c.file.path.clone(),
             status: c.file.status,
@@ -908,6 +922,27 @@ fn tier_word(r: Risk) -> &'static str {
     }
 }
 
+/// Which conditions of `w` must hold on one and the same changed file:
+/// (has a per-file metric condition, `untested: true` joins, `changed_lines_over` joins).
+/// The metric conditions are `churn_over`, `complexity_over`,
+/// `max_method_complexity_over`, `coverage_under`,
+/// `changed_lines_coverage_under`, `uncovered: true` and `hotspot: true`.
+/// `untested: true` and `changed_lines_over` join them (and each other);
+/// alone, `untested` is about any file and `changed_lines_over` about the
+/// whole diff.
+pub(crate) fn per_file_group(w: &ripple_core::config::When) -> (bool, bool, bool) {
+    let metric = w.churn_over.is_some()
+        || w.complexity_over.is_some()
+        || w.max_method_complexity_over.is_some()
+        || w.coverage_under.is_some()
+        || w.changed_lines_coverage_under.is_some()
+        || w.uncovered == Some(true)
+        || w.hotspot == Some(true);
+    let untested = w.untested == Some(true) && (metric || w.changed_lines_over.is_some());
+    let lines = w.changed_lines_over.is_some() && (metric || w.untested == Some(true));
+    (metric, untested, lines)
+}
+
 fn list(items: &[String], max: usize) -> String {
     let mut s: Vec<String> = items.iter().take(max).map(|i| format!("`{i}`")).collect();
     if items.len() > max {
@@ -982,112 +1017,127 @@ impl Ctx<'_> {
         (!m.is_empty()).then_some(m)
     }
 
-    /// The signal conditions of a rule: `Err(())` when one does not hold.
-    fn eval_signals(&self, w: &ripple_core::config::When, parts: &mut Vec<String>, changed_ev: &mut BTreeSet<String>, ev: &mut Evidence) -> Result<(), ()> {
+    /// The per-file conditions of a rule (see [`per_file_group`]), all on
+    /// the same changed file, then the rule-wide signal conditions
+    /// (`uncovered: false`, `hotspot: false`, `missing_cochange`).
+    /// `untested`: the changed source files no test depends on, when the
+    /// group uses `untested: true`. `Err(())` when one does not hold.
+    fn eval_signals(&self, w: &ripple_core::config::When, untested: Option<&[String]>, parts: &mut Vec<String>, changed_ev: &mut BTreeSet<String>, ev: &mut Evidence) -> Result<(), ()> {
         let cands: Vec<&Changed> = self.candidates().collect();
-        // (path, number shown) per matching file; `Err` when the condition fails.
-        let threshold = |hits: Vec<(String, String)>, what: String, parts: &mut Vec<String>, changed_ev: &mut BTreeSet<String>| -> Result<(), ()> {
+        let (metric, with_untested, with_lines) = per_file_group(w);
+        // One condition of the group: what it says, the evidence count it
+        // sets, and per file the value (larger = worse; sorts and counts)
+        // and the number shown, or `None` when it does not hold.
+        type Test<'s> = Box<dyn Fn(&Changed) -> Option<(f64, String)> + 's>;
+        let mut conds: Vec<(String, Option<&'static str>, Test<'_>)> = Vec::new();
+        let fm = |c: &Changed| c.node.and_then(|n| self.graph.metrics(n));
+        let cov = |c: &Changed| self.file_signals(&c.file.path).and_then(|f| f.coverage);
+        if let Some(n) = w.churn_over {
+            let t: Test = Box::new(move |c| self.file_signals(&c.file.path)?.churn.filter(|ch| ch.recent_commits > n).map(|ch| (f64::from(ch.recent_commits), format!("{} commits", ch.recent_commits))));
+            conds.push((format!("changed in more than {n} commits in the last 90 days"), Some("recent_commits"), t));
+        }
+        if let Some(n) = w.complexity_over {
+            let t: Test = Box::new(move |c| fm(c).filter(|m| m.complexity > n).map(|m| (f64::from(m.complexity), format!("complexity {}", m.complexity))));
+            conds.push((format!("complexity above {n}"), Some("complexity"), t));
+        }
+        if let Some(n) = w.max_method_complexity_over {
+            let t: Test = Box::new(move |c| {
+                fm(c).filter(|m| m.methods > 0 && u32::from(m.max_method) > n).map(|m| (f64::from(m.max_method), format!("a method of complexity {}", m.max_method)))
+            });
+            conds.push((format!("a method more complex than {n}"), Some("max_method_complexity"), t));
+        }
+        if let Some(pct) = w.coverage_under {
+            let t: Test = Box::new(move |c| {
+                let cv = cov(c)?;
+                let p = cv.percent?;
+                (p < pct).then(|| (-p, format!("{}% of {} lines", crate::signals::fmt_pct(p), cv.coverable)))
+            });
+            conds.push((format!("line coverage under {}%", crate::signals::fmt_pct(pct)), None, t));
+        }
+        if let Some(pct) = w.changed_lines_coverage_under {
+            let t: Test = Box::new(move |c| {
+                let p = cov(c)?.changed_lines_percent?;
+                (p < pct).then(|| (-p, format!("{}% of the changed lines", crate::signals::fmt_pct(p))))
+            });
+            conds.push((format!("changed lines covered under {}%", crate::signals::fmt_pct(pct)), None, t));
+        }
+        if w.uncovered == Some(true) {
+            let inc = w.uncovered_includes_unknown;
+            let t: Test = Box::new(move |c| match cov(c) {
+                Some(cv) if cv.coverable > 0 && cv.covered == 0 => Some((f64::from(cv.coverable), format!("0 of {} lines covered", cv.coverable))),
+                Some(_) => None,
+                None if inc => Some((0.0, "in no coverage report".to_string())),
+                None => None,
+            });
+            conds.push(("not covered by any test".into(), None, t));
+        }
+        if w.hotspot == Some(true) {
+            let top = self.sig.map_or(0.0, |s| s.hotspot_percent);
+            let t: Test = Box::new(move |c| {
+                let h = self.file_signals(&c.file.path)?.hotspot.filter(|h| h.hotspot)?;
+                Some((-f64::from(h.rank), format!("#{} of {}", h.rank, h.of)))
+            });
+            conds.push((format!("a hotspot (top {}% of `ripple rank`)", crate::signals::fmt_pct(top)), None, t));
+        }
+        if with_untested {
+            let untested = untested.unwrap_or_default();
+            let t: Test = Box::new(move |c| untested.contains(&c.file.path).then(|| (0.0, "no test depends on it".to_string())));
+            conds.push(("no test among its dependents".into(), None, t));
+        }
+        if with_lines && let Some(n) = w.changed_lines_over {
+            if !self.has_lines {
+                return Err(());
+            }
+            let t: Test = Box::new(move |c| {
+                let lines = c.file.added.unwrap_or(0) as usize + c.file.deleted.unwrap_or(0) as usize;
+                (lines > n).then(|| (lines as f64, format!("{lines} lines changed")))
+            });
+            conds.push((format!("more than {n} changed lines"), Some("changed_lines"), t));
+        }
+        debug_assert!(conds.is_empty() || metric || with_untested);
+        if !conds.is_empty() {
+            let mut hits: Vec<(&Changed, Vec<(f64, String)>)> = cands
+                .iter()
+                .filter_map(|&c| conds.iter().map(|(_, _, t)| t(c)).collect::<Option<Vec<_>>>().map(|v| (c, v)))
+                .collect();
             if hits.is_empty() {
                 return Err(());
             }
-            let shown: Vec<String> = hits.iter().take(3).map(|(p, n)| format!("`{p}` ({n})")).collect();
+            hits.sort_by(|a, b| b.1[0].0.total_cmp(&a.1[0].0).then_with(|| a.0.file.path.cmp(&b.0.file.path)));
+            for (i, (_, key, _)) in conds.iter().enumerate() {
+                if let Some(key) = key {
+                    let max = hits.iter().map(|h| h.1[i].0).fold(0.0, f64::max);
+                    ev.counts.insert((*key).into(), max as usize);
+                }
+            }
+            let whats: Vec<&str> = conds.iter().map(|(w, _, _)| w.as_str()).collect();
+            let what = match whats.split_last() {
+                Some((last, [])) => (*last).to_string(),
+                Some((last, rest)) => format!("{} and {last} in the same file", rest.join(", ")),
+                None => unreachable!(),
+            };
+            let shown: Vec<String> = hits.iter().take(3).map(|(c, v)| format!("`{}` ({})", c.file.path, v.iter().map(|x| x.1.as_str()).collect::<Vec<_>>().join(", "))).collect();
             let more = if hits.len() > 3 { format!(" and {} more", hits.len() - 3) } else { String::new() };
             parts.push(format!("{what}: {}{more}", shown.join(", ")));
-            changed_ev.extend(hits.into_iter().map(|(p, _)| p));
-            Ok(())
-        };
-        let boolean = |want: bool, hits: Vec<(String, String)>, yes: String, no: &str, parts: &mut Vec<String>, changed_ev: &mut BTreeSet<String>| -> Result<(), ()> {
-            if hits.is_empty() == want {
+            changed_ev.extend(hits.iter().map(|(c, _)| c.file.path.clone()));
+        }
+        drop(conds);
+        // Rule-wide: "no changed file is ...".
+        if w.uncovered == Some(false) {
+            let any = cands.iter().any(|c| match cov(c) {
+                Some(cv) => cv.coverable > 0 && cv.covered == 0,
+                None => w.uncovered_includes_unknown,
+            });
+            if any {
                 return Err(());
             }
-            if want {
-                let shown: Vec<String> = hits.iter().take(3).map(|(p, n)| format!("`{p}` ({n})")).collect();
-                let more = if hits.len() > 3 { format!(" and {} more", hits.len() - 3) } else { String::new() };
-                parts.push(format!("{yes}: {}{more}", shown.join(", ")));
-                changed_ev.extend(hits.into_iter().map(|(p, _)| p));
-            } else {
-                parts.push(no.to_string());
+            parts.push("every changed source file has some line coverage".into());
+        }
+        if w.hotspot == Some(false) {
+            if cands.iter().any(|c| self.file_signals(&c.file.path).and_then(|f| f.hotspot).is_some_and(|h| h.hotspot)) {
+                return Err(());
             }
-            Ok(())
-        };
-        if let Some(n) = w.churn_over {
-            let mut hits: Vec<(u32, String)> = cands
-                .iter()
-                .filter_map(|c| self.file_signals(&c.file.path)?.churn.filter(|ch| ch.recent_commits > n).map(|ch| (ch.recent_commits, c.file.path.clone())))
-                .collect();
-            hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            if let Some(max) = hits.first() {
-                ev.counts.insert("recent_commits".into(), max.0 as usize);
-            }
-            let hits = hits.into_iter().map(|(v, p)| (p, format!("{v} commits"))).collect();
-            threshold(hits, format!("changed in more than {n} commits in the last 90 days"), parts, changed_ev)?;
-        }
-        let fm = |c: &Changed| c.node.and_then(|n| self.graph.metrics(n));
-        if let Some(n) = w.complexity_over {
-            let mut hits: Vec<(u32, String)> = cands.iter().filter_map(|c| fm(c).filter(|m| m.complexity > n).map(|m| (m.complexity, c.file.path.clone()))).collect();
-            hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            if let Some(max) = hits.first() {
-                ev.counts.insert("complexity".into(), max.0 as usize);
-            }
-            let hits = hits.into_iter().map(|(v, p)| (p, format!("complexity {v}"))).collect();
-            threshold(hits, format!("complexity above {n}"), parts, changed_ev)?;
-        }
-        if let Some(n) = w.max_method_complexity_over {
-            let mut hits: Vec<(u32, String)> = cands
-                .iter()
-                .filter_map(|c| fm(c).filter(|m| m.methods > 0 && u32::from(m.max_method) > n).map(|m| (u32::from(m.max_method), c.file.path.clone())))
-                .collect();
-            hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            if let Some(max) = hits.first() {
-                ev.counts.insert("max_method_complexity".into(), max.0 as usize);
-            }
-            let hits = hits.into_iter().map(|(v, p)| (p, format!("a method of complexity {v}"))).collect();
-            threshold(hits, format!("a method more complex than {n}"), parts, changed_ev)?;
-        }
-        let cov = |c: &Changed| self.file_signals(&c.file.path).and_then(|f| f.coverage);
-        if let Some(pct) = w.coverage_under {
-            let hits: Vec<(String, String)> = cands
-                .iter()
-                .filter_map(|c| {
-                    let cv = cov(c)?;
-                    let p = cv.percent?;
-                    (p < pct).then(|| (c.file.path.clone(), format!("{}% of {} lines", crate::signals::fmt_pct(p), cv.coverable)))
-                })
-                .collect();
-            threshold(hits, format!("line coverage under {}%", crate::signals::fmt_pct(pct)), parts, changed_ev)?;
-        }
-        if let Some(pct) = w.changed_lines_coverage_under {
-            let hits: Vec<(String, String)> = cands
-                .iter()
-                .filter_map(|c| {
-                    let p = cov(c)?.changed_lines_percent?;
-                    (p < pct).then(|| (c.file.path.clone(), format!("{}% of the changed lines", crate::signals::fmt_pct(p))))
-                })
-                .collect();
-            threshold(hits, format!("changed lines covered under {}%", crate::signals::fmt_pct(pct)), parts, changed_ev)?;
-        }
-        if let Some(want) = w.uncovered {
-            let hits: Vec<(String, String)> = cands
-                .iter()
-                .filter_map(|c| match cov(c) {
-                    Some(cv) if cv.coverable > 0 && cv.covered == 0 => Some((c.file.path.clone(), format!("0 of {} lines covered", cv.coverable))),
-                    Some(_) => None,
-                    None if w.uncovered_includes_unknown => Some((c.file.path.clone(), "in no coverage report".to_string())),
-                    None => None,
-                })
-                .collect();
-            boolean(want, hits, "not covered by any test".into(), "every changed source file has some line coverage", parts, changed_ev)?;
-        }
-        if let Some(want) = w.hotspot {
-            let top = self.sig.map_or(0.0, |s| s.hotspot_percent);
-            let hits: Vec<(String, String)> = cands
-                .iter()
-                .filter_map(|c| {
-                    let h = self.file_signals(&c.file.path)?.hotspot.filter(|h| h.hotspot)?;
-                    Some((c.file.path.clone(), format!("#{} of {}", h.rank, h.of)))
-                })
-                .collect();
-            boolean(want, hits, format!("a hotspot (top {}% of `ripple rank`)", crate::signals::fmt_pct(top)), "changes no hotspot", parts, changed_ev)?;
+            parts.push("changes no hotspot".into());
         }
         if let Some(want) = w.missing_cochange {
             let min = w.cochange_min_confidence.unwrap_or(ripple_core::config::DEFAULT_COCHANGE_MIN_CONFIDENCE);
@@ -1328,7 +1378,8 @@ impl Ctx<'_> {
             parts.push(format!("{count} files changed (more than {n})"));
             ev.counts.insert("changed_files".into(), count);
         }
-        if let Some(n) = w.changed_lines_over {
+        let (_, group_untested, group_lines) = per_file_group(w);
+        if let Some(n) = w.changed_lines_over.filter(|_| !group_lines) {
             if !self.has_lines {
                 return None;
             }
@@ -1382,7 +1433,10 @@ impl Ctx<'_> {
                 parts.push("changes no global files".into());
             }
         }
-        if let Some(want) = w.untested {
+        let mut grouped_untested = None;
+        if group_untested {
+            grouped_untested = Some(untested_cache.entry(conf).or_insert_with(|| self.untested(conf)).clone());
+        } else if let Some(want) = w.untested {
             let untested = untested_cache.entry(conf).or_insert_with(|| self.untested(conf)).clone();
             if untested.is_empty() == want {
                 return None;
@@ -1394,7 +1448,7 @@ impl Ctx<'_> {
                 parts.push("every changed source file has a dependent test".into());
             }
         }
-        if self.eval_signals(w, &mut parts, &mut changed_ev, &mut ev).is_err() {
+        if self.eval_signals(w, grouped_untested.as_deref(), &mut parts, &mut changed_ev, &mut ev).is_err() {
             return None;
         }
         if parts.is_empty() {
