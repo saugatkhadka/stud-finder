@@ -74,11 +74,17 @@ pub struct RubyConfig {
     pub namespace_definition_limit: usize,
     /// Extra autoload roots beyond the Rails defaults (`app/*`, `lib`).
     pub autoload_roots: Vec<String>,
+    /// Track dependencies per method instead of per file: a file that uses a
+    /// class is only reached when it mentions a method that is affected.
+    /// Matching is by method name (Ruby has no static types), so calls built
+    /// at runtime (`send("#{x}_at")`) are covered only by the conservative
+    /// fallbacks in the extractor. Set to false for plain file-level edges.
+    pub method_level: bool,
 }
 
 impl Default for RubyConfig {
     fn default() -> Self {
-        Self { enabled: true, namespace_definition_limit: 3, autoload_roots: Vec::new() }
+        Self { enabled: true, namespace_definition_limit: 3, autoload_roots: Vec::new(), method_level: true }
     }
 }
 

@@ -81,11 +81,31 @@ pub struct Edge {
     /// itself reached via an unscoped reference or one with `from_scope: "show"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_scope: Option<String>,
+    /// `from` inherits `to`'s behaviour (superclass, `include`, `extend`,
+    /// `prepend`): whatever part of `to` is affected, the same-named part of
+    /// `from` is affected. Scopes on the edge are ignored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherit: bool,
+}
+
+/// `to_scope` value meaning "depends only on the class-level part of `to`"
+/// (constants, DSL, anything outside a method): followed only when the whole
+/// of `to` is affected, never for a change confined to named methods.
+pub const SCOPE_BODY: &str = "@body";
+
+/// A named part of a file (a Ruby method / controller action) and its lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRange {
+    pub name: String,
+    /// 1-based line of the `def`.
+    pub start: u32,
+    /// 1-based line of the closing `end`, inclusive.
+    pub end: u32,
 }
 
 impl Edge {
     pub fn new(from: impl Into<RelPath>, to: impl Into<RelPath>, kind: EdgeKind, confidence: Confidence) -> Self {
-        Self { from: from.into(), to: to.into(), kind, confidence, line: 0, detail: None, from_scope: None, to_scope: None }
+        Self { from: from.into(), to: to.into(), kind, confidence, line: 0, detail: None, from_scope: None, to_scope: None, inherit: false }
     }
     pub fn at(mut self, line: u32) -> Self {
         self.line = line;
@@ -101,6 +121,10 @@ impl Edge {
     }
     pub fn to_scope(mut self, scope: impl Into<String>) -> Self {
         self.to_scope = Some(scope.into());
+        self
+    }
+    pub fn inherit(mut self) -> Self {
+        self.inherit = true;
         self
     }
 }
@@ -137,11 +161,18 @@ pub struct JsCallSite {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Facts {
     pub js_call_sites: Vec<JsCallSite>,
+    /// Per file, the scopes that edges may name in `from_scope`/`to_scope`,
+    /// with their line ranges, sorted by `start`. Lets a diff's changed lines
+    /// be turned into "these methods changed". A file absent here, or a line
+    /// outside every range, means "treat the whole file as changed".
+    #[serde(default)]
+    pub scopes: std::collections::BTreeMap<RelPath, Vec<ScopeRange>>,
 }
 
 impl Facts {
     pub fn merge(&mut self, other: Facts) {
         self.js_call_sites.extend(other.js_call_sites);
+        self.scopes.extend(other.scopes);
     }
 }
 
