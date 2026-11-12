@@ -46,6 +46,9 @@ pub struct InferredRef {
     /// Tried last: `Recv.const_get("X")` also finds top-level `X`, because
     /// `const_get` with `inherit = true` searches `Object` for modules.
     pub top_level_fallback: Option<String>,
+    /// Only a model counts (`app/models/`, any `models/` directory): the
+    /// naming-convention guess of a serializer's model.
+    pub model_only: bool,
     pub line: u32,
     /// Byte offset of the call, to find the enclosing method.
     pub offset: u32,
@@ -60,6 +63,23 @@ pub struct RubyFacts {
     pub assoc_dynamic_skipped: u32,
     /// Controller actions by line range, sorted (controllers only; see [`crate::actions`]).
     pub actions: Vec<crate::actions::Action>,
+    /// HTTP requests a test makes (`get users_path`, `visit "/about"`); test files only.
+    pub requests: Vec<HttpRequest>,
+}
+
+/// A request issued by a test through the Rails integration-test / Capybara
+/// API: `visit x_path`, `get "/api/v1/x"`, `post x_url(...)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    /// The test method as written (`visit`, `get`).
+    pub callee: String,
+    /// Upper-case verb (`visit` is `GET`).
+    pub verb: String,
+    /// The route helper as written (`users_path`) when `helper`, else the
+    /// literal path with interpolations as `:param`, query stripped.
+    pub url: String,
+    pub helper: bool,
+    pub line: u32,
 }
 
 /// Substrings that must appear for the prism pass to find anything; files
@@ -80,24 +100,50 @@ const TRIGGERS: &[&str] = &[
     "factory",
 ];
 
-/// `controller`: the file is a (non-concern) controller, whose action line
-/// ranges are collected from the same parse.
-pub fn collect(source: &str, controller: bool) -> RubyFacts {
-    if !controller && !TRIGGERS.iter().any(|t| source.contains(t)) {
+/// Request methods of Rails integration tests and Capybara, with their verb.
+const REQUEST_METHODS: &[(&[u8], &str)] = &[
+    (b"visit", "GET"),
+    (b"get", "GET"),
+    (b"post", "POST"),
+    (b"put", "PUT"),
+    (b"patch", "PATCH"),
+    (b"delete", "DELETE"),
+    (b"head", "HEAD"),
+];
+
+/// Which optional facts to collect for a file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Want {
+    /// The file is a (non-concern) controller, whose action line ranges are
+    /// collected from the same parse.
+    pub controller: bool,
+    /// The file is a test: collect the HTTP requests it makes.
+    pub requests: bool,
+    /// The file is under a `serializers/` directory: `class XSerializer < ..`
+    /// infers the model `X` (ActiveModel::Serializer's naming convention).
+    pub serializer: bool,
+}
+
+pub fn collect(source: &str, want: Want) -> RubyFacts {
+    if !want.controller && !want.requests && !want.serializer && !TRIGGERS.iter().any(|t| source.contains(t)) {
         return RubyFacts::default();
     }
     let result = ruby_prism::parse(source.as_bytes());
-    collect_root(&result.node(), source, controller)
+    collect_root(&result.node(), source, want)
 }
 
 /// Same as [`collect`] on an already parsed tree.
-pub fn collect_root(root: &Node, source: &str, controller: bool) -> RubyFacts {
+pub fn collect_root(root: &Node, source: &str, want: Want) -> RubyFacts {
+    let controller = want.controller;
+    let requests = want.requests && REQUEST_METHODS.iter().any(|(m, _)| source.contains(std::str::from_utf8(m).unwrap_or("")));
     let mut v = Visitor {
         nesting: Vec::new(),
         facts: RubyFacts::default(),
         offset: 0,
+        requests,
+        serializer: want.serializer,
     };
-    if controller || TRIGGERS.iter().any(|t| source.contains(t)) {
+    if controller || requests || want.serializer || TRIGGERS.iter().any(|t| source.contains(t)) {
         v.visit(root);
     }
     if controller {
@@ -111,6 +157,10 @@ struct Visitor {
     facts: RubyFacts,
     /// Start offset of the call being handled.
     offset: u32,
+    /// Collect [`HttpRequest`]s.
+    requests: bool,
+    /// Infer serializers' models.
+    serializer: bool,
 }
 
 impl Visitor {
@@ -142,8 +192,42 @@ impl Visitor {
             scope,
             absolute,
             top_level_fallback: None,
+            model_only: false,
             line,
             offset: self.offset,
+        });
+    }
+
+    /// `class REST::AccountSerializer < ActiveModel::Serializer` (or any
+    /// superclass): the model `Account`, looked up from the class's namespace
+    /// outwards (`REST::Account`, `Account`). Nested serializers
+    /// (`StatusSerializer::TagSerializer`) work the same way.
+    fn infer_serialized_model(&mut self, node: &ClassNode) {
+        if node.superclass().is_none() {
+            return;
+        }
+        let Some(name) = const_name(&node.constant_path()) else { return };
+        let (ns, last) = match name.rsplit_once("::") {
+            Some((ns, last)) => (Some(ns), last),
+            None => (None, name.as_str()),
+        };
+        let Some(model) = last.strip_suffix("Serializer").filter(|m| !m.is_empty()) else { return };
+        let scope = match ns {
+            Some(ns) if ns.starts_with("::") => ns[2..].to_string(),
+            Some(ns) => match self.nesting.last() {
+                Some(outer) => format!("{outer}::{ns}"),
+                None => ns.to_string(),
+            },
+            None => self.scope(),
+        };
+        self.facts.inferred.push(InferredRef {
+            name: ClassName::Literal(model.to_string()),
+            scope,
+            absolute: false,
+            top_level_fallback: None,
+            model_only: true,
+            line: line_of(&node.location()),
+            offset: node.location().start(),
         });
     }
 
@@ -158,6 +242,14 @@ impl Visitor {
             .map(|a| a.arguments().iter().collect())
             .unwrap_or_default();
 
+        if self.requests && receiver.is_none()
+            && let Some((_, verb)) = REQUEST_METHODS.iter().find(|(m, _)| *m == method)
+            && let Some((url, helper)) = args.first().and_then(request_target)
+        {
+            let callee = String::from_utf8_lossy(method).into_owned();
+            self.facts.requests.push(HttpRequest { callee, verb: verb.to_string(), url, helper, line });
+            return;
+        }
         match method {
             b"require" | b"require_relative" | b"require_dependency" if receiverless => {
                 if let Some(path) = args.first().and_then(string_lit) {
@@ -294,6 +386,9 @@ impl Visitor {
 
 impl<'pr> Visit<'pr> for Visitor {
     fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
+        if self.serializer {
+            self.infer_serialized_model(node);
+        }
         self.enter(const_name(&node.constant_path()));
         ruby_prism::visit_class_node(self, node);
         self.nesting.pop();
@@ -309,6 +404,43 @@ impl<'pr> Visit<'pr> for Visitor {
         self.handle_call(node);
         ruby_prism::visit_call_node(self, node);
     }
+}
+
+/// The first argument of a request call: a receiverless route helper call
+/// (`users_path`, `user_url(u)`) or a literal path (`"/a/#{id}/b?x=1"` ->
+/// `/a/:param/b`). Anything else (`product.long_url`, `api("/x")`, a helper
+/// interpolated into a string, a full URL) is not a request we can route.
+fn request_target(node: &Node) -> Option<(String, bool)> {
+    if let Some(call) = node.as_call_node() {
+        if call.receiver().is_some() {
+            return None;
+        }
+        let name = utf8(call.name().as_slice())?;
+        let helper = (name.ends_with("_path") || name.ends_with("_url"))
+            && !matches!(name.as_str(), "polymorphic_path" | "polymorphic_url" | "current_path" | "current_url")
+            && !name.starts_with("_");
+        return helper.then_some((name, true));
+    }
+    let path = if let Some(s) = node.as_string_node() {
+        utf8(s.unescaped())?
+    } else if let Some(s) = node.as_interpolated_string_node() {
+        let mut out = String::new();
+        for part in s.parts().iter() {
+            if let Some(lit) = part.as_string_node() {
+                out.push_str(std::str::from_utf8(lit.unescaped()).ok()?);
+            } else if out.is_empty() {
+                // `"#{x_path}/y"`, `"#{host}/y"`: the base is unknown.
+                return None;
+            } else {
+                out.push_str(":param");
+            }
+        }
+        out
+    } else {
+        return None;
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    (path.starts_with('/') && !path.starts_with("//")).then(|| (path.to_string(), false))
 }
 
 fn line_of(loc: &ruby_prism::Location) -> u32 {
@@ -371,7 +503,7 @@ mod tests {
     fn associations_and_literals() {
         let f = collect(
             "module Admin\n  class Post < ApplicationRecord\n    belongs_to :author, class_name: 'User'\n    belongs_to :subject, polymorphic: true\n    has_many :comments\n    has_one :thing, class_name: name_for(:x)\n    has_many :tags, through: :taggings, source: :label\n  end\nend\n\"Foo::Bar\".constantize\nObject.const_get(:Baz)\nrequire_relative '../x'\n",
-            false,
+            Want::default(),
         );
         assert_eq!(f.assoc_polymorphic_skipped, 1);
         assert_eq!(f.assoc_dynamic_skipped, 1);
@@ -412,5 +544,38 @@ mod tests {
                 line: 12
             }]
         );
+    }
+
+    #[test]
+    fn test_requests() {
+        let src = r##"
+describe "x" do
+  it { visit emails_path }
+  it { get user_url(user), params: { a: 1 } }
+  it { post "/api/v1/statuses/#{status.id}/favourite?x=1" }
+  it { delete("/photos/#{id}") }
+  it { visit product.long_url }
+  it { visit "#{emails_path}/drafts" }
+  it { get api("/projects/#{id}", user) }
+  it { visit "https://example.com/x" }
+  it { get :index }
+  it { expect(page).to have_current_path(emails_path) }
+  it { page.visit root_path }
+end
+"##;
+        let want = Want { requests: true, ..Want::default() };
+        let got: Vec<_> = collect(src, want).requests.iter().map(|r| (r.callee.clone(), r.verb.clone(), r.url.clone(), r.helper, r.line)).collect();
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            got,
+            vec![
+                (s("visit"), s("GET"), s("emails_path"), true, 3),
+                (s("get"), s("GET"), s("user_url"), true, 4),
+                (s("post"), s("POST"), s("/api/v1/statuses/:param/favourite"), false, 5),
+                (s("delete"), s("DELETE"), s("/photos/:param"), false, 6),
+            ]
+        );
+        // Only test files collect requests.
+        assert!(collect(src, Want::default()).requests.is_empty());
     }
 }

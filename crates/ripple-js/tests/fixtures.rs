@@ -351,3 +351,44 @@ fn call_sites_navigation_vs_data() {
     // `fetch(x)` names no verb and links have none.
     assert!(!verbs.iter().any(|v| v.starts_with("fetch_path ") || v.starts_with("var_data_path ") || v.starts_with("visit_path ") || v.starts_with("get_path ")), "{verbs:?}");
 }
+
+#[test]
+fn aliases_from_jest_and_bundler_configs() {
+    let out = run("bundler", Config::default());
+    assert_lines(
+        "edges",
+        edges(&out),
+        &[
+            // webpack `alias` (ROOT_PATH read through `require('./webpack.constants')`);
+            // the Jest mapper gives the same `~` and lists CE before EE for ee_else_ce.
+            "app/js/main.js -> app/js/feature.js [JsImport Exact L3] ee_else_ce/feature",
+            "app/js/main.js -> app/js/lib/util.js [JsImport Exact L1] ~/lib/util",
+            // CE has no such file: the EE entry of the same prefix resolves it.
+            "app/js/main.js -> ee/app/js/only_ee.js [JsImport Exact L4] ee_else_ce/only_ee",
+            // `Object.assign(alias, { vendor: .. })`
+            "app/js/main.js -> vendor/js/thing.js [JsImport Exact L2] vendor/thing",
+            "config/webpack.config.js -> config/webpack.constants.js [JsImport Exact L2] ./webpack.constants",
+            // vite `{ find, replacement }` and the package.json `jest` key; scoped to packages/ui
+            // (app/js/main.js's `@ui/button` stays external).
+            "packages/ui/src/button.test.ts -> packages/ui/src/button.ts [JsImport Exact L2] @ui/button",
+            "packages/ui/src/button.test.ts -> packages/ui/test/setup.ts [JsImport Exact L1] @t/setup",
+            "packages/ui/src/index.ts -> packages/ui/src/button.ts [JsImport Exact L1] @ui/button",
+            "spec/frontend/main_spec.js -> app/js/main.js [JsImport Exact L1] ~/main",
+            // `const rootDirEE = ..` bound inside an `if` block
+            "spec/frontend/main_spec.js -> ee/app/js/only_ee.js [JsImport Exact L3] ee/only_ee",
+            "spec/frontend/main_spec.js -> spec/frontend/helpers/h.js [JsImport Exact L2] jest/helpers/h",
+        ],
+    );
+    assert_lines(
+        "warnings",
+        warnings(&out),
+        &[
+            "js_bundler_alias_unreadable config/webpack.config.js: 1 alias entry not statically readable, ignored: generated",
+            "js_bundler_alias_unreadable jest.config.base.js: 1 alias entry not statically readable, ignored: ^dyn(/.*)$",
+            // A discovered alias claims the specifier: a missing target is a warning, not external.
+            "js_unresolved_import app/js/main.js:7: cannot resolve alias import '~/lib/missing'",
+        ],
+    );
+    // lodash/debounce, @ui/button outside packages/ui, and the configs' own path x3, node:url, vite.
+    assert_eq!(out.stats["js_imports_external"], 7);
+}

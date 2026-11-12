@@ -179,6 +179,9 @@ impl State {
             es.namespace_no_canonical,
         );
         put("ruby_inferred_unresolved", es.inferred_unresolved);
+        put("ruby_serializer_model_unresolved", es.serializer_model_unresolved);
+        put("ruby_template_helper_calls", es.template_helper_calls);
+        put("ruby_template_helper_ambiguous", es.template_helper_ambiguous);
         put(
             "ruby_assoc_polymorphic_skipped",
             self.files
@@ -243,6 +246,7 @@ impl State {
             facts: ripple_core::Facts {
                 scopes,
                 mentions,
+                http_requests: self.http_requests(),
                 ..Default::default()
             },
             warnings: self
@@ -252,6 +256,25 @@ impl State {
                 .collect(),
             stats,
         }
+    }
+
+    /// Every test's HTTP requests, in file order.
+    fn http_requests(&self) -> Vec<ripple_core::JsCallSite> {
+        let mut out = Vec::new();
+        for (path, e) in &self.files {
+            for r in &e.facts.requests {
+                out.push(ripple_core::JsCallSite {
+                    file: path.clone(),
+                    line: r.line,
+                    method: Some(r.verb.clone()),
+                    url: r.url.clone(),
+                    callee: r.callee.clone(),
+                    route_helper: r.helper,
+                    link: false,
+                });
+            }
+        }
+        out
     }
 
     /// Repairs two Rubydex incremental gaps (see [`shadow`]): definitions

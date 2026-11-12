@@ -85,6 +85,21 @@ fn is_action_name(a: &str) -> bool {
     !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !a.starts_with(|c: char| c.is_ascii_digit())
 }
 
+/// Literal (non-parameter) segments of a route path, optional groups ignored.
+fn literal_segments(path: &str) -> usize {
+    let mut depth = 0usize;
+    let mut required = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if depth == 0 => required.push(c),
+            _ => {}
+        }
+    }
+    required.split('/').filter(|s| !s.is_empty() && !s.contains([':', '*'])).count()
+}
+
 fn bump(stats: &mut BTreeMap<String, u64>, key: impl Into<String>) {
     *stats.entry(key.into()).or_default() += 1;
 }
@@ -248,7 +263,7 @@ impl BoundaryLinker {
     fn call_edges(&mut self, ws: &Workspace, facts: &Facts, controllers: &HashMap<String, Vec<RelPath>>, out: &mut ExtractOutput) {
         let routes = &self.table.routes;
         let link_edges = ws.config.boundary.link_edges;
-        self.calls = facts.js_call_sites.iter().enumerate().map(|(i, s)| calls::match_call(i, s, routes, &self.matcher, &ws.config.boundary)).collect();
+        self.calls = facts.js_call_sites.iter().enumerate().map(|(i, s)| calls::match_call(i, s, &self.table, &self.matcher, &ws.config.boundary)).collect();
         let (mut unmatched, mut ambiguous) = (0usize, 0usize);
         out.stats.insert("calls.total".into(), self.calls.len() as u64);
         out.stats.insert("calls.skipped_links".into(), 0);
@@ -302,6 +317,50 @@ impl BoundaryLinker {
         }
         if unmatched > WARNING_SAMPLE {
             out.warnings.push(Warning::new("boundary_call_unmatched", format!("... and {} more unmatched call sites", unmatched - WARNING_SAMPLE)));
+        }
+    }
+
+    /// Ruby tests -> the controller actions their requests are routed to
+    /// (`EdgeKind::ApiCall`, scoped to the action): `get users_path` in a
+    /// request spec, `visit "/settings"` in a system spec. Same matching as
+    /// JS call sites; unmatched requests (external URLs, Grape APIs, engines)
+    /// are only counted, since tests routinely hit URLs Rails does not route.
+    fn request_edges(&self, ws: &Workspace, facts: &Facts, controllers: &HashMap<String, Vec<RelPath>>, out: &mut ExtractOutput) {
+        let routes = &self.table.routes;
+        out.stats.insert("requests.total".into(), facts.http_requests.len() as u64);
+        for (i, site) in facts.http_requests.iter().enumerate() {
+            let m = calls::match_call(i, site, &self.table, &self.matcher, &ws.config.boundary);
+            let c = match m.outcome {
+                CallOutcome::Matched(c) => c,
+                CallOutcome::Ambiguous(_) => {
+                    bump(&mut out.stats, "requests.ambiguous");
+                    continue;
+                }
+                CallOutcome::NonController => {
+                    bump(&mut out.stats, "requests.non_controller");
+                    continue;
+                }
+                CallOutcome::Unmatched | CallOutcome::Filtered => {
+                    bump(&mut out.stats, "requests.unmatched");
+                    continue;
+                }
+            };
+            bump(&mut out.stats, format!("requests.{}", mounts::confidence_label(c)));
+            // A literal segment in the test's path was written for the route
+            // that has it literally: `/library` means `library#index`, not
+            // the host-constrained `/:username` that also matches it.
+            let best = m.actions.iter().map(|&ri| literal_segments(&routes[ri].path)).max().unwrap_or(0);
+            for &ri in m.actions.iter().filter(|&&ri| literal_segments(&routes[ri].path) == best) {
+                let r = &routes[ri];
+                let Some(files) = controllers.get(&r.controller) else { continue };
+                for f in files {
+                    let mut e = Edge::new(&site.file, f, EdgeKind::ApiCall, c).at(site.line).detail(format!("{} {} → {}", site.callee, site.url, r.endpoint()));
+                    if is_action_name(&r.action) {
+                        e = e.to_scope(&r.action);
+                    }
+                    out.edges.push(e);
+                }
+            }
         }
     }
 
@@ -416,6 +475,7 @@ impl Linker for BoundaryLinker {
 
         self.route_edges(&controllers, &mut out);
         self.call_edges(ws, facts, &controllers, &mut out);
+        self.request_edges(ws, facts, &controllers, &mut out);
         self.mount_edges(ws, &controllers, &mut out);
 
         out.edges.sort_by(|a, b| (&a.from, &a.to, a.kind, a.line, &a.detail, &a.from_scope, &a.to_scope).cmp(&(&b.from, &b.to, b.kind, b.line, &b.detail, &b.from_scope, &b.to_scope)));

@@ -162,6 +162,12 @@ pub struct JsCallSite {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Facts {
     pub js_call_sites: Vec<JsCallSite>,
+    /// HTTP requests made by Ruby tests (`get users_path`, `visit "/about"`
+    /// in request, system, feature and controller specs). Same shape as JS
+    /// call sites: `route_helper` with the helper name in `url`, or a
+    /// literal path with `:param` segments; `callee` is the test method.
+    #[serde(default)]
+    pub http_requests: Vec<JsCallSite>,
     /// Per file, the scopes that edges may name in `from_scope`/`to_scope`,
     /// with their line ranges, sorted by `start`. Lets a diff's changed lines
     /// be turned into "these methods changed". A file absent here, or a line
@@ -179,6 +185,7 @@ pub struct Facts {
 impl Facts {
     pub fn merge(&mut self, other: Facts) {
         self.js_call_sites.extend(other.js_call_sites);
+        self.http_requests.extend(other.http_requests);
         self.scopes.extend(other.scopes);
         if other.mentions.is_some() {
             self.mentions = other.mentions;

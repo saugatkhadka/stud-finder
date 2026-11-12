@@ -1,0 +1,4 @@
+{
+  "name": "ui-kit",
+  "jest": { "moduleNameMapper": { "^@t/(.*)$": "<rootDir>/test/$1", "\\.css$": "<rootDir>/test/style.js" } }
+}

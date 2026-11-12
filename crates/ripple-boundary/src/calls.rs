@@ -1,7 +1,7 @@
 //! JS HTTP call sites -> Rails controllers (`EdgeKind::ApiCall`).
 
 use crate::matching::{is_catch_all, Hit, Matcher};
-use crate::routes::{Route, RouteKind};
+use crate::routes::{Route, RouteKind, RouteTable};
 use ripple_core::config::BoundaryConfig;
 use ripple_core::{Confidence, JsCallSite};
 
@@ -92,7 +92,8 @@ fn first_per_controller(routes: &[Route], hits: impl IntoIterator<Item = usize>)
     out
 }
 
-pub fn match_call(site_index: usize, site: &JsCallSite, routes: &[Route], matcher: &Matcher, cfg: &BoundaryConfig) -> CallMatch {
+pub fn match_call(site_index: usize, site: &JsCallSite, table: &RouteTable, matcher: &Matcher, cfg: &BoundaryConfig) -> CallMatch {
+    let routes = &table.routes[..];
     let routes_table = routes;
     let verb = site.method.as_deref().map(str::to_ascii_uppercase);
     let done = |url: String, outcome, routes: Vec<usize>, hits: &[usize]| {
@@ -102,19 +103,23 @@ pub fn match_call(site_index: usize, site: &JsCallSite, routes: &[Route], matche
 
     if site.route_helper {
         let name = helper_route_name(&site.url);
-        let Some(named_idx) = routes.iter().position(|r| r.name.as_deref() == Some(name.as_str())) else {
+        let Some(named_idx) = table.named(&name) else {
             return done(site.url.clone(), CallOutcome::Unmatched, Vec::new(), &[]);
         };
         let named = &routes[named_idx];
         // The helper names one route; the same path under other verbs is the
         // rest of the resource (`posts_path` -> index and create). Per verb,
-        // only the first route counts (the named one for its own verb), so
+        // routes count up to the first unconstrained one (the named one for
+        // its own verb, unless it is constrained: `get :issues, action:
+        // :issues_calendar, constraints: ics?` followed by `get :issues`), so
         // host-constrained duplicates of the path further down are skipped.
-        let mut seen_verbs: Vec<&str> = vec![named.verb.as_str()];
+        let mut seen_verbs: Vec<&str> = if named.constrained { Vec::new() } else { vec![named.verb.as_str()] };
         let mut hits = vec![named_idx];
         for (i, r) in routes.iter().enumerate() {
-            if r.path == named.path && !seen_verbs.contains(&r.verb.as_str()) {
-                seen_verbs.push(&r.verb);
+            if i != named_idx && r.path == named.path && !seen_verbs.contains(&r.verb.as_str()) && (i > named_idx || r.verb != named.verb) {
+                if !r.constrained {
+                    seen_verbs.push(&r.verb);
+                }
                 hits.push(i);
             }
         }
@@ -197,5 +202,23 @@ mod tests {
         assert_eq!(helper_route_name("edit_post_url"), "edit_post");
         assert_eq!(join_base("/api/", "v1/foo"), "/api/v1/foo");
         assert_eq!(join_base("/", "v1/foo"), "/v1/foo");
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use crate::routes;
+
+    #[test]
+    fn a_constrained_named_route_falls_through_to_the_next_one() {
+        let src = "Rails.application.routes.draw do\n  resource :dashboard, controller: 'dashboard', only: [] do\n    get :issues, action: :issues_calendar, constraints: ->(req) { req.format == :ics }\n    get :issues\n    get :home\n  end\nend\n";
+        let table = routes::build(&[("config/routes.rb".into(), src.as_bytes().to_vec())], false);
+        let matcher = Matcher::new(&table.routes);
+        let site = JsCallSite { file: "spec/x_spec.rb".into(), line: 1, method: Some("GET".into()), url: "issues_dashboard_path".into(), callee: "visit".into(), route_helper: true, link: false };
+        let m = match_call(0, &site, &table, &matcher, &BoundaryConfig::default());
+        let actions: Vec<&str> = m.actions.iter().map(|&i| table.routes[i].action.as_str()).collect();
+        assert_eq!(actions, ["issues_calendar", "issues"]);
+        assert_eq!(m.outcome, CallOutcome::Matched(Confidence::Exact));
     }
 }

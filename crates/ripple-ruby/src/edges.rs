@@ -38,9 +38,15 @@ pub struct EdgeStats {
     pub namespace_no_canonical: u64,
     pub refs_to_namespace_without_canonical: u64,
     pub inferred_unresolved: u64,
+    /// `XSerializer` classes with no model `X`.
+    pub serializer_model_unresolved: u64,
     pub requires_unresolved: u64,
     pub renders_unresolved: u64,
     pub template_consts_unresolved: u64,
+    /// Template identifiers linked to the view helper defining them...
+    pub template_helper_calls: u64,
+    /// ...and those defined in too many helper files to link.
+    pub template_helper_ambiguous: u64,
 }
 
 /// Resolution targets for one declaration, after the namespace policy.
@@ -69,7 +75,13 @@ pub struct EdgeBuilder<'a> {
     actions: &'a [Action],
     /// `ruby.method_level`: mark superclass / mixin references as inheritance.
     method_level: bool,
+    /// View helper method name -> helper files defining it.
+    helpers: HashMap<&'a str, Vec<&'a str>>,
 }
+
+/// A template call to a name defined in more helper files than this is too
+/// ambiguous to link (CE + EE override = 2).
+const HELPER_AMBIGUITY_LIMIT: usize = 2;
 
 impl<'a> EdgeBuilder<'a> {
     pub fn new(
@@ -99,6 +111,12 @@ impl<'a> EdgeBuilder<'a> {
             .collect();
         lib_roots.sort();
         lib_roots.dedup();
+        let mut helpers: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+        for (path, entry) in files {
+            for name in &entry.helper_defs {
+                helpers.entry(name.as_str()).or_default().push(path.as_str());
+            }
+        }
         Self {
             graph,
             files,
@@ -113,6 +131,7 @@ impl<'a> EdgeBuilder<'a> {
             seen: HashMap::new(),
             actions: &[],
             method_level,
+            helpers,
         }
     }
 
@@ -439,6 +458,19 @@ impl<'a> EdgeBuilder<'a> {
                 candidates.push(name.clone());
             }
             candidates.extend(inf.top_level_fallback.iter().cloned());
+            if inf.model_only {
+                // A naming-convention guess: only a model in the repo counts.
+                let is_model = |f: &str| f.split('/').rev().skip(1).any(|s| s == "models");
+                match candidates.iter().filter_map(|c| self.lookup_name(c)).find(|t| t.files.iter().any(|f| is_model(f))) {
+                    Some(t) => {
+                        for &to in t.files.iter().filter(|f| is_model(f)) {
+                            self.push_ref(from, to, EdgeKind::RailsInferred, Confidence::Inferred, inf.line, t.name, false);
+                        }
+                    }
+                    None => self.stats.serializer_model_unresolved += 1,
+                }
+                continue;
+            }
             // Like Rails, the first candidate that exists wins, even if it is defined outside the repo.
             match candidates.iter().find_map(|c| self.lookup_name(c)) {
                 Some(t) => {
@@ -629,6 +661,20 @@ impl<'a> EdgeBuilder<'a> {
                         &r.name,
                     );
                 }
+            }
+        }
+        // Receiverless calls to view helpers (`app/helpers/**`, all included in every view).
+        for (name, line) in &entry.template.idents {
+            match self.helpers.get(name.as_str()) {
+                Some(files) if files.len() <= HELPER_AMBIGUITY_LIMIT => {
+                    let files = files.clone();
+                    for to in files {
+                        self.push(from, to, EdgeKind::RailsView, Confidence::Inferred, *line, name);
+                    }
+                    self.stats.template_helper_calls += 1;
+                }
+                Some(_) => self.stats.template_helper_ambiguous += 1,
+                None => {}
             }
         }
         for (name, line) in &entry.template.consts {

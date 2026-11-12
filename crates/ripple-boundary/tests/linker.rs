@@ -76,7 +76,7 @@ fn rails_route_edges_point_at_controllers() {
 #[test]
 fn call_sites_match_with_the_documented_confidence() {
     let ws = workspace(&fixture_root());
-    let facts = Facts { scopes: Default::default(), mentions: None,
+    let facts = Facts { scopes: Default::default(), mentions: None, http_requests: Vec::new(),
         js_call_sites: vec![
             site(Some("GET"), "/api/v2/widgets"),          // 0 static + verb + one route
             site(Some("GET"), "/api/v2/widgets/:param"),   // 1 dynamic
@@ -130,7 +130,7 @@ fn call_sites_match_with_the_documented_confidence() {
 fn url_prefixes_filter_and_bases_apply_only_without_leading_slash() {
     let mut ws = workspace(&fixture_root());
     ws.config.boundary.url_prefixes = vec!["/api/".into()];
-    let facts = Facts { scopes: Default::default(), mentions: None, js_call_sites: vec![site(Some("GET"), "/about"), site(Some("GET"), "v2/widgets"), site(Some("GET"), "/api/v2/widgets")] };
+    let facts = Facts { scopes: Default::default(), mentions: None, http_requests: Vec::new(), js_call_sites: vec![site(Some("GET"), "/about"), site(Some("GET"), "v2/widgets"), site(Some("GET"), "/api/v2/widgets")] };
     let mut l = BoundaryLinker::new();
     l.link(&ws, &facts, None).unwrap();
     let m = l.call_matches();
@@ -191,7 +191,7 @@ fn warm_link_equals_full_link() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("boundary-warm");
     let _ = std::fs::remove_dir_all(&dir);
     copy_dir(&fixture_root(), &dir);
-    let facts = Facts { scopes: Default::default(), mentions: None, js_call_sites: vec![site(Some("GET"), "/api/v2/widgets"), site(Some("GET"), "/probe")] };
+    let facts = Facts { scopes: Default::default(), mentions: None, http_requests: Vec::new(), js_call_sites: vec![site(Some("GET"), "/api/v2/widgets"), site(Some("GET"), "/probe")] };
     let mut ws = workspace(&dir);
     let mut warm = BoundaryLinker::new();
     let mut prev = fingerprint(&warm.link(&ws, &facts, None).unwrap());
@@ -253,7 +253,7 @@ fn link_site(url: &str) -> JsCallSite {
 #[test]
 fn navigation_links_are_skipped_unless_enabled() {
     let mut ws = workspace(&fixture_root());
-    let facts = Facts { scopes: Default::default(), mentions: None, js_call_sites: vec![link_site("Routes.photo_path"), site(Some("GET"), "/api/v2/widgets")] };
+    let facts = Facts { scopes: Default::default(), mentions: None, http_requests: Vec::new(), js_call_sites: vec![link_site("Routes.photo_path"), site(Some("GET"), "/api/v2/widgets")] };
     let out = BoundaryLinker::new().link(&ws, &facts, None).unwrap();
     let calls = edges_of(&out, EdgeKind::ApiCall);
     assert!(calls.iter().all(|e| e.from == "app/javascript/widgets/api.ts"), "{calls:?}");
@@ -273,7 +273,7 @@ fn navigation_links_are_skipped_unless_enabled() {
 #[test]
 fn api_call_edges_are_scoped_to_each_matched_action() {
     let ws = workspace(&fixture_root());
-    let facts = Facts { scopes: Default::default(), mentions: None,
+    let facts = Facts { scopes: Default::default(), mentions: None, http_requests: Vec::new(),
         js_call_sites: vec![
             helper("Routes.photos_path"),                // index (GET) and create (POST)
             site(Some("POST"), "/photos"),               // create only
@@ -303,7 +303,7 @@ fn a_verb_the_path_does_not_serve_falls_back_to_any_verb() {
     let ws = workspace(&fixture_root());
     // `POST` with `_method: "DELETE"`, or a verb guessed from context: no
     // DELETE /photos route, so every verb of the path, heuristically.
-    let facts = Facts { scopes: Default::default(), mentions: None, js_call_sites: vec![site(Some("DELETE"), "/photos"), JsCallSite { method: Some("DELETE".into()), ..helper("Routes.photos_path") }] };
+    let facts = Facts { scopes: Default::default(), mentions: None, http_requests: Vec::new(), js_call_sites: vec![site(Some("DELETE"), "/photos"), JsCallSite { method: Some("DELETE".into()), ..helper("Routes.photos_path") }] };
     let mut l = BoundaryLinker::new();
     let out = l.link(&ws, &facts, None).unwrap();
     let mut got: Vec<_> = edges_of(&out, EdgeKind::ApiCall).into_iter().map(|e| (e.to_scope.clone().unwrap(), e.confidence)).collect();
@@ -337,4 +337,38 @@ fn view_mount_edges_are_scoped_to_the_rendering_action() {
     // A layout belongs to no action: no controller edge.
     let gallery = "app/javascript/widgets/Gallery.tsx";
     assert!(mounts.iter().filter(|e| e.from == gallery).all(|e| e.to == "app/views/layouts/application.html.haml"));
+}
+
+fn request(callee: &str, verb: &str, url: &str, helper: bool) -> JsCallSite {
+    JsCallSite { file: "spec/requests/photos_spec.rb".into(), line: 3, method: Some(verb.into()), url: url.into(), callee: callee.into(), route_helper: helper, link: false }
+}
+
+#[test]
+fn test_requests_link_to_the_routed_action() {
+    let ws = workspace(&fixture_root());
+    let facts = Facts {
+        http_requests: vec![
+            request("visit", "GET", "photos_path", true),          // photos#index only (verb given)
+            request("post", "POST", "like_photo_path", true),      // photos#like
+            request("get", "GET", "/photos/:param/comments", false), // comments#index
+            request("visit", "GET", "/nowhere/at/all", false),     // unmatched: counted, no edge
+        ],
+        ..Default::default()
+    };
+    let mut l = BoundaryLinker::new();
+    let out = l.link(&ws, &facts, None).unwrap();
+    let mut got: Vec<_> = edges_of(&out, EdgeKind::ApiCall).into_iter().map(|e| (e.from.as_str(), e.to.as_str(), e.to_scope.clone().unwrap_or_default(), e.confidence)).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("spec/requests/photos_spec.rb", "app/controllers/comments_controller.rb", "index".to_string(), Confidence::Heuristic),
+            ("spec/requests/photos_spec.rb", "app/controllers/photos_controller.rb", "index".to_string(), Confidence::Exact),
+            ("spec/requests/photos_spec.rb", "app/controllers/photos_controller.rb", "like".to_string(), Confidence::Exact),
+        ]
+    );
+    assert_eq!(out.stats["requests.total"], 4);
+    assert_eq!(out.stats["requests.unmatched"], 1);
+    // Requests never produce warnings (tests hit unrouted URLs on purpose).
+    assert!(out.warnings.iter().all(|w| !w.message.contains("nowhere")));
 }

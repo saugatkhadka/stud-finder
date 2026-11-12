@@ -43,6 +43,9 @@ pub struct FileEntry {
     /// What the file defines and mentions, for the mention filter (taken out
     /// of `methods`); `None` when unknown (method facts off or failed).
     pub mentions: Option<std::sync::Arc<ripple_core::FileMentions>>,
+    /// Methods a view helper module (`app/helpers/**`) defines with `def name`
+    /// (not `def self.name`), sorted and unique.
+    pub helper_defs: Vec<String>,
     /// Normalized constant names Zeitwerk would map this path to.
     pub zeitwerk_keys: Vec<String>,
     pub warnings: Vec<Warning>,
@@ -82,8 +85,12 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
     let mut local_graph = None;
     match kind {
         SourceKind::Ruby => {
-            let controller = paths::is_scoped_controller(rel);
+            let want = rails::Want { controller: paths::is_scoped_controller(rel), requests: paths::is_test_path(rel), serializer: rel.split('/').any(|s| s == "serializers") && !paths::is_test_path(rel) };
+            let controller = want.controller;
             entry.zeitwerk_keys = paths::zeitwerk_keys(rel, extra_roots);
+            if paths::is_view_helper(rel) {
+                entry.helper_defs = helper_defs(&source);
+            }
             match catch_unwind(AssertUnwindSafe(|| {
                 build_local_graph(
                     rel.into(),
@@ -125,11 +132,11 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             // One prism parse for the Rails DSL facts, actions and methods.
             match catch_unwind(AssertUnwindSafe(|| {
                 if !method_level {
-                    return (rails::collect(&source, controller), MethodFacts::default());
+                    return (rails::collect(&source, want), MethodFacts::default());
                 }
                 let result = ruby_prism::parse(source.as_bytes());
                 let root = result.node();
-                (rails::collect_root(&root, &source, controller), methods::collect(&root, source.as_bytes(), controller))
+                (rails::collect_root(&root, &source, want), methods::collect(&root, source.as_bytes(), controller))
             })) {
                 Ok((f, mut m)) => {
                     entry.facts = f;
@@ -167,6 +174,27 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
         entry,
         local_graph,
     }
+}
+
+/// `def name` at the start of a line (instance methods; `def self.x` is not
+/// callable from a view). A text scan, so it works without the prism pass.
+fn helper_defs(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = source
+        .lines()
+        .filter_map(|l| {
+            let rest = l.trim_start().strip_prefix("def ")?.trim_start();
+            let end = rest
+                .char_indices()
+                .find(|&(i, c)| !(c.is_ascii_alphanumeric() || c == '_' || (i > 0 && matches!(c, '?' | '!'))))
+                .map_or(rest.len(), |(i, c)| if matches!(c, '?' | '!') { i + 1 } else { i });
+            let name = &rest[..end];
+            let first = name.chars().next()?;
+            (first.is_ascii_lowercase() || first == '_').then(|| name.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn line_starts(source: &str) -> Vec<usize> {

@@ -94,6 +94,7 @@ const EXPECTED: &[&str] = &[
     "app/components/badge_component.rb -> app/components/badge_component.html.erb [RailsView Inferred L0] component template",
     "app/controllers/accounts_controller.rb -> app/controllers/application_controller.rb [RubyConstant Exact L1] ApplicationController",
     "app/controllers/accounts_controller.rb -> app/models/account.rb [RubyConstant Exact L5 @show] Account",
+    "app/controllers/accounts_controller.rb -> app/views/accounts/_badge.html.erb [RailsView Inferred L0] views of accounts",
     "app/controllers/accounts_controller.rb -> app/views/accounts/_card.html.haml [RailsView Inferred L0] views of accounts",
     "app/controllers/accounts_controller.rb -> app/views/accounts/index.json.jbuilder [RailsView Inferred L0 @index] views of accounts",
     "app/controllers/accounts_controller.rb -> app/views/accounts/show.html.erb [RailsView Inferred L0 @show] views of accounts",
@@ -146,7 +147,12 @@ const EXPECTED: &[&str] = &[
     "app/models/status.rb -> app/models/account.rb [RailsInferred Inferred L3] Account",
     "app/models/status.rb -> app/models/application_record.rb [RubyConstant Exact L1] ApplicationRecord",
     "app/models/status.rb -> app/models/media_attachment.rb [RailsInferred Inferred L4] MediaAttachment",
+    "app/serializers/rest/account_serializer.rb -> app/models/account.rb [RailsInferred Inferred L1] Account",
+    "app/serializers/rest/account_serializer.rb -> app/models/status.rb [RailsInferred Inferred L2] Status",
     "app/serializers/status_serializer.rb -> app/models/media_attachment.rb [RailsInferred Inferred L2] MediaAttachment",
+    // A view helper call; `shared_title` is defined in three helpers (ambiguous),
+    // `not_a_view_helper` only as `def self.`.
+    "app/views/accounts/_badge.html.erb -> app/helpers/accounts_helper.rb [RailsView Inferred L1] badge_label",
     "app/views/accounts/_card.html.haml -> app/models/account.rb [RailsView Inferred L2] Account",
     "app/views/accounts/_card.html.haml -> app/views/shared/_nav.html.erb [RailsView Inferred L3] shared/nav",
     "app/views/accounts/_card.html.haml -> ee/app/views/shared/_nav.html.haml [RailsView Inferred L3] shared/nav",
@@ -203,6 +209,9 @@ fn rails_app_stats_and_warnings() {
     assert_eq!(s["ruby_namespaces_over_limit_no_canonical"], 1, "Reopened");
     assert_eq!(s["ruby_refs_to_namespace_without_canonical"], 1);
     assert_eq!(s["ruby_renders_unresolved"], 2);
+    assert_eq!(s["ruby_serializer_model_unresolved"], 2, "Widget, TagParser (not a model)");
+    assert_eq!(s["ruby_template_helper_calls"], 1, "badge_label");
+    assert_eq!(s["ruby_template_helper_ambiguous"], 1, "shared_title");
     assert!(s["ruby_refs_namespace_skipped"] >= 3);
     for k in [
         "ruby_time_analyse_us",

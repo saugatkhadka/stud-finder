@@ -3,10 +3,12 @@
 //! `oxc_resolver` does the file-level work (extensions, `index.*`, `.js` ->
 //! `.ts`, directory `package.json` `main`) over a virtual file system. This
 //! module adds what it cannot know without `node_modules`: tsconfig `paths`,
-//! bundler aliases from `ripple.yml`, and workspace packages.
+//! bundler aliases from `ripple.yml`, aliases read from Jest / webpack / vite
+//! configs ([`crate::bundler`]), and workspace packages.
 //!
 //! Order for a non-relative specifier: configured aliases, tsconfig `paths`
-//! (nearest config first, then its ancestors), workspace packages, `baseUrl`.
+//! (nearest config first, then its ancestors), discovered aliases, workspace
+//! packages, `baseUrl`.
 //! A specifier that one of the first three *claims* but nothing resolves is
 //! `Unresolved`; one that nothing claims is an external npm package.
 
@@ -46,6 +48,9 @@ pub struct ModuleResolver {
     configs: HashMap<String, Vec<TsConfig>>,
     /// `(key, repo-relative dir)`, longest key first.
     aliases: Vec<(String, String)>,
+    /// Read from Jest / bundler configs; longest key first, file order within a key.
+    discovered: Vec<crate::bundler::Alias>,
+    discovered_deps: Vec<String>,
     pub workspaces: Workspaces,
     /// Problems found while loading configuration, as `(code, message)`.
     pub problems: Vec<(&'static str, String)>,
@@ -80,6 +85,8 @@ impl ModuleResolver {
             oxc: ResolverGeneric::new_with_file_system(fs, oxc_options()),
             configs: HashMap::new(),
             aliases: Vec::new(),
+            discovered: Vec::new(),
+            discovered_deps: Vec::new(),
             workspaces: Workspaces::default(),
             problems: Vec::new(),
         };
@@ -130,6 +137,21 @@ impl ModuleResolver {
             })
             .collect();
         self.aliases.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+
+        let found = crate::bundler::discover(&self.root, &files);
+        for p in found.problems {
+            self.problems.push(("js_bundler_alias_unreadable", p));
+        }
+        let mut discovered: Vec<crate::bundler::Alias> = Vec::new();
+        for a in found.aliases {
+            match discovered.iter_mut().find(|d| d.scope == a.scope && d.key == a.key && d.target == a.target) {
+                Some(d) => d.bare |= a.bare,
+                None => discovered.push(a),
+            }
+        }
+        discovered.sort_by_key(|a| std::cmp::Reverse(a.key.len()));
+        self.discovered = discovered;
+        self.discovered_deps = found.deps;
         drop(files);
 
         self.workspaces = Workspaces::discover(&self.root, &self.files.read().unwrap_or_else(|e| e.into_inner()));
@@ -140,7 +162,12 @@ impl ModuleResolver {
 
     /// Files whose change must trigger [`load_config`](Self::load_config).
     pub fn config_deps(&self) -> impl Iterator<Item = &String> {
-        self.configs.values().flatten().flat_map(|c| c.deps.iter()).chain(self.workspaces.deps.iter())
+        self.configs.values().flatten().flat_map(|c| c.deps.iter()).chain(self.workspaces.deps.iter()).chain(self.discovered_deps.iter())
+    }
+
+    /// Aliases read from Jest / bundler configs (after de-duplication).
+    pub fn discovered_count(&self) -> usize {
+        self.discovered.len()
     }
 
     pub fn config_count(&self) -> usize {
@@ -202,6 +229,22 @@ impl ModuleResolver {
                 if let Some(t) = targets.iter().find_map(|t| self.resolve_target(t, false)) {
                     return Outcome::Resolved { target: t, class: Class::Alias };
                 }
+            }
+        }
+
+        // 3. Aliases read from Jest / bundler configs whose scope holds the importer.
+        for a in &self.discovered {
+            if !a.scope.is_empty() && importer_dir != a.scope && !importer_dir.starts_with(&format!("{}/", a.scope)) {
+                continue;
+            }
+            let rest = match spec.strip_prefix(a.key.as_str()) {
+                Some("") if a.bare => "",
+                Some(r) if r.starts_with('/') && r.len() > 1 => r,
+                _ => continue,
+            };
+            claimed.get_or_insert(Class::Alias);
+            if let Some(t) = paths::join(&a.target, rest.trim_start_matches('/')).and_then(|t| self.resolve_target(&t, false)) {
+                return Outcome::Resolved { target: t, class: Class::Alias };
             }
         }
 
