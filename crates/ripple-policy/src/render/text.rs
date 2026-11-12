@@ -264,10 +264,10 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
         more(&mut o, shown, r.counts.further, "");
     }
 
-    // 8. Tests reaching the change (static reach, not coverage).
+    // 8. Tests that depend on the change (graph reach, not coverage; not a selection to run).
     if r.counts.tests > 0 {
         let shown = r.tests.len().min(cap);
-        let _ = writeln!(o, "tests (static reach) {}: {} direct", r.counts.tests, r.counts.tests_direct);
+        let _ = writeln!(o, "tests that depend on it {}: {} direct", r.counts.tests, r.counts.tests_direct);
         for t in r.tests.iter().take(cap) {
             let note = match (t.depth, t.mention_line.or(t.line)) {
                 (0, _) => "  changed".to_string(),

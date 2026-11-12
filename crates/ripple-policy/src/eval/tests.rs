@@ -396,7 +396,7 @@ fn budgets_cut_lists_and_say_so() {
     let t = crate::render::text::render(&r, usize::MAX, false);
     assert!(t.contains("dependents 30/60:\n"), "{t}");
     assert!(t.contains("  +30 more (--all)\n"), "{t}");
-    assert!(t.contains("tests (static reach) 60: 60 direct\n"), "{t}");
+    assert!(t.contains("tests that depend on it 60: 60 direct\n"), "{t}");
     assert!(t.contains("further 60 files  hops 2:60  ruby:60  areas pay:6  notable 6\n"), "{t}");
     assert!(t.lines().count() < 60, "{t}");
 
@@ -469,7 +469,7 @@ fn text_snapshot_plain_and_colour() {
     let t = crate::render::text::render(&r, 10, false);
     assert!(!t.contains('\x1b'));
     let lines: Vec<&str> = t.lines().collect();
-    assert_eq!(lines[0], "2 changed files; 1 direct dependent; 3 more at further hops; 1 test reaches it; CRITICAL risk; may be incomplete (global_file)");
+    assert_eq!(lines[0], "2 changed files; 1 direct dependent; 3 more at further hops; 1 test depends on it; CRITICAL risk; may be incomplete (global_file)");
     assert_eq!(lines[1], "INCOMPLETE config/initializers/stripe.rb: global_file: matches `global_files`: the whole app may depend on it in ways no static graph sees");
     assert!(lines[2].starts_with("changed "), "risk comes after the correctness signals: {t}");
     let risk = t.lines().find(|l| l.starts_with("risk ")).unwrap();
@@ -482,7 +482,7 @@ tests ").unwrap(), "{t}");
     assert!(t.contains("\ndependents 1/1:\n  app/services/charge.rb:4  ruby_constant Invoice  -> app/models/invoice.rb  [billing]\n"), "{t}");
     assert!(t.contains("\nfurther 3 files  hops 2:1 3:1 4:1  ruby:1 js:2  areas billing:1 frontend:2  notable 2\n"), "{t}");
     assert!(t.contains("  app/javascript/billing/api.ts  hop 3 via app/controllers/invoices_controller.rb  heuristic  crosses_boundary,high_tier  [billing,frontend]\n"), "{t}");
-    assert!(t.contains("\ntests (static reach) 1: 1 direct\n  spec/models/invoice_spec.rb:3\n"), "{t}");
+    assert!(t.contains("\ntests that depend on it 1: 1 direct\n  spec/models/invoice_spec.rb:3\n"), "{t}");
     assert!(t.contains("warning: config/initializers/stripe.rb: global: static impact"), "{t}");
     assert!(!t.contains("relies on"), "invoice.rb relies on nothing");
     let c = crate::render::text::render(&r, 10, true);
@@ -591,7 +591,7 @@ fn scoped_seeds_narrow_every_query() {
     assert_eq!(r.changed[0].scopes, Some(vec!["refund!".to_string()]));
     assert!(!r.query.file_level);
     assert_eq!(r.changed[0].dependents, 6, "direct dependents stay the file-level fan-in");
-    assert!(r.summary.contains("; 2 direct dependents; 1 more at further hops; 0 tests reach it; method-level (7 if whole files changed)"), "{}", r.summary);
+    assert!(r.summary.contains("; 2 direct dependents; 1 more at further hops; 0 tests depend on it; method-level (7 if whole files changed)"), "{}", r.summary);
 
     // The same diff analysed file-level: the auth and boundary rules fire.
     let w = eval_on(&g, &p, &refund, true);

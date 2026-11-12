@@ -316,6 +316,20 @@ fn query_commands_text() {
     assert_eq!(o.status.code(), Some(2));
 }
 
+/// `dependents` takes `--sync` and `--no-wait` like `impact`.
+#[test]
+fn dependents_sync_and_no_wait() {
+    let env = billing();
+    let v = env.json(&["dependents", "billing/invoice.txt", "--format", "json", "--no-wait"]);
+    assert_eq!(v["counts"]["dependents"], 1);
+    // A new file and its edge, not named in the request: only a synced answer must see it.
+    std::fs::write(&env.edges, "app/charge.txt billing/invoice.txt\napp/ui.txt app/charge.txt\nspec/invoice_spec.txt billing/invoice.txt\napp/new.txt billing/invoice.txt\n").unwrap();
+    env.repo.write("app/new.txt", "1\n");
+    let v = env.json(&["dependents", "billing/invoice.txt", "--format", "json", "--sync"]);
+    assert_eq!(v["counts"]["dependents"], 2, "{v}");
+    assert_eq!(env.run(&["dependents", "billing/invoice.txt", "--sync", "--no-wait"]).status.code(), Some(2), "the two flags conflict");
+}
+
 // ---- method-level scopes ----------------------------------------------------
 
 /// purchase.txt is laid out like a Ruby model: refund! on lines 4-7, charge!

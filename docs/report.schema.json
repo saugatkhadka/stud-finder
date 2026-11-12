@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ripple impact report",
+  "description": "Output of `ripple impact --format json`, `ripple dependents --format json` and `ripple check --format json` (schema_version 2). Optional fields are omitted, never null; lists are ordered as documented in the README.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "summary", "counts", "truncated", "changed", "removed_methods", "dependents", "inherit_only", "also_mentioned", "relies_on", "further", "tests", "incomplete", "warnings", "query", "index", "timing"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "summary": { "type": "string" },
+    "counts": { "$ref": "#/$defs/counts" },
+    "truncated": { "type": "boolean" },
+    "changed": { "type": "array", "items": { "$ref": "#/$defs/changed" } },
+    "removed_methods": { "type": "array", "items": { "$ref": "#/$defs/removed_method" } },
+    "dependents": { "type": "array", "items": { "$ref": "#/$defs/dependent" } },
+    "inherit_only": { "type": "array", "items": { "$ref": "#/$defs/path" }, "description": "Direct dependents that inherit from / include a changed file but do not mention its changed methods (method-scoped changes only)." },
+    "also_mentioned": { "type": "array", "items": { "$ref": "#/$defs/also_mentioned" } },
+    "relies_on": { "type": "array", "items": { "$ref": "#/$defs/dependency" } },
+    "further": { "$ref": "#/$defs/further" },
+    "tests": { "type": "array", "description": "Test files that depend on the change through the graph: changed tests and hop-1 tests by default (counts.tests has them all). Not coverage, and not a selection of tests to run.", "items": { "$ref": "#/$defs/test" } },
+    "incomplete": { "type": "array", "items": { "$ref": "#/$defs/incomplete" } },
+    "blind_spots": { "type": "array", "items": { "type": "string" } },
+    "usually_changes_with": { "type": "array", "description": "At most 5 files outside the diff and its direct dependents that git history shows changing together with a changed file, best first. Absent when there are none or co-change is not ready (see `signals`).", "items": { "$ref": "#/$defs/cochange" } },
+    "signals": { "$ref": "#/$defs/signals" },
+    "policy": { "$ref": "#/$defs/policy" },
+    "warnings": { "type": "array", "items": { "$ref": "#/$defs/warning" } },
+    "query": { "$ref": "#/$defs/query" },
+    "index": { "$ref": "#/$defs/index" },
+    "timing": { "$ref": "#/$defs/timing" }
+  },
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0 },
+    "line": { "type": "integer", "minimum": 1 },
+    "path": { "type": "string" },
+    "names": { "type": "array", "items": { "type": "string" } },
+    "edge_kind": { "enum": ["ruby_constant", "ruby_require", "rails_inferred", "rails_view", "rails_route", "js_import", "js_dynamic_import", "api_call", "view_mount", "graph_ql", "asset"] },
+    "confidence": { "enum": ["exact", "inferred", "heuristic"] },
+    "risk": { "enum": ["low", "medium", "high", "critical"] },
+    "language": { "enum": ["ruby", "js", "template", "other"] },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["changed", "dependents", "relies_on", "further", "further_notable", "impacted", "impacted_file_level", "tests", "tests_direct", "removed_methods", "inherit_only", "also_mentioned"],
+      "properties": {
+        "changed": { "$ref": "#/$defs/count" },
+        "dependents": { "$ref": "#/$defs/count" },
+        "relies_on": { "$ref": "#/$defs/count" },
+        "further": { "$ref": "#/$defs/count" },
+        "further_notable": { "$ref": "#/$defs/count" },
+        "impacted": { "$ref": "#/$defs/count" },
+        "impacted_file_level": { "$ref": "#/$defs/count" },
+        "tests": { "$ref": "#/$defs/count" },
+        "tests_direct": { "$ref": "#/$defs/count" },
+        "removed_methods": { "$ref": "#/$defs/count" },
+        "inherit_only": { "$ref": "#/$defs/count" },
+        "also_mentioned": { "$ref": "#/$defs/count" }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["body", "method_added", "class_body", "signature", "method_removed", "whole_file"] },
+        "methods": { "$ref": "#/$defs/names" },
+        "signatures": { "$ref": "#/$defs/names" },
+        "added_methods": { "$ref": "#/$defs/names" },
+        "removed_methods": { "$ref": "#/$defs/names" },
+        "class_body": { "type": "boolean" },
+        "whole_file": { "enum": ["added", "deleted", "renamed", "no_diff", "unsupported_language"] }
+      }
+    },
+    "changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "status", "language", "areas", "change", "dependents", "in_graph", "is_test", "is_global"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "status": { "enum": ["added", "modified", "deleted", "renamed"] },
+        "old_path": { "$ref": "#/$defs/path" },
+        "added": { "$ref": "#/$defs/count" },
+        "deleted": { "$ref": "#/$defs/count" },
+        "first_line": { "$ref": "#/$defs/line" },
+        "scopes": { "$ref": "#/$defs/names" },
+        "language": { "$ref": "#/$defs/language" },
+        "areas": { "$ref": "#/$defs/names" },
+        "change": { "$ref": "#/$defs/change" },
+        "dependents": { "$ref": "#/$defs/count" },
+        "in_graph": { "type": "boolean" },
+        "is_test": { "type": "boolean" },
+        "is_global": { "type": "boolean" },
+        "metrics": { "$ref": "#/$defs/metrics" }
+      }
+    },
+    "signal_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["ready", "building", "loading", "disabled", "unavailable"] },
+        "reason": { "type": "string", "description": "Why the signal is not ready, or a caveat when it is." }
+      }
+    },
+    "signals": {
+      "type": "object",
+      "description": "State of each signal besides the dependency graph. Rules needing a signal that is not ready do not fire (and add a `rule_signal_not_ready` warning).",
+      "additionalProperties": false,
+      "required": ["complexity", "churn", "cochange", "coverage", "hotspot"],
+      "properties": {
+        "complexity": { "$ref": "#/$defs/signal_status" },
+        "churn": { "$ref": "#/$defs/signal_status" },
+        "cochange": { "$ref": "#/$defs/signal_status" },
+        "coverage": { "$ref": "#/$defs/signal_status" },
+        "hotspot": { "$ref": "#/$defs/signal_status" }
+      }
+    },
+    "percent": { "type": "number", "minimum": 0 },
+    "metrics": {
+      "type": "object",
+      "description": "Size, complexity, churn, coverage and hotspot rank of a changed non-test file. Each part is absent when unknown or its signal is not ready.",
+      "additionalProperties": false,
+      "properties": {
+        "complexity": { "$ref": "#/$defs/count" },
+        "max_method": { "$ref": "#/$defs/count" },
+        "lines": { "$ref": "#/$defs/count" },
+        "churn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commits", "recent_commits"],
+          "properties": {
+            "commits": { "$ref": "#/$defs/count" },
+            "recent_commits": { "$ref": "#/$defs/count" },
+            "last_changed": { "type": "integer", "description": "Unix seconds." }
+          }
+        },
+        "coverage": {
+          "type": "object",
+          "description": "Absent when the file is in no coverage report (unknown, not 0%).",
+          "additionalProperties": false,
+          "required": ["covered", "coverable"],
+          "properties": {
+            "percent": { "$ref": "#/$defs/percent" },
+            "covered": { "$ref": "#/$defs/count" },
+            "coverable": { "$ref": "#/$defs/count" },
+            "changed_lines_percent": { "$ref": "#/$defs/percent" },
+            "stale": { "type": "boolean" }
+          }
+        },
+        "hotspot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rank", "of", "percentile"],
+          "properties": {
+            "rank": { "type": "integer", "minimum": 1 },
+            "of": { "$ref": "#/$defs/count", "description": "Files ranked: `rank` of `of`." },
+            "percentile": { "$ref": "#/$defs/percent" },
+            "hotspot": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "cochange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "together", "of", "why"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "via": { "$ref": "#/$defs/path" },
+        "together": { "$ref": "#/$defs/count" },
+        "of": { "$ref": "#/$defs/count" },
+        "why": { "type": "string" }
+      }
+    },
+    "mention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "how"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "line": { "$ref": "#/$defs/line" },
+        "how": { "enum": ["same_file", "dependent", "by_name"] }
+      }
+    },
+    "also_mentioned": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "of", "definitions", "total", "files"],
+      "properties": {
+        "name": { "type": "string" },
+        "of": { "$ref": "#/$defs/path" },
+        "definitions": { "$ref": "#/$defs/count" },
+        "total": { "$ref": "#/$defs/count" },
+        "singleton": { "const": true },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/mention" } }
+      }
+    },
+    "removed_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "method", "mentions", "mentions_total", "other_definitions"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "method": { "type": "string" },
+        "mentions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/mention" }
+        },
+        "mentions_total": { "$ref": "#/$defs/count" },
+        "other_definitions": { "$ref": "#/$defs/count" }
+      }
+    },
+    "dependent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "kind", "confidence", "of", "language"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "line": { "$ref": "#/$defs/line" },
+        "kind": { "$ref": "#/$defs/edge_kind" },
+        "detail": { "type": "string" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "of": { "$ref": "#/$defs/path" },
+        "from_scope": { "type": "string" },
+        "to_scope": { "type": "string" },
+        "inherit": { "const": true },
+        "uses_methods": { "$ref": "#/$defs/names" },
+        "mention_line": { "$ref": "#/$defs/line" },
+        "calls_on_constant": { "type": "array", "items": { "$ref": "#/$defs/line" } },
+        "language": { "$ref": "#/$defs/language" },
+        "areas": { "$ref": "#/$defs/names" },
+        "crosses_boundary": { "const": true }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "of", "kind", "confidence"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "of": { "$ref": "#/$defs/path" },
+        "line": { "$ref": "#/$defs/line" },
+        "kind": { "$ref": "#/$defs/edge_kind" },
+        "detail": { "type": "string" },
+        "confidence": { "$ref": "#/$defs/confidence" }
+      }
+    },
+    "further": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["by_depth", "by_language", "by_area", "by_tier", "files"],
+      "properties": {
+        "by_depth": { "type": "object", "additionalProperties": { "$ref": "#/$defs/count" } },
+        "by_language": { "type": "object", "additionalProperties": { "$ref": "#/$defs/count" } },
+        "by_area": { "type": "object", "additionalProperties": { "$ref": "#/$defs/count" } },
+        "by_tier": { "type": "object", "additionalProperties": { "$ref": "#/$defs/count" } },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "depth", "via", "of", "kind", "confidence", "language"],
+            "properties": {
+              "file": { "$ref": "#/$defs/path" },
+              "depth": { "$ref": "#/$defs/count" },
+              "via": { "$ref": "#/$defs/path" },
+              "of": { "$ref": "#/$defs/path" },
+              "kind": { "$ref": "#/$defs/edge_kind" },
+              "confidence": { "$ref": "#/$defs/confidence" },
+              "language": { "$ref": "#/$defs/language" },
+              "areas": { "$ref": "#/$defs/names" },
+              "notable": { "type": "array", "items": { "enum": ["crosses_boundary", "high_tier", "global"] } }
+            }
+          }
+        }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "depth"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "depth": { "$ref": "#/$defs/count" },
+        "of": { "$ref": "#/$defs/path" },
+        "via": { "$ref": "#/$defs/path" },
+        "kind": { "$ref": "#/$defs/edge_kind" },
+        "line": { "$ref": "#/$defs/line" },
+        "detail": { "type": "string" },
+        "mention_line": { "$ref": "#/$defs/line" }
+      }
+    },
+    "incomplete": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "message"],
+      "properties": {
+        "reason": { "enum": ["global_file", "not_in_graph", "dynamic_dispatch", "unresolved_references", "stale_index"] },
+        "file": { "$ref": "#/$defs/path" },
+        "message": { "type": "string" }
+      }
+    },
+    "hop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "kind": { "$ref": "#/$defs/edge_kind" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "line": { "$ref": "#/$defs/line" },
+        "detail": { "type": "string" },
+        "from_scope": { "type": "string" },
+        "to_scope": { "type": "string" },
+        "inherit": { "const": true }
+      }
+    },
+    "impact_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "depth", "path"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "depth": { "$ref": "#/$defs/count" },
+        "path": { "type": "array", "items": { "$ref": "#/$defs/hop" } }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk", "reasons", "require", "owners", "areas"],
+      "properties": {
+        "risk": { "$ref": "#/$defs/risk" },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rule", "risk", "message", "require", "builtin", "evidence"],
+            "properties": {
+              "rule": { "type": "string" },
+              "risk": { "$ref": "#/$defs/risk" },
+              "message": { "type": "string" },
+              "description": { "type": "string" },
+              "require": { "$ref": "#/$defs/names" },
+              "builtin": { "type": "boolean" },
+              "evidence": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["changed", "impacted", "impacted_matching"],
+                "properties": {
+                  "changed": { "type": "array", "items": { "$ref": "#/$defs/path" } },
+                  "impacted": { "type": "array", "items": { "$ref": "#/$defs/impact_path" } },
+                  "impacted_matching": { "$ref": "#/$defs/count" },
+                  "counts": { "type": "object", "additionalProperties": { "$ref": "#/$defs/count" } }
+                }
+              }
+            }
+          }
+        },
+        "require": { "$ref": "#/$defs/names" },
+        "owners": { "$ref": "#/$defs/names" },
+        "areas": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["area", "tier", "owners", "touched", "files", "min_depth"],
+            "properties": {
+              "area": { "type": "string" },
+              "tier": { "$ref": "#/$defs/risk" },
+              "owners": { "$ref": "#/$defs/names" },
+              "touched": { "type": "boolean" },
+              "files": { "$ref": "#/$defs/count" },
+              "min_depth": { "$ref": "#/$defs/count" },
+              "example": { "$ref": "#/$defs/impact_path" }
+            }
+          }
+        }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "file": { "type": ["string", "null"] }
+      }
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_depth", "min_confidence", "file_level", "all"],
+      "properties": {
+        "max_depth": { "$ref": "#/$defs/count" },
+        "min_confidence": { "$ref": "#/$defs/confidence" },
+        "file_level": { "type": "boolean" },
+        "all": { "type": "boolean" }
+      }
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation", "nodes", "edges", "pending_changes"],
+      "properties": {
+        "generation": { "$ref": "#/$defs/count" },
+        "nodes": { "$ref": "#/$defs/count" },
+        "edges": { "$ref": "#/$defs/count" },
+        "pending_changes": { "$ref": "#/$defs/count" },
+        "stale": { "const": true }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["refresh_us", "query_us", "evaluate_us"],
+      "properties": {
+        "refresh_us": { "$ref": "#/$defs/count" },
+        "query_us": { "$ref": "#/$defs/count" },
+        "evaluate_us": { "$ref": "#/$defs/count" }
+      }
+    }
+  }
+}

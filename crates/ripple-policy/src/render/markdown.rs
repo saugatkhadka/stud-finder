@@ -73,7 +73,7 @@ pub fn render(report: &Report, max_listed: usize) -> String {
     head.push(format!("**{}** changed file{}", r.counts.changed, plural(r.counts.changed)));
     head.push(format!("**{}** direct dependent{}", thousands(r.counts.dependents), plural(r.counts.dependents)));
     head.push(impacted_head(r));
-    head.push(format!("**{}** test{} reach it", thousands(r.counts.tests), plural(r.counts.tests)));
+    head.push(format!("**{}** test{} depend{} on it", thousands(r.counts.tests), plural(r.counts.tests), if r.counts.tests == 1 { "s" } else { "" }));
     if let Some(p) = &r.policy
         && !p.require.is_empty()
     {
@@ -285,7 +285,7 @@ pub fn render(report: &Report, max_listed: usize) -> String {
     }
 
     if r.counts.tests > 0 {
-        let _ = writeln!(o, "### Tests that reach the change ({}; {} direct)\n", thousands(r.counts.tests), r.counts.tests_direct);
+        let _ = writeln!(o, "### Tests that depend on the change ({}; {} direct)\n", thousands(r.counts.tests), r.counts.tests_direct);
         let _ = writeln!(o, "```");
         for t in r.tests.iter().take(cap) {
             let _ = writeln!(o, "{}", t.file);

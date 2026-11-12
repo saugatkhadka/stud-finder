@@ -20,7 +20,7 @@ pub struct Config {
     /// static graph can see their consumers (initializers, lockfiles, ...).
     pub global_files: Vec<String>,
     /// Globs identifying test files. Tests are reported separately
-    /// ("tests to run") and do not count toward blast-radius size.
+    /// ("tests that depend on it") and do not count toward blast-radius size.
     pub tests: Vec<String>,
     pub rules: Vec<Rule>,
     pub query: QueryConfig,

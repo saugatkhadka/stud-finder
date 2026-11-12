@@ -80,8 +80,9 @@ pub struct Report {
     pub relies_on: Vec<Dependency>,
     /// Non-test files 2 or more hops away, summarised.
     pub further: Further,
-    /// Test files that reach the change through the graph (static reach, not
-    /// coverage): changed tests (depth 0) and hop-1 tests by default, all with `all`.
+    /// Test files that depend on the change through the graph (not coverage,
+    /// and not a selection of tests to run): changed tests (depth 0) and hop-1
+    /// tests by default, all with `all`.
     pub tests: Vec<TestFile>,
     /// Why the lists above may miss files. Empty = nothing known to be missing.
     pub incomplete: Vec<Incomplete>,
@@ -126,7 +127,7 @@ pub struct Counts {
     /// What `impacted` would be if every changed file were wholly changed
     /// and method / action scopes were ignored (a superset).
     pub impacted_file_level: usize,
-    /// Tests reaching the change at any depth, plus changed tests.
+    /// Tests that depend on the change at any depth, plus changed tests.
     pub tests: usize,
     /// Changed tests plus tests at hop 1.
     pub tests_direct: usize,
