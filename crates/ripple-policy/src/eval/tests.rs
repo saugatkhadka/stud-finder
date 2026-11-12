@@ -1332,7 +1332,7 @@ fn report_metrics_signals_and_usually_changes_with() {
     assert_eq!(mx.churn.unwrap().recent_commits, 41);
     assert_eq!(mx.coverage.unwrap().percent, Some(12.0));
     assert!(mx.hotspot.unwrap().hotspot);
-    assert_eq!(crate::signals::metrics_line(mx), "cx 120 (max 30) · churn 41/90d · cov 12% (changed lines 20%) · hotspot #3 of 2114");
+    assert_eq!(crate::signals::metrics_line(mx), "cx 120 (max 30) · churn 41/90d · cov 12% (changed lines 20%) · hotspot #3");
     assert!(r.changed.iter().find(|c| c.path == "spec/models/invoice_spec.rb").unwrap().metrics.is_none(), "tests have no metrics");
     assert_eq!(r.usually_changes_with.len(), 1);
     assert_eq!(r.signals.as_ref().unwrap().coverage.state, SignalState::Ready);
@@ -1347,12 +1347,12 @@ fn report_metrics_signals_and_usually_changes_with() {
     assert_eq!((mx.churn, mx.coverage), (None, None));
     assert!(r.usually_changes_with.is_empty());
     let t = crate::render::text::render(&r, 30, false);
-    assert!(t.contains("\n  cx 120 (max 30) · hotspot #3 of 2114\n"), "{t}");
+    assert!(t.contains("\n  cx 120 (max 30) · hotspot #3\n"), "{t}");
     assert!(t.contains("not ready: churn building (reading git history); cochange building (reading git history)\n"), "{t}");
     assert!(!t.contains("coverage disabled"), "disabled signals are not 'not ready': {t}");
     // The schema accepts it all.
     let v = serde_json::to_value(run_sig("", &[m("app/models/invoice.rb").lines(3, 1)], Some(ready_signals()))).unwrap();
     assert_eq!(crate::schema::validate_report(&v), Vec::<String>::new());
     let t = crate::render::text::render(&serde_json::from_value(v).unwrap(), 30, false);
-    assert!(t.contains("usually changes with (not in the diff):\n  app/views/invoices/show.html.erb  changed with app/models/invoice.rb in 12 of its last 20 commits (60%)\n"), "{t}");
+    assert!(t.contains("usually changes with (not in the diff):\n  app/views/invoices/show.html.erb  with app/models/invoice.rb in 12 of its 20 commits (60%)\n"), "{t}");
 }

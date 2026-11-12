@@ -349,17 +349,18 @@ What each section means:
 - **`policy`**: present only when `ripple.yml` defines rules or areas and a
   rule fired, or always for `check`. Rule semantics and CI exit codes are as
   described under Configuration.
-- **`changed[].metrics`** (non-test, non-deleted files; each part absent when
+- **`changed[].metrics`** (source files: not tests, not deleted, not "other"; each part absent when
   unknown or its signal is not ready):
-  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, of, percentile, hotspot}}`.
-  `coverage` is absent for a file in no report (unknown, not 0%);
+  `{complexity, max_method, lines, churn: {commits, recent_commits, last_changed}, coverage: {percent, covered, coverable, changed_lines_percent, stale}, hotspot: {rank, percentile, hotspot}}`.
+  `coverage` is absent for a file in no report (unknown, not 0%); `hotspot`
+  is present only for a hotspot (`ripple file` shows any file's rank);
   `changed_lines_percent` needs a diff; `stale` (only when true) means the
   report predates HEAD or `coverage.max_age_days`.
 - **`signals`**: `{complexity, churn, cochange, coverage, hotspot}`, each
   `{state: ready|building|loading|disabled|unavailable, reason?}`.
 - **`usually_changes_with`**: at most 5 files outside the diff and its direct
   dependents that git history shows changing with a changed file:
-  `{path, via, together, of, why}`. Absent when there are none or co-change
+  `{path, together, of, why}` (`why` names the changed file). Absent when there are none or co-change
   is not ready. (The daemon's envelope `history` keeps the raw data.)
 
 Changing `ripple.yml` itself does not count as a change to analyse. It gives
@@ -403,7 +404,8 @@ blind spots: methods matched by name; receivers untyped; JS/TS and send/try not 
 ```
 
 Each changed source file is followed by one metrics line, for example
-`cx 433 (max 88) · churn 41/90d · cov 62% (changed lines 20%) · hotspot #3 of 2114`.
+`cx 433 (max 88) · churn 41/90d · cov 62% (changed lines 20%) · hotspot #3` (the rank
+only for a hotspot).
 
 The order is: summary, removed methods, incomplete, changed (with metrics),
 dependents, inherit-only, also-mentions, relies-on, further, tests,

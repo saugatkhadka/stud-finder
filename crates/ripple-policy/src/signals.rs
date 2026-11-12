@@ -139,11 +139,14 @@ pub struct CoverageMetric {
     pub stale: bool,
 }
 
-/// Position in `ripple rank` (1 = the riskiest file).
+/// Position in `ripple rank` (1 = the riskiest file). In a report only for
+/// hotspots; `ripple file` shows it for any ranked file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct HotspotMetric {
     pub rank: u32,
-    /// Files ranked.
+    /// Files ranked (not serialised: the same for every file; `ripple rank`
+    /// and `ripple file` show it).
+    #[serde(default, skip_serializing)]
     pub of: u32,
     /// Share of the ranked files with a lower score, in percent (one decimal).
     pub percentile: f64,
@@ -157,7 +160,9 @@ pub struct HotspotMetric {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CoChangeEntry {
     pub path: String,
-    /// The changed file it changes with.
+    /// The changed file it changes with (named in `why`; not serialised, to
+    /// keep the report small).
+    #[serde(default, skip_serializing)]
     pub via: String,
     /// Commits with both ...
     pub together: u32,
@@ -194,10 +199,11 @@ pub struct SignalInput {
 /// Entries of `usually_changes_with` in a report.
 pub const USUALLY_CHANGES_WITH: usize = 5;
 
-/// "changed with `via` in 12 of the last 20 commits touching it (60%)".
+/// "with `via` in 12 of its 20 commits (60%)": the share of the commits
+/// touching `via` that touched the partner too.
 pub fn cochange_why(via: &str, together: u32, of: u32) -> String {
     let pct = if of == 0 { 0.0 } else { f64::from(together) * 100.0 / f64::from(of) };
-    format!("changed with {via} in {together} of its last {of} commits ({pct:.0}%)")
+    format!("with {via} in {together} of its {of} commits ({pct:.0}%)")
 }
 
 /// `x` rounded to one decimal.
@@ -206,7 +212,8 @@ pub fn round1(x: f64) -> f64 {
 }
 
 /// The compact one-line rendering used by the text output:
-/// `cx 433 (max 88) · churn 41/90d · cov 62% (changed lines 20%) · hotspot #3`.
+/// `cx 433 (max 88) · churn 41/90d · cov 62% (changed lines 20%) · hotspot #3`
+/// (the rank is shown only for a hotspot).
 pub fn metrics_line(m: &Metrics) -> String {
     let mut parts = Vec::new();
     if let Some(cx) = m.complexity {
@@ -231,12 +238,8 @@ pub fn metrics_line(m: &Metrics) -> String {
         }
         parts.push(s);
     }
-    if let Some(h) = m.hotspot {
-        if h.hotspot {
-            parts.push(format!("hotspot #{} of {}", h.rank, h.of));
-        } else {
-            parts.push(format!("rank #{} of {}", h.rank, h.of));
-        }
+    if let Some(h) = m.hotspot.filter(|h| h.hotspot) {
+        parts.push(format!("hotspot #{}", h.rank));
     }
     parts.join(" · ")
 }

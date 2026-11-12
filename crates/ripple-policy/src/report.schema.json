@@ -149,7 +149,7 @@
         "hotspot": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["rank", "of", "percentile"],
+          "required": ["rank", "percentile"],
           "properties": {
             "rank": { "type": "integer", "minimum": 1 },
             "of": { "$ref": "#/$defs/count" },
@@ -162,7 +162,7 @@
     "cochange": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "via", "together", "of", "why"],
+      "required": ["path", "together", "of", "why"],
       "properties": {
         "path": { "$ref": "#/$defs/path" },
         "via": { "$ref": "#/$defs/path" },

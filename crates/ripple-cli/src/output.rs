@@ -217,7 +217,7 @@ pub fn file_profile(v: &Value) -> String {
         o += &format!("  coverage: {} of {} lines{}{}\n", c.covered, c.coverable, c.percent.map(|p| format!(" ({}%)", ripple_policy::fmt_pct(p))).unwrap_or_default(), if c.stale { ", stale (measured before HEAD or too long ago)" } else { "" });
     }
     if let Some(h) = m.hotspot {
-        o += &format!("  hotspot: rank {} of {} (percentile {}){}\n", h.rank, h.of, ripple_policy::fmt_pct(h.percentile), if h.hotspot { ", a hotspot" } else { "" });
+        o += &format!("  hotspot: rank {} of {} (percentile {}){}\n", h.rank, v["ranked"], ripple_policy::fmt_pct(h.percentile), if h.hotspot { ", a hotspot" } else { "" });
     }
     let top: Vec<&Value> = v["top_methods"].as_array().into_iter().flatten().collect();
     if !top.is_empty() {

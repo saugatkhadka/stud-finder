@@ -490,6 +490,7 @@ fn file_profile(snap: &Arc<Snapshot>, file: &str, src: &Sources) -> QueryResult 
         "is_test": class.test,
         "is_global": class.global,
         "in_graph": node.is_some(),
+        "ranked": metrics.hotspot.map(|h| h.of),
         "metrics": metrics,
         "methods": method_count,
         "top_methods": methods,

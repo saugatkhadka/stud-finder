@@ -959,9 +959,9 @@ impl Ctx<'_> {
         out
     }
 
-    /// `changed[].metrics`: non-test files that still exist.
+    /// `changed[].metrics`: source files (not tests) that still exist.
     fn metrics_of(&self, c: &Changed) -> Option<Metrics> {
-        if c.class.test || c.file.status == FileStatus::Deleted {
+        if c.class.test || !c.class.language.is_source() || c.file.status == FileStatus::Deleted {
             return None;
         }
         let mut m = Metrics::default();
@@ -975,7 +975,9 @@ impl Ctx<'_> {
         if let Some(f) = self.file_signals(&c.file.path) {
             m.churn = f.churn.filter(|_| self.status.churn.is_ready());
             m.coverage = f.coverage.filter(|_| self.status.coverage.is_ready());
-            m.hotspot = f.hotspot.filter(|_| self.status.hotspot.is_ready());
+            // Only hotspots: a rank in the middle of the field is noise in
+            // a report (`ripple file` shows it for any file).
+            m.hotspot = f.hotspot.filter(|h| h.hotspot && self.status.hotspot.is_ready());
         }
         (!m.is_empty()).then_some(m)
     }
