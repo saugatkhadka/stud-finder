@@ -265,7 +265,7 @@ impl State {
         let method_level = ws.config.ruby.method_level;
         let start = Instant::now();
         let (scopes, mentions, method_stats) = if method_level {
-            let o = self.scoped.refresh(&self.files, &self.names);
+            let o = self.scoped.refresh(&mut self.files, &self.names);
             if verify_rows() {
                 let want = scoped::compute(&self.files, &self.names);
                 assert_eq!(o.scopes, want.scopes, "incremental scopes differ");

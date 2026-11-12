@@ -55,6 +55,10 @@ pub struct FileEntry {
     /// [`crate::fingerprint::of`]: equal for two versions of the file that
     /// differ only in what feeds the file's own output.
     pub fp: u64,
+    /// This file's cached share of the method-level output and whether it
+    /// is computed (see [`crate::scoped::Cache`]).
+    pub scoped: Option<Box<crate::scoped::FileOut>>,
+    pub scoped_done: bool,
 }
 
 pub struct Analysed {
