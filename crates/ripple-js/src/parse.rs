@@ -1,9 +1,12 @@
-//! Parses one JS/TS source text with oxc and extracts module references plus
-//! HTTP call sites in a single AST walk.
+//! Parses one JS/TS source text with oxc and extracts module references,
+//! HTTP call sites and size/complexity (see [`ripple_core::metrics`]) in a
+//! single AST walk.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression, BinaryExpression, BinaryOperator, BindingPattern,
+    Argument, ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression, AssignmentPattern, AssignmentTargetPropertyIdentifier,
+    AssignmentTargetWithDefault, CatchClause, ComputedMemberExpression, DoWhileStatement, ForInStatement, ForOfStatement, ForStatement,
+    FormalParameter, PrivateFieldExpression, StaticMemberExpression, WhileStatement, BinaryExpression, BinaryOperator, BindingPattern,
     CallExpression, ConditionalExpression, ExportAllDeclaration, ExportDeclaration, ExportDefaultDeclaration, ExportFromDeclaration,
     ExportSpecifier, Expression, ExpressionStatement, Function, IdentifierReference, IfStatement, ImportDeclaration,
     ImportDeclarationSpecifier, ImportExpression, ImportOrExportKind, JSXAttributeItem, JSXAttributeName, JSXAttributeValue,
@@ -23,6 +26,7 @@ use crate::callsites::{CallKind, CallSiteConfig, CallSites, RouteBinding, write_
 use crate::linkctx::{self, CallUse, Class, Frame};
 use crate::refs::{Ref, RefKind};
 use ripple_core::JsCallSite;
+use ripple_core::metrics::{self as cx, Counter};
 
 /// Byte offset -> 1-based line, for one source text embedded at `base_line`.
 pub struct LineIndex {
@@ -50,6 +54,10 @@ pub struct Collected {
     /// Parallel to `calls`: `Some(context)` when the use of the URL could not
     /// be classified as navigation or data (then `link` stays false).
     pub unclassified: Vec<Option<String>>,
+    /// Decisions and functions (see [`ripple_core::metrics`]).
+    pub complexity: Counter,
+    /// Code lines of the parsed blocks (non-blank lines if a block's parse failed).
+    pub lines: u32,
 }
 
 /// The oxc source type for a path, or `None` for extensions we do not parse.
@@ -73,8 +81,11 @@ pub fn parse_block(src: &str, source_type: SourceType, base_line: u32, file: &st
         // oxc gives up with an empty AST; salvage module references textually
         // so a half-typed file does not silently drop out of the graph.
         out.refs.extend(scan_imports(src, &lines));
+        out.lines += cx::nonblank_lines(src.as_bytes());
         return error;
     }
+    let comments: Vec<(u32, u32)> = ret.program.comments.iter().map(|c| (c.span.start, c.span.end)).collect();
+    out.lines += cx::code_lines(src.as_bytes(), &comments);
     let mut walker = Walker {
         src,
         lines: &lines,
@@ -85,12 +96,14 @@ pub fn parse_block(src: &str, source_type: SourceType, base_line: u32, file: &st
         uses: HashMap::new(),
         data_verbs: HashMap::new(),
         scratch: String::new(),
+        cx: Counter::default(),
     };
     walker.visit_program(&ret.program);
     let unclassified = walker.finish();
     out.refs.extend(walker.refs);
     out.calls.extend(walker.sites.out);
     out.unclassified.extend(unclassified);
+    out.complexity.absorb(&walker.cx);
     error
 }
 
@@ -110,6 +123,7 @@ struct Walker<'c, 'a> {
     /// `None` when they name none or disagree.
     data_verbs: HashMap<&'a str, Option<&'static str>>,
     scratch: String,
+    cx: Counter,
 }
 
 impl<'a> Walker<'_, 'a> {
@@ -387,6 +401,9 @@ impl<'a> Visit<'a> for Walker<'_, 'a> {
     }
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        if it.optional {
+            self.cx.decision();
+        }
         self.special_call(it);
         let before = self.sites.out.len();
         let kind = self.sites.on_call(it);
@@ -552,6 +569,9 @@ impl<'a> Visit<'a> for Walker<'_, 'a> {
     }
 
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        if it.operator.is_logical() {
+            self.cx.decision();
+        }
         self.with(Some(Frame::Ignore), |w| w.visit_assignment_target(&it.left));
         let span = it.left.span();
         let target = self.src.get(span.start as usize..span.end as usize).unwrap_or("");
@@ -574,17 +594,22 @@ impl<'a> Visit<'a> for Walker<'_, 'a> {
     }
 
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        self.cx.enter();
         self.with(Some(Frame::Func), |w| walk::walk_function(w, it, flags));
+        self.cx.leave();
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
         let expression_body = !matches!(it.body, ArrowFunctionBody::FunctionBody(_));
+        self.cx.enter();
         self.frames.push(Frame::Func);
         self.with(expression_body.then_some(Frame::Return), |w| walk::walk_arrow_function_expression(w, it));
         self.frames.pop();
+        self.cx.leave();
     }
 
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        self.cx.decision();
         self.with(Some(Frame::Ignore), |w| w.visit_expression(&it.test));
         self.visit_statement(&it.consequent);
         if let Some(alt) = &it.alternate {
@@ -599,22 +624,101 @@ impl<'a> Visit<'a> for Walker<'_, 'a> {
 
     fn visit_switch_case(&mut self, it: &SwitchCase<'a>) {
         if let Some(test) = &it.test {
+            self.cx.decision();
             self.with(Some(Frame::Compare), |w| w.visit_expression(test));
         }
         self.visit_statements(&it.consequent);
     }
 
     fn visit_conditional_expression(&mut self, it: &ConditionalExpression<'a>) {
+        self.cx.decision();
         self.with(Some(Frame::Ignore), |w| w.visit_expression(&it.test));
         self.visit_expression(&it.consequent);
         self.visit_expression(&it.alternate);
     }
 
     fn visit_logical_expression(&mut self, it: &LogicalExpression<'a>) {
+        self.cx.decision();
         // `url && <a href={url}>`: the left side of `&&` is a test.
         let left = (it.operator == LogicalOperator::And).then_some(Frame::Ignore);
         self.with(left, |w| w.visit_expression(&it.left));
         self.visit_expression(&it.right);
+    }
+
+    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
+        self.cx.decision();
+        walk::walk_for_statement(self, it);
+    }
+
+    fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+        self.cx.decision();
+        walk::walk_for_in_statement(self, it);
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+        self.cx.decision();
+        walk::walk_for_of_statement(self, it);
+    }
+
+    fn visit_while_statement(&mut self, it: &WhileStatement<'a>) {
+        self.cx.decision();
+        walk::walk_while_statement(self, it);
+    }
+
+    fn visit_do_while_statement(&mut self, it: &DoWhileStatement<'a>) {
+        self.cx.decision();
+        walk::walk_do_while_statement(self, it);
+    }
+
+    fn visit_catch_clause(&mut self, it: &CatchClause<'a>) {
+        self.cx.decision();
+        walk::walk_catch_clause(self, it);
+    }
+
+    fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
+        if it.optional {
+            self.cx.decision();
+        }
+        walk::walk_static_member_expression(self, it);
+    }
+
+    fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+        if it.optional {
+            self.cx.decision();
+        }
+        walk::walk_computed_member_expression(self, it);
+    }
+
+    fn visit_private_field_expression(&mut self, it: &PrivateFieldExpression<'a>) {
+        if it.optional {
+            self.cx.decision();
+        }
+        walk::walk_private_field_expression(self, it);
+    }
+
+    /// Default values: `function f(a = 1)`, `{ a = 1 } = o`, `[a = 1] = xs`.
+    fn visit_formal_parameter(&mut self, it: &FormalParameter<'a>) {
+        if it.initializer.is_some() {
+            self.cx.decision();
+        }
+        walk::walk_formal_parameter(self, it);
+    }
+
+    fn visit_assignment_pattern(&mut self, it: &AssignmentPattern<'a>) {
+        self.cx.decision();
+        walk::walk_assignment_pattern(self, it);
+    }
+
+    fn visit_assignment_target_with_default(&mut self, it: &AssignmentTargetWithDefault<'a>) {
+        self.cx.decision();
+        walk::walk_assignment_target_with_default(self, it);
+    }
+
+    fn visit_assignment_target_property_identifier(&mut self, it: &AssignmentTargetPropertyIdentifier<'a>) {
+        if it.init.is_some() {
+            self.cx.decision();
+        }
+        walk::walk_assignment_target_property_identifier(self, it);
     }
 
     fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {

@@ -3,6 +3,7 @@
 //! queries are allocation-light and run in microseconds to low milliseconds.
 
 use crate::mentions::{FileMentions, MentionTable, NO_DEF, name_id};
+use crate::metrics::{FileMetrics, MethodMetric, MetricsTable};
 use crate::model::{Confidence, Edge, EdgeKind, RelPath};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -87,6 +88,9 @@ pub struct Graph {
     /// [`Graph::set_mentions`]); `None` = unknown.
     mentions: Vec<Option<Arc<FileMentions>>>,
     unmentioned: Arc<[u32]>,
+    /// Size/complexity tables (see [`Graph::set_metrics`]), shared with the
+    /// extractors' outputs.
+    metrics: Vec<Arc<MetricsTable>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -303,7 +307,7 @@ impl Graph {
         let mentions = vec![None; n];
         drop(detail_ids);
         let (detail_text, detail_ends) = (detail_text.into_boxed_str(), detail_ends.into_boxed_slice());
-        Self { paths, endpoints, data, detail_text, detail_ends, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]) }
+        Self { paths, endpoints, data, detail_text, detail_ends, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]), metrics: Vec::new() }
     }
 
     /// Attaches the per-file method mentions that let method-level queries
@@ -317,6 +321,43 @@ impl Graph {
             }
         }
         self.unmentioned = table.unmentioned.clone();
+    }
+
+    /// Attaches the extractors' size/complexity tables (replacing any
+    /// attached before). The tables are shared, not copied; a lookup hashes
+    /// the node's path and binary-searches each table.
+    pub fn set_metrics(&mut self, tables: impl IntoIterator<Item = Arc<MetricsTable>>) {
+        self.metrics = tables.into_iter().collect();
+    }
+
+    /// Size and complexity of `node`'s file; `None` when no extractor
+    /// analysed it (not code, ignored, or Ruby with `ruby.method_level` off).
+    pub fn metrics(&self, node: NodeId) -> Option<FileMetrics> {
+        self.metrics_of(self.paths.get(node as usize)?)
+    }
+
+    /// [`Graph::metrics`] by path (the file need not be a node).
+    pub fn metrics_of(&self, path: &str) -> Option<FileMetrics> {
+        crate::metrics::lookup(&self.metrics, path).map(|(f, _)| f)
+    }
+
+    /// Per-method metrics of `node`'s file, sorted by start line; empty when
+    /// unknown (JS/TS, templates, and files without methods).
+    pub fn method_metrics(&self, node: NodeId) -> &[MethodMetric] {
+        self.paths.get(node as usize).and_then(|p| crate::metrics::lookup(&self.metrics, p)).map_or(&[], |(_, m)| m)
+    }
+
+    /// The method of `node`'s file whose lines contain `line` (1-based), e.g.
+    /// the `start` of a [`crate::model::ScopeRange`].
+    pub fn method_at(&self, node: NodeId, line: u32) -> Option<MethodMetric> {
+        let ms = self.method_metrics(node);
+        let i = ms.partition_point(|m| m.start <= line);
+        ms[..i].last().copied().filter(|m| line <= m.end())
+    }
+
+    /// The attached size/complexity tables.
+    pub fn metrics_tables(&self) -> &[Arc<MetricsTable>] {
+        &self.metrics
     }
 
     /// The method facts of `node`, if known.
@@ -867,5 +908,29 @@ mod tests {
         let g = g();
         assert_eq!(g.fan_in(g.id("a").unwrap()), 2);
         assert_eq!(g.fan_out(g.id("b").unwrap()), 1);
+    }
+
+    #[test]
+    fn metrics_by_node_path_and_line() {
+        let mut g = g();
+        let fm = FileMetrics { lines: 30, complexity: 7, methods: 2, max_method: 4 };
+        let ms = [MethodMetric { start: 2, span: 3, complexity: 4 }, MethodMetric { start: 10, span: 0, complexity: 2 }];
+        let js = FileMetrics { lines: 5, complexity: 1, methods: 0, max_method: 0 };
+        g.set_metrics([
+            Arc::new(MetricsTable::build([("a", fm, &ms[..])], true)),
+            Arc::new(MetricsTable::build([("b", js, &[][..])], false)),
+        ]);
+        let (a, b, c) = (g.id("a").unwrap(), g.id("b").unwrap(), g.id("c").unwrap());
+        assert_eq!(g.metrics(a), Some(fm));
+        assert_eq!(g.metrics(b), Some(js));
+        assert_eq!(g.metrics(c), None);
+        assert_eq!(g.metrics_of("a"), Some(fm));
+        assert_eq!(g.method_metrics(a), &ms);
+        assert!(g.method_metrics(b).is_empty());
+        assert_eq!(g.method_at(a, 1), None);
+        assert_eq!(g.method_at(a, 2).map(|m| m.complexity), Some(4));
+        assert_eq!(g.method_at(a, 5).map(|m| m.complexity), Some(4));
+        assert_eq!(g.method_at(a, 6), None);
+        assert_eq!(g.method_at(a, 10).map(|m| m.complexity), Some(2));
     }
 }

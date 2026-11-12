@@ -143,6 +143,9 @@ impl State {
             (BTreeMap::new(), None, BTreeMap::new())
         };
         let methods_us = micros(start);
+        let start = Instant::now();
+        let metrics = self.metrics_table();
+        let metrics_us = micros(start);
 
         let mut stats = BTreeMap::new();
         let mut put = |k: &str, v: u64| {
@@ -237,6 +240,7 @@ impl State {
         put("ruby_time_edges_us", edges_us);
         if method_level {
             put("ruby_time_methods_us", methods_us);
+            put("ruby_time_metrics_us", metrics_us);
         }
         for (k, v) in method_stats {
             put(&k, v);
@@ -249,6 +253,7 @@ impl State {
             facts: ripple_core::Facts {
                 scopes,
                 mentions,
+                metrics: metrics.into_iter().collect(),
                 http_requests: self.http_requests(),
                 ..Default::default()
             },
@@ -259,6 +264,29 @@ impl State {
                 .collect(),
             stats,
         }
+    }
+
+    /// Size/complexity of every analysed file, with per-method complexity
+    /// of the outermost `def`s; `None` without `ruby.method_level`.
+    fn metrics_table(&self) -> Option<std::sync::Arc<ripple_core::MetricsTable>> {
+        use ripple_core::metrics::{MethodMetric, sat16};
+        if !self.method_level {
+            return None;
+        }
+        let mut methods: Vec<MethodMetric> = Vec::new();
+        let mut rows: Vec<(&str, ripple_core::FileMetrics, usize, usize)> = Vec::with_capacity(self.files.len());
+        for (path, e) in &self.files {
+            let Some(m) = e.metrics else { continue };
+            let from = methods.len();
+            methods.extend(e.methods.defs.iter().map(|d| MethodMetric {
+                start: d.start,
+                span: sat16(d.end.saturating_sub(d.start)),
+                complexity: d.complexity,
+            }));
+            rows.push((path, m, from, methods.len()));
+        }
+        let table = ripple_core::MetricsTable::build(rows.iter().map(|&(p, m, a, b)| (p, m, &methods[a..b])), true);
+        Some(std::sync::Arc::new(table))
     }
 
     /// Every test's HTTP requests, in file order.

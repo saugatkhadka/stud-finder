@@ -9,6 +9,7 @@ use crate::rails::{self, RubyFacts};
 use crate::methods::{self, MethodFacts};
 use crate::templates::{self, TemplateFacts};
 use ripple_core::Warning;
+use ripple_core::metrics::{self as cx, FileMetrics};
 use rubydex::diagnostic::Rule;
 use rubydex::indexing::local_graph::LocalGraph;
 use rubydex::indexing::{IndexerBackend, LanguageId, build_local_graph};
@@ -40,6 +41,9 @@ pub struct FileEntry {
     pub template: TemplateFacts,
     /// Methods defined and mentioned (Ruby files and templates).
     pub methods: MethodFacts,
+    /// Size and complexity (per-method complexity is in `methods.defs`);
+    /// `None` without `ruby.method_level` or when the prism pass failed.
+    pub metrics: Option<FileMetrics>,
     /// What the file defines and mentions, for the mention filter (taken out
     /// of `methods`); `None` when unknown (method facts off or failed).
     pub mentions: Option<std::sync::Arc<ripple_core::FileMentions>>,
@@ -132,16 +136,22 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             // One prism parse for the Rails DSL facts, actions and methods.
             match catch_unwind(AssertUnwindSafe(|| {
                 if !method_level {
-                    return (rails::collect(&source, want), MethodFacts::default());
+                    return (rails::collect(&source, want), MethodFacts::default(), 0);
                 }
                 let result = ruby_prism::parse(source.as_bytes());
                 let root = result.node();
-                (rails::collect_root(&root, &source, want), methods::collect(&root, source.as_bytes(), controller))
+                let comments: Vec<(u32, u32)> = result.comments().map(|c| {
+                    let l = c.location();
+                    (l.start(), l.end())
+                }).collect();
+                let lines = cx::code_lines(source.as_bytes(), &comments);
+                (rails::collect_root(&root, &source, want), methods::collect(&root, source.as_bytes(), controller), lines)
             })) {
-                Ok((f, mut m)) => {
+                Ok((f, mut m, lines)) => {
                     entry.facts = f;
                     if method_level {
                         entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
+                        entry.metrics = Some(file_metrics(lines, &m));
                     }
                     entry.methods = m;
                 }
@@ -168,6 +178,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
                 let mut m = methods::from_template(&entry.template);
                 entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
                 entry.methods = m;
+                entry.metrics = Some(FileMetrics { lines: cx::nonblank_lines(source.as_bytes()), ..FileMetrics::default() });
             }
         }
     }
@@ -175,6 +186,17 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
         path: rel.to_string(),
         entry,
         local_graph,
+    }
+}
+
+/// A Ruby file's metrics from its code lines and method facts.
+fn file_metrics(lines: u32, m: &MethodFacts) -> FileMetrics {
+    let defs = m.defs.iter().map(|d| u32::from(d.complexity));
+    FileMetrics {
+        lines,
+        complexity: m.top_decisions + defs.clone().sum::<u32>(),
+        methods: cx::sat16(m.defs.len() as u32),
+        max_method: cx::sat16(defs.max().unwrap_or(0)),
     }
 }
 

@@ -18,6 +18,9 @@
 //!   receiver is `self` (or none). `define_method` with a computed name
 //!   defines rather than calls, and `*_exec` runs a block whose code is
 //!   visible (its mentions count where it is written): neither is dynamic.
+//! - **complexity**: decisions per outermost `def` and outside every def,
+//!   counted as documented in [`ripple_core::metrics`] (a `def` nested in
+//!   another counts towards the outer one).
 //! - **inherit ranges**: byte ranges of superclass constants and of constant
 //!   arguments to receiverless/`self.` `include`/`extend`/`prepend`, so the
 //!   Rubydex constant references there can be told apart.
@@ -117,6 +120,8 @@ pub struct Def {
     /// but whitespace or a comment after its `end` on its last line, so every
     /// line in the range belongs to this method alone.
     pub clean: bool,
+    /// `1 + decisions` inside it, saturating (fits the struct's padding).
+    pub complexity: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +146,8 @@ pub struct MethodFacts {
     pub own: Vec<u32>,
     /// What the file defines and mentions, for the mention filter.
     pub mentions: FileMentions,
+    /// Decisions outside every def (class bodies, DSL blocks, top level).
+    pub top_decisions: u32,
 }
 
 /// Calls that run `initialize` on a new instance of the receiver.
@@ -220,7 +227,7 @@ pub fn from_template(t: &crate::templates::TemplateFacts) -> MethodFacts {
     pairs.sort_unstable();
     pairs.dedup();
     let mentions = FileMentions { pairs: pairs.into(), opaque: t.dynamic, ..FileMentions::default() };
-    MethodFacts { names, defs: Vec::new(), counts, inherit_ranges: Vec::new(), own: Vec::new(), mentions }
+    MethodFacts { names, defs: Vec::new(), counts, inherit_ranges: Vec::new(), own: Vec::new(), mentions, top_decisions: 0 }
 }
 
 /// Identifier-like: `foo`, `foo?`, `foo!`, `foo=`, `_x1`. Used for strings.
@@ -247,6 +254,7 @@ struct Collector<'s> {
     dynamic: Vec<Dynamic>,
     inherit_ranges: Vec<(u32, u32)>,
     cur: u32,
+    top_decisions: u32,
 }
 
 fn line(loc: &ruby_prism::Location) -> u32 {
@@ -327,11 +335,59 @@ impl Collector<'_> {
         let mut own: Vec<u32> = self.defs.iter().map(|d| d.name).collect();
         own.sort_unstable();
         own.dedup();
-        MethodFacts { names: self.names, defs: self.defs, counts, inherit_ranges: self.inherit_ranges, own, mentions }
+        MethodFacts { names: self.names, defs: self.defs, counts, inherit_ranges: self.inherit_ranges, own, mentions, top_decisions: self.top_decisions }
+    }
+}
+
+/// Is `node` a decision (see [`ripple_core::metrics`])? Called for every
+/// node with children as the visitor enters it.
+fn is_decision(node: &Node) -> bool {
+    match node {
+        Node::IfNode { .. }
+        | Node::UnlessNode { .. }
+        | Node::WhileNode { .. }
+        | Node::UntilNode { .. }
+        | Node::ForNode { .. }
+        | Node::WhenNode { .. }
+        | Node::InNode { .. }
+        | Node::RescueModifierNode { .. }
+        | Node::AndNode { .. }
+        | Node::OrNode { .. }
+        | Node::LocalVariableOrWriteNode { .. }
+        | Node::LocalVariableAndWriteNode { .. }
+        | Node::InstanceVariableOrWriteNode { .. }
+        | Node::InstanceVariableAndWriteNode { .. }
+        | Node::ClassVariableOrWriteNode { .. }
+        | Node::ClassVariableAndWriteNode { .. }
+        | Node::GlobalVariableOrWriteNode { .. }
+        | Node::GlobalVariableAndWriteNode { .. }
+        | Node::ConstantOrWriteNode { .. }
+        | Node::ConstantAndWriteNode { .. }
+        | Node::ConstantPathOrWriteNode { .. }
+        | Node::ConstantPathAndWriteNode { .. }
+        | Node::CallOrWriteNode { .. }
+        | Node::CallAndWriteNode { .. }
+        | Node::IndexOrWriteNode { .. }
+        | Node::IndexAndWriteNode { .. } => true,
+        // Rescue clauses count once per body, however many there are.
+        Node::BeginNode { .. } => node.as_begin_node().is_some_and(|b| b.rescue_clause().is_some()),
+        Node::CallNode { .. } => node.as_call_node().is_some_and(|c| {
+            c.is_safe_navigation() || (c.block().is_some() && ripple_core::metrics::ruby_iterating(c.name().as_slice()))
+        }),
+        _ => false,
     }
 }
 
 impl<'pr> Visit<'pr> for Collector<'_> {
+    fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+        if is_decision(&node) {
+            match self.defs.get_mut(self.cur as usize) {
+                Some(d) => d.complexity = d.complexity.saturating_add(1),
+                None => self.top_decisions += 1,
+            }
+        }
+    }
+
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         let name = node.name().as_slice();
         if self.cur != NONE {
@@ -352,6 +408,7 @@ impl<'pr> Visit<'pr> for Collector<'_> {
             start_off,
             end_off,
             clean,
+            complexity: 1,
         });
         self.cur = (self.defs.len() - 1) as u32;
         if name == b"method_missing" {
@@ -570,6 +627,97 @@ mod tests {
         }
         let total = f.names.iter().position(|n| n == "total").unwrap() as u32;
         assert_eq!(f.counts.iter().find(|c| c.0 == total).map(|c| c.1), Some(1), "only the top-level call counts");
+    }
+
+    /// Expected values worked out by hand from RuboCop's
+    /// `Metrics/CyclomaticComplexity` rules (1 + if/unless/elsif/ternary,
+    /// while/until/for, when/in, one per rescue body, &&/||/and/or, ||=/&&=,
+    /// &., iterating blocks).
+    #[test]
+    fn complexity_per_def_matches_rubocop_rules() {
+        let src = r#"class A
+  validates :x, if: -> { a && b }
+  scope :y, -> { where(z: 1) if c }
+  def m1; x; end
+  def m2(x)
+    if x then 1 elsif y then 2 else 3 end
+  end
+  def m3
+    return 1 unless ok?
+    a ? b : c
+  end
+  def m4
+    case x
+    when 1 then a
+    when 2, 3 then b
+    else c
+    end
+  end
+  def m5
+    a && b || c
+    x and y
+  end
+  def m6
+    @x ||= compute
+    y &&= 2
+    h[:k] ||= 1
+  end
+  def m7
+    user&.name&.upcase
+  end
+  def m8
+    items.each { |i| puts i }
+    items.map(&:id)
+    items.tap { |t| t }
+    items.each_with_object({}) do |i, h|
+      h[i] = i if i
+    end
+  end
+  def m9
+    begin
+      x
+    rescue A
+      y
+    rescue B
+      z
+    end
+  end
+  def m10
+    x
+  rescue => e
+    y
+  ensure
+    z
+  end
+  def m11
+    while a
+      b
+    end
+    until c do d end
+    for i in 1..3 do end
+    x rescue nil
+  end
+  def m12
+    case h
+    in {a:} then 1
+    in [x] then 2
+    end
+  end
+  def self.m13
+    def inner; a if b; end
+    [1].select { |v| v.odd? || v.zero? }
+  end
+end
+"#;
+        let f = facts(src);
+        let got: Vec<(String, u16)> = f.defs.iter().map(|d| (f.names[d.name as usize].clone(), d.complexity)).collect();
+        let want: Vec<(String, u16)> = [("m1", 1), ("m2", 3), ("m3", 3), ("m4", 3), ("m5", 4), ("m6", 4), ("m7", 3), ("m8", 5), ("m9", 2), ("m10", 2), ("m11", 5), ("m12", 3), ("m13", 4)]
+            .iter()
+            .map(|(n, c)| (n.to_string(), *c))
+            .collect();
+        assert_eq!(got, want);
+        // `&&` in the validation lambda and `if` in the scope lambda.
+        assert_eq!(f.top_decisions, 2);
     }
 
     #[test]

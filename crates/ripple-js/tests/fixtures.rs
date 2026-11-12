@@ -392,3 +392,35 @@ fn aliases_from_jest_and_bundler_configs() {
     // lodash/debounce, @ui/button outside packages/ui, and the configs' own path x3, node:url, vite.
     assert_eq!(out.stats["js_imports_external"], 7);
 }
+
+/// Size/complexity through the incremental path: editing one file changes
+/// that file's row only, and equals a fresh build.
+#[test]
+fn metrics_update_changes_only_the_edited_file() {
+    use ripple_core::ChangeSet;
+    use ripple_core::metrics::path_hash;
+    let tmp = std::env::temp_dir().join(format!("ripple-js-metrics-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = fixture("imports");
+    for f in list_files(&src) {
+        let to = tmp.join(&f);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(src.join(&f), to).unwrap();
+    }
+    let mut ex = JsExtractor::new();
+    let before = ex.build(&workspace(&tmp, Config::default())).unwrap().facts.metrics[0].clone();
+    let path = "src/lib/b.ts";
+    let text = std::fs::read_to_string(tmp.join(path)).unwrap();
+    let old = before.get(path).expect("b.ts metrics");
+    std::fs::write(tmp.join(path), format!("{text}\n// note\nexport function pick(a?: {{ b?: number }}) {{\n  return a?.b ?? (a ? 1 : 2);\n}}\n")).unwrap();
+    let ws = workspace(&tmp, Config::default());
+    let inc = ex.update(&ws, &ChangeSet { modified: vec![path.into()], removed: vec![] }).unwrap().facts.metrics[0].clone();
+    let fresh = JsExtractor::new().build(&ws).unwrap().facts.metrics[0].clone();
+    assert_eq!(*inc, *fresh);
+    let new = inc.get(path).unwrap();
+    // `?.`, `??`, `?:`: one function of complexity 4, three more code lines.
+    assert_eq!((new.lines, new.complexity, new.methods, new.max_method), (old.lines + 3, old.complexity + 4, old.methods + 1, old.max_method.max(4)));
+    let changed: Vec<u64> = before.iter().zip(inc.iter()).filter(|(a, b)| a != b).map(|(a, _)| a.0).collect();
+    assert_eq!(changed, vec![path_hash(path)]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

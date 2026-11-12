@@ -579,3 +579,41 @@ fn method_app_update_matches_build() {
 fn out_scopes(out: &ExtractOutput, path: &str) -> Vec<String> {
     out.facts.scopes.get(path).map(|v| v.iter().map(|r| r.name.clone()).collect()).unwrap_or_default()
 }
+
+/// Size/complexity through the incremental path: editing one file changes
+/// that file's row (and methods) only, and equals a fresh build.
+#[test]
+fn metrics_update_changes_only_the_edited_file() {
+    use ripple_core::metrics::{MetricsTable, path_hash};
+    let tmp = std::env::temp_dir().join(format!("ripple-metrics-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    copy_dir(&fixture("method_app"), &tmp);
+    let table = |o: &ExtractOutput| -> std::sync::Arc<MetricsTable> {
+        assert_eq!(o.facts.metrics.len(), 1);
+        o.facts.metrics[0].clone()
+    };
+    let mut ext = RubyExtractor::new();
+    let before = table(&ext.build(&workspace(&tmp)).expect("build"));
+    let path = "app/services/report.rb";
+    let old = before.get(path).expect("report metrics");
+    assert_eq!((old.lines, old.complexity, old.methods, old.max_method), (8, 2, 2, 1));
+    assert_eq!(before.get("app/views/orders/show.html.erb").map(|m| (m.complexity, m.methods)), Some((0, 0)));
+
+    std::fs::write(
+        tmp.join(path),
+        "class Report\n  # Builds it.\n  def build_report(record)\n    record.line_total if record&.ok?\n  end\n\n  def summary_text(record)\n    record.shared_helper + record.abc\n  end\nend\n",
+    )
+    .unwrap();
+    let ws = workspace(&tmp);
+    let inc = table(&ext.update(&ws, &ChangeSet { modified: vec![path.into()], removed: vec![] }).expect("update"));
+    let fresh = table(&RubyExtractor::new().build(&ws).expect("build"));
+    assert_eq!(*inc, *fresh);
+    let new = inc.get(path).unwrap();
+    assert_eq!((new.lines, new.complexity, new.methods, new.max_method), (8, 4, 2, 3));
+    let m: Vec<(u32, u32, u16)> = inc.methods(path).iter().map(|m| (m.start, m.end(), m.complexity)).collect();
+    assert_eq!(m, vec![(3, 5, 3), (7, 9, 1)]);
+    let changed: Vec<u64> = before.iter().zip(inc.iter()).filter(|(a, b)| a != b).map(|(a, _)| a.0).collect();
+    assert_eq!(before.len(), inc.len());
+    assert_eq!(changed, vec![path_hash(path)]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

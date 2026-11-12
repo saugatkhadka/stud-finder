@@ -42,4 +42,6 @@ pub struct Parsed {
     pub error: Option<String>,
     /// The file could not be read at all (then `error` holds the I/O message).
     pub unreadable: bool,
+    /// Size and complexity; `None` when the file could not be read or parsed.
+    pub metrics: Option<ripple_core::FileMetrics>,
 }

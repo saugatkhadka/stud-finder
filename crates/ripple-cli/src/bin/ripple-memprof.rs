@@ -166,6 +166,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(m) = ruby_out.facts.mentions.as_ref() {
         graph.set_mentions(m);
     }
+    graph.set_metrics(ruby_out.facts.metrics.iter().chain(&js_out.facts.metrics).cloned());
     p.end("graph.build");
     let p = Phase::start();
     let index = PolicyIndex::build(&policy, &graph);
@@ -190,6 +191,11 @@ fn main() -> anyhow::Result<()> {
     let total = live() - start;
     println!("live after everything: {}", mb(total));
     println!("counts: nodes {} edges {} ruby_edges {} js_edges {} boundary_edges {}", graph.node_count(), graph.edge_count(), ruby_out.edges.len(), js_out.edges.len(), b_out.edges.len());
+    for (name, o) in [("ruby", &ruby_out), ("js", &js_out)] {
+        for t in &o.facts.metrics {
+            println!("info  metrics.{name}: files {} methods {} heap_bytes {}", t.len(), t.iter().map(|(_, f)| u64::from(f.methods)).sum::<u64>(), t.heap_bytes());
+        }
+    }
     if let Some(path) = std::env::var_os("MEMPROF_DUMP") {
         // Everything the index publishes, for before/after equality checks.
         use std::fmt::Write as _;
@@ -228,6 +234,7 @@ fn main() -> anyhow::Result<()> {
     sum += freed("engine.link_outputs[boundary].edges", || b_out.edges = Vec::new());
     sum += freed("engine.link_outputs[boundary].rest", || drop(b_out));
     sum += freed("boundary linker state", || drop(boundary));
+    sum += freed("engine.outputs[js].facts.metrics (table; graph shares it)", || js_out.facts.metrics = Vec::new());
     sum += freed("engine.outputs[js].edges", || js_out.edges = Vec::new());
     sum += freed("engine.outputs[js].facts(call sites)+rest", || drop(js_out));
     for (k, v) in ripple_js::memprof::breakdown(&mut js, &live) {
@@ -241,6 +248,7 @@ fn main() -> anyhow::Result<()> {
     sum += freed("js extractor rest (pool)", || drop(js));
     sum += freed("engine.outputs[ruby].edges", || ruby_out.edges = Vec::new());
     sum += freed("engine.outputs[ruby].facts.scopes", || ruby_out.facts.scopes = Default::default());
+    sum += freed("engine.outputs[ruby].facts.metrics (table; graph shares it)", || ruby_out.facts.metrics = Vec::new());
     sum += freed("engine.outputs[ruby].facts.mentions (table; Arcs shared)", || ruby_out.facts.mentions = None);
     sum += freed("engine.outputs[ruby].warnings+stats", || drop(ruby_out));
     for (k, v) in ripple_ruby::memprof::breakdown(&mut ruby, &live) {
