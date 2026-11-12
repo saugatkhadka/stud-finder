@@ -2,7 +2,10 @@
 //! in-process (`--no-daemon`) path so both answer identically.
 
 use crate::engine::Snapshot;
-use crate::protocol::{ErrorBody, FileParams, Format, ImpactParams, WhyParams};
+use crate::historyd::HistoryInfo;
+use crate::protocol::{ErrorBody, FileParams, Format, ImpactParams, RankParams, WhyParams};
+use crate::signals::{RankMode, Sources};
+use std::sync::Arc;
 use ripple_core::{Confidence, QueryOpts, Warning};
 use ripple_policy::{ChangedFile, EvalOptions, FileStatus, Incomplete, Language, Report, classify_change, def_names, evaluate_with, path_hops, render, scopes_for_hunks, summary_line};
 use serde::Serialize;
@@ -29,13 +32,15 @@ pub fn clean(p: &str) -> String {
 }
 
 /// Executes a read-only method. `reload`/`shutdown` are handled by the caller.
-pub fn execute(snap: &Snapshot, method: &str, params: &Value, pending: usize) -> QueryResult {
+pub fn execute(snap: &Arc<Snapshot>, method: &str, params: &Value, pending: usize, src: &Sources) -> QueryResult {
     match method {
         "impact" => {
             let p: ImpactParams = parse(params)?;
-            impact_result(snap, &p, pending, 0)
+            impact_result(snap, &p, pending, 0, src).map(|(body, _)| body)
         }
-        "dependents" => dependents(snap, &parse(params)?),
+        "dependents" => dependents(snap, &parse(params)?, src),
+        "file" => file_profile(snap, &parse::<FileParams>(params)?.file, src),
+        "rank" => rank(snap, &parse(params)?, src),
         "dependencies" => neighbours(snap, &parse(params)?, true),
         "why" => why(snap, &parse(params)?),
         "areas" => areas(snap, &parse::<FileParams>(params)?.file),
@@ -148,8 +153,12 @@ fn still_importing(snap: &Snapshot, deleted: &str) -> Vec<String> {
     out
 }
 
-pub fn impact_report(snap: &Snapshot, p: &ImpactParams, pending: usize, refresh_us: u64) -> Report {
+/// The report of an impact request and the `history` envelope object.
+/// Signals are looked up before evaluation (rules use them); `impact`
+/// never computes a ranking in the daemon's foreground.
+pub fn impact_report(snap: &Arc<Snapshot>, p: &ImpactParams, pending: usize, refresh_us: u64, src: &Sources) -> (Report, HistoryInfo) {
     let changed = changed_list(snap, p);
+    let (signals, history) = src.input(snap, &changed, RankMode::Cached);
     let opts = EvalOptions {
         max_depth: p.max_depth,
         min_confidence: p.min_confidence,
@@ -159,6 +168,7 @@ pub fn impact_report(snap: &Snapshot, p: &ImpactParams, pending: usize, refresh_
         policy: p.policy,
         file_level: p.file_level,
         root: Some(snap.root.clone()),
+        signals: Some(signals),
     };
     let mut report = evaluate_with(&snap.policy, &snap.graph, &snap.index, &changed, &opts);
     report.timing.refresh_us = refresh_us;
@@ -206,17 +216,19 @@ pub fn impact_report(snap: &Snapshot, p: &ImpactParams, pending: usize, refresh_
         report.warnings.sort_by(|a, b| (&a.code, &a.file, &a.message).cmp(&(&b.code, &b.file, &b.message)));
         report.warnings.dedup();
     }
-    report
+    (report, history)
 }
 
-pub fn impact_result(snap: &Snapshot, p: &ImpactParams, pending: usize, refresh_us: u64) -> QueryResult {
-    let report = impact_report(snap, p, pending, refresh_us);
-    match p.format {
+/// The rendered report and the `history` envelope object.
+pub fn impact_result(snap: &Arc<Snapshot>, p: &ImpactParams, pending: usize, refresh_us: u64, src: &Sources) -> Result<(String, HistoryInfo), ErrorBody> {
+    let (report, history) = impact_report(snap, p, pending, refresh_us, src);
+    let body = match p.format {
         Format::Json => Ok(render::json::render(&report, false)),
         // The report is already cut to its budget (or `limit`), unless `all`.
         Format::Text => to_json(&render::text::render(&report, p.max_listed.unwrap_or(usize::MAX), p.color)),
         Format::Markdown => to_json(&render::markdown::render(&report, p.max_listed.unwrap_or(snap.policy.config.ci.max_listed))),
-    }
+    }?;
+    Ok((body, history))
 }
 
 #[derive(Serialize)]
@@ -246,7 +258,7 @@ fn not_found(snap: &Snapshot, file: &str) -> ErrorBody {
 
 /// `dependents`: the impact report of one file (or some of its methods /
 /// actions) as if it had changed, so it reads exactly like `impact`.
-fn dependents(snap: &Snapshot, p: &FileParams) -> QueryResult {
+fn dependents(snap: &Arc<Snapshot>, p: &FileParams, src: &Sources) -> QueryResult {
     let file = clean(&p.file);
     snap.graph.id(&file).ok_or_else(|| not_found(snap, &file))?;
     let ip = ImpactParams {
@@ -258,7 +270,7 @@ fn dependents(snap: &Snapshot, p: &FileParams) -> QueryResult {
         limit: p.limit,
         ..Default::default()
     };
-    impact_result(snap, &ip, 0, 0)
+    impact_result(snap, &ip, 0, 0, src).map(|(body, _)| body)
 }
 
 fn neighbours(snap: &Snapshot, p: &FileParams, forward: bool) -> QueryResult {
@@ -359,6 +371,187 @@ fn areas(snap: &Snapshot, file: &str) -> QueryResult {
         "is_ignored": pol.is_ignored(&file),
         "in_graph": node.is_some(),
         "dependents": node.map(|n| snap.graph.fan_in(n)).unwrap_or(0),
+    }))
+}
+
+/// Metrics of one file from the graph and the looked-up signals (the same
+/// object as `changed[].metrics`).
+fn metrics_for(snap: &Snapshot, file: &str, sig: &ripple_policy::SignalInput) -> ripple_policy::Metrics {
+    let mut m = ripple_policy::Metrics::default();
+    if let Some(fm) = snap.graph.metrics_of(file) {
+        m.complexity = Some(fm.complexity);
+        m.max_method = (fm.methods > 0).then_some(u32::from(fm.max_method));
+        m.lines = Some(fm.lines);
+    }
+    if let Some(f) = sig.files.get(file) {
+        m.churn = f.churn.filter(|_| sig.status.churn.is_ready());
+        m.coverage = f.coverage.filter(|_| sig.status.coverage.is_ready());
+        m.hotspot = f.hotspot.filter(|_| sig.status.hotspot.is_ready());
+    }
+    m
+}
+
+/// Signal states, with complexity from the graph.
+fn signal_states(snap: &Snapshot, mut s: ripple_policy::Signals) -> ripple_policy::Signals {
+    if snap.graph.metrics_tables().is_empty() {
+        s.complexity = ripple_policy::SignalStatus::new(ripple_policy::SignalState::Unavailable, Some("the index has no metrics".to_string()));
+    }
+    s
+}
+
+/// `file`: one file's profile.
+fn file_profile(snap: &Arc<Snapshot>, file: &str, src: &Sources) -> QueryResult {
+    let file = clean(file);
+    let g = &snap.graph;
+    let node = g.id(&file);
+    if node.is_none() && !snap.files.contains(&file) {
+        return Err(not_found(snap, &file));
+    }
+    let pol = &snap.policy;
+    let class = node.and_then(|n| snap.index.get(n)).cloned().unwrap_or_else(|| pol.classify(&file));
+    let areas: Vec<Value> = class.areas.iter().map(|&a| pol.area(a)).map(|a| json!({"area": a.name, "tier": a.tier, "owners": a.owners})).collect();
+    let owners: Vec<String> = class.areas.iter().flat_map(|&a| pol.area(a).owners.iter().cloned()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let cf = ChangedFile::new(file.clone(), FileStatus::Modified);
+    let (sig, _) = src.input(snap, &[cf], RankMode::Any);
+    let metrics = metrics_for(snap, &file, &sig);
+    let cov = src.coverage.ready().filter(|_| sig.status.coverage.is_ready());
+    // Methods (Ruby): named from the scope table by their `def` line.
+    let scopes = snap.scopes_of(&file).unwrap_or_default();
+    let mut methods: Vec<Value> = Vec::new();
+    let mut uncovered: Vec<String> = Vec::new();
+    let mut method_count = 0;
+    if let Some(n) = node {
+        let mm = g.method_metrics(n);
+        method_count = mm.len();
+        // The scope table keeps one range per name; methods it does not
+        // name (redefinitions, `def self.x`) are named from their `def` line.
+        let text = std::fs::read_to_string(snap.root.join(&file)).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let name_of = |start: u32| {
+            scopes.iter().find(|r| r.start == start).map(|r| r.name.clone()).or_else(|| {
+                let l = lines.get((start as usize).checked_sub(1)?)?.trim_start();
+                let rest = l.strip_prefix("def ")?.trim_start();
+                let name: String = rest.chars().take_while(|c| !matches!(c, '(' | ' ' | ';' | '\n')).collect();
+                (!name.is_empty()).then_some(name)
+            })
+        };
+        // The body without the `def` line, which runs when the class loads
+        // (SimpleCov counts it as covered even for a method never called).
+        let body = |m: &&ripple_core::MethodMetric| if m.end() > m.start { (m.start + 1, m.end()) } else { (m.start, m.end()) };
+        let mut sorted: Vec<_> = mm.iter().collect();
+        sorted.sort_by(|a, b| b.complexity.cmp(&a.complexity).then(a.start.cmp(&b.start)));
+        for m in sorted.iter().take(5) {
+            let mut v = json!({"name": name_of(m.start), "start": m.start, "end": m.end(), "complexity": m.complexity});
+            if let Some(c) = cov.and_then(|c| c.lines(&file, &[body(m)])).and_then(|l| l.percent()) {
+                v["coverage"] = json!(ripple_policy::round1(c));
+            }
+            methods.push(v);
+        }
+        if let Some(c) = cov.filter(|c| c.file(&file).is_some()) {
+            for m in mm {
+                if c.lines(&file, &[body(&m)]).is_some_and(|l| l.coverable > 0 && l.covered == 0) {
+                    uncovered.push(name_of(m.start).unwrap_or_else(|| format!("line {}", m.start)));
+                }
+            }
+        }
+    }
+    let (mut deps_n, mut dependents, mut tests, mut dependencies) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
+    if let Some(n) = node {
+        let mut seen = std::collections::HashSet::new();
+        for (d, _) in g.dependents(n) {
+            if !seen.insert(d) {
+                continue;
+            }
+            if snap.index.get(d).is_some_and(|c| c.test) {
+                tests.push(g.path(d).to_string());
+            } else {
+                deps_n.push(d);
+            }
+        }
+        deps_n.sort_by(|&a, &b| g.fan_in(b).cmp(&g.fan_in(a)).then_with(|| g.path(a).cmp(g.path(b))));
+        dependents = deps_n.iter().take(5).map(|&d| json!({"file": g.path(d), "dependents": g.fan_in(d)})).collect();
+        tests.sort();
+        dependencies = g.dependencies(n).map(|(d, _)| d).collect::<std::collections::HashSet<_>>().len();
+    }
+    let tests_total = tests.len();
+    tests.truncate(10);
+    let partners: Vec<ripple_policy::CoChangeEntry> = if sig.status.cochange.is_ready() {
+        let q = ripple_history::PartnerQuery::from_config(&pol.config.history);
+        src.history.lookup(std::slice::from_ref(&file), &q, |p| p == file).usually_changes_with.iter().map(crate::signals::co_entry).collect()
+    } else {
+        Vec::new()
+    };
+    to_json(&json!({
+        "file": file,
+        "language": class.language,
+        "areas": areas,
+        "tier": pol.max_tier(&class.areas),
+        "owners": owners,
+        "is_test": class.test,
+        "is_global": class.global,
+        "in_graph": node.is_some(),
+        "ranked": metrics.hotspot.map(|h| h.of),
+        "metrics": metrics,
+        "methods": method_count,
+        "top_methods": methods,
+        "uncovered_methods": uncovered,
+        "dependents": {"count": deps_n.len(), "top": dependents},
+        "dependencies": {"count": dependencies},
+        "tests": {"count": tests_total, "files": tests},
+        "usually_changes_with": partners,
+        "signals": signal_states(snap, sig.status),
+    }))
+}
+
+/// `rank`: the riskiest non-test source files.
+fn rank(snap: &Arc<Snapshot>, p: &RankParams, src: &Sources) -> QueryResult {
+    let filter = ripple_policy::PathFilter::new(&p.path).map_err(|e| ErrorBody::new("bad_params", format!("--path: {e}")))?;
+    let area = match &p.area {
+        Some(a) => Some(snap.policy.areas().iter().position(|x| &x.name == a).ok_or_else(|| ErrorBody::new("bad_params", format!("no area `{a}` in ripple.yml")))? as u16),
+        None => None,
+    };
+    let by = p.by.as_deref().unwrap_or("score");
+    if !["score", "churn", "complexity", "coverage"].contains(&by) {
+        return Err(ErrorBody::new("bad_params", format!("--by {by}: expected score, churn, complexity or coverage")));
+    }
+    let (ranking, hotspot) = src.ranking(snap, RankMode::Fresh);
+    let (churn, cochange) = src.history_status();
+    let signals = signal_states(snap, ripple_policy::Signals { complexity: ripple_policy::SignalStatus::ready(), churn, cochange, coverage: src.coverage.status(), hotspot });
+    let Some(r) = ranking else {
+        return to_json(&json!({"by": by, "formula": crate::signals::RANK_FORMULA, "files": 0, "matching": 0, "rows": [], "signals": signals}));
+    };
+    let mut rows: Vec<&crate::signals::RankRow> = r.rows.iter().filter(|x| filter.is_match(&x.path) && area.is_none_or(|a| x.areas.contains(&a))).collect();
+    match by {
+        "churn" => rows.sort_by(|a, b| (b.recent_commits, b.commits).cmp(&(a.recent_commits, a.commits)).then(a.rank.cmp(&b.rank))),
+        "complexity" => rows.sort_by(|a, b| (b.complexity, b.max_method).cmp(&(a.complexity, a.max_method)).then(a.rank.cmp(&b.rank))),
+        "coverage" => {
+            rows.retain(|x| x.coverage.is_some());
+            rows.sort_by(|a, b| a.coverage.unwrap_or(0.0).total_cmp(&b.coverage.unwrap_or(0.0)).then(a.rank.cmp(&b.rank)));
+        }
+        _ => {}
+    }
+    let matching = rows.len();
+    rows.truncate(p.limit.unwrap_or(20));
+    let cutoff = r.cutoff();
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .map(|x| {
+            let mut v = serde_json::to_value(x).unwrap_or(Value::Null);
+            v["hotspot"] = json!(x.rank <= cutoff);
+            v
+        })
+        .collect();
+    to_json(&json!({
+        "by": by,
+        "formula": crate::signals::RANK_FORMULA,
+        "files": r.rows.len(),
+        "matching": matching,
+        "hotspot_percent": r.hotspot_percent,
+        "hotspot_cutoff": cutoff,
+        "generation": r.key.generation,
+        "compute_us": r.compute_us,
+        "rows": rows,
+        "signals": signals,
     }))
 }
 

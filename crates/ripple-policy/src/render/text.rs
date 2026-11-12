@@ -138,6 +138,9 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
         }
         let old = c.old_path.as_deref().map(|p| format!(" (from {p})")).unwrap_or_default();
         let _ = writeln!(o, "changed {status} {}{old}  {}", c.path, extra.join("  "));
+        if let Some(m) = c.metrics.as_ref().filter(|m| !m.is_empty()) {
+            let _ = writeln!(o, "  {}", crate::signals::metrics_line(m));
+        }
     }
     more(&mut o, r.changed.len(), r.counts.changed, " changed files");
 
@@ -277,6 +280,14 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
         more(&mut o, shown, r.counts.tests, "");
     }
 
+    // Files outside the diff that usually change with it (git history).
+    if !r.usually_changes_with.is_empty() {
+        let _ = writeln!(o, "usually changes with (not in the diff):");
+        for u in r.usually_changes_with.iter().take(crate::signals::USUALLY_CHANGES_WITH) {
+            let _ = writeln!(o, "  {}  {}", u.path, u.why);
+        }
+    }
+
     // Policy: one compact line, after the correctness signals; the
     // rule messages only when asked for everything.
     if let Some(p) = &r.policy {
@@ -306,5 +317,21 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
     if !r.blind_spots.is_empty() {
         let _ = writeln!(o, "blind spots: {}", r.blind_spots.join("; "));
     }
+    if let Some(line) = r.signals.as_ref().and_then(not_ready_line) {
+        let _ = writeln!(o, "{line}");
+    }
     o
+}
+
+/// "not ready: coverage unavailable (no coverage report ...); churn building", or None.
+pub(crate) fn not_ready_line(s: &crate::signals::Signals) -> Option<String> {
+    let parts: Vec<String> = s
+        .not_ready()
+        .into_iter()
+        .map(|(name, st)| match &st.reason {
+            Some(r) => format!("{name} {} ({r})", st.state.as_str()),
+            None => format!("{name} {}", st.state.as_str()),
+        })
+        .collect();
+    if parts.is_empty() { None } else { Some(format!("not ready: {}", parts.join("; "))) }
 }

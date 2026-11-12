@@ -20,7 +20,8 @@
     "tests": { "type": "array", "items": { "$ref": "#/$defs/test" } },
     "incomplete": { "type": "array", "items": { "$ref": "#/$defs/incomplete" } },
     "blind_spots": { "type": "array", "items": { "type": "string" } },
-    "usually_changes_with": { "type": "array", "description": "Reserved (co-change history); absent by default." },
+    "usually_changes_with": { "type": "array", "description": "At most 5 files outside the diff and its direct dependents that git history shows changing together with a changed file, best first. Absent when there are none or co-change is not ready (see `signals`).", "items": { "$ref": "#/$defs/cochange" } },
+    "signals": { "$ref": "#/$defs/signals" },
     "policy": { "$ref": "#/$defs/policy" },
     "warnings": { "type": "array", "items": { "$ref": "#/$defs/warning" } },
     "query": { "$ref": "#/$defs/query" },
@@ -87,7 +88,87 @@
         "dependents": { "$ref": "#/$defs/count" },
         "in_graph": { "type": "boolean" },
         "is_test": { "type": "boolean" },
-        "is_global": { "type": "boolean" }
+        "is_global": { "type": "boolean" },
+        "metrics": { "$ref": "#/$defs/metrics" }
+      }
+    },
+    "signal_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["ready", "building", "loading", "disabled", "unavailable"] },
+        "reason": { "type": "string", "description": "Why the signal is not ready, or a caveat when it is." }
+      }
+    },
+    "signals": {
+      "type": "object",
+      "description": "State of each signal besides the dependency graph. Rules needing a signal that is not ready do not fire (and add a `rule_signal_not_ready` warning).",
+      "additionalProperties": false,
+      "required": ["complexity", "churn", "cochange", "coverage", "hotspot"],
+      "properties": {
+        "complexity": { "$ref": "#/$defs/signal_status" },
+        "churn": { "$ref": "#/$defs/signal_status" },
+        "cochange": { "$ref": "#/$defs/signal_status" },
+        "coverage": { "$ref": "#/$defs/signal_status" },
+        "hotspot": { "$ref": "#/$defs/signal_status" }
+      }
+    },
+    "percent": { "type": "number", "minimum": 0 },
+    "metrics": {
+      "type": "object",
+      "description": "Size, complexity, churn, coverage and hotspot rank of a changed non-test file. Each part is absent when unknown or its signal is not ready.",
+      "additionalProperties": false,
+      "properties": {
+        "complexity": { "$ref": "#/$defs/count" },
+        "max_method": { "$ref": "#/$defs/count" },
+        "lines": { "$ref": "#/$defs/count" },
+        "churn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commits", "recent_commits"],
+          "properties": {
+            "commits": { "$ref": "#/$defs/count" },
+            "recent_commits": { "$ref": "#/$defs/count" },
+            "last_changed": { "type": "integer", "description": "Unix seconds." }
+          }
+        },
+        "coverage": {
+          "type": "object",
+          "description": "Absent when the file is in no coverage report (unknown, not 0%).",
+          "additionalProperties": false,
+          "required": ["covered", "coverable"],
+          "properties": {
+            "percent": { "$ref": "#/$defs/percent" },
+            "covered": { "$ref": "#/$defs/count" },
+            "coverable": { "$ref": "#/$defs/count" },
+            "changed_lines_percent": { "$ref": "#/$defs/percent" },
+            "stale": { "type": "boolean" }
+          }
+        },
+        "hotspot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rank", "percentile"],
+          "properties": {
+            "rank": { "type": "integer", "minimum": 1 },
+            "of": { "$ref": "#/$defs/count" },
+            "percentile": { "$ref": "#/$defs/percent" },
+            "hotspot": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "cochange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "together", "of", "why"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "via": { "$ref": "#/$defs/path" },
+        "together": { "$ref": "#/$defs/count" },
+        "of": { "$ref": "#/$defs/count" },
+        "why": { "type": "string" }
       }
     },
     "mention": {

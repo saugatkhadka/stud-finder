@@ -355,6 +355,11 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 
 fn strip_timing(mut v: Value) -> Value {
     v["timing"] = Value::Null;
+    // The daemon reads history and coverage in the background, one-shot
+    // mode inline: their states legitimately differ between the two.
+    if let Some(o) = v.as_object_mut() {
+        o.remove("signals");
+    }
     v
 }
 

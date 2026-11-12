@@ -4,6 +4,7 @@ use crate::engine::{Engine, Pipeline, Snapshot};
 use crate::paths::DaemonPaths;
 use crate::protocol::{ErrorBody, Freshness, ImpactParams, PROTOCOL, Response};
 use crate::query;
+use crate::signals::Sources;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -209,13 +210,10 @@ impl Backend {
                             if let Some(d) = p.diff.take() {
                                 p.changed = crate::git::changed_files(&root, &d.spec()).map_err(|e| ErrorBody::new("git_failed", format!("{e:#}")))?;
                             }
-                            let out = query::impact_result(snap, &p, 0, 0)?;
-                            // The sidecar only: one-shot mode never builds history.
-                            let mut changed: Vec<String> = p.changed.iter().map(|c| query::clean(&c.path)).chain(p.files.iter().map(|f| query::clean(f))).collect();
-                            changed.sort_unstable();
-                            changed.dedup();
-                            let view = crate::historyd::oneshot_view(&root, &snap.policy.config);
-                            history = Some(crate::historyd::impact_history(&view, snap, &changed));
+                            // The history sidecar and coverage reports, read now:
+                            // one-shot mode never builds history or runs tests.
+                            let (out, h) = query::impact_result(snap, &p, 0, 0, &Sources::oneshot(snap))?;
+                            history = Some(h);
                             Ok(out)
                         }),
                     "stats" => {
@@ -224,7 +222,8 @@ impl Backend {
                         Ok(v.to_string())
                     }
                     "reload" | "shutdown" => Err(ErrorBody::new("no_daemon", "no daemon is running")),
-                    m => query::execute(snap, m, params, 0),
+                    m @ ("dependents" | "file" | "rank") => query::execute(snap, m, params, 0, &Sources::oneshot(snap)),
+                    m => query::execute(snap, m, params, 0, &Sources::none()),
                 });
                 let fresh = Freshness { synced: true, ..Freshness::default() };
                 Ok(Reply { protocol: PROTOCOL, generation: snap.generation, server_us: us, fresh, result, history })

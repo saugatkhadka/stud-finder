@@ -166,8 +166,10 @@ pub fn render(report: &Report, max_listed: usize) -> String {
     }
 
     let _ = writeln!(o, "### Changed files\n");
-    let _ = writeln!(o, "| File | Status | Lines | Change | Language | Areas | Direct dependents |");
-    let _ = writeln!(o, "|---|---|---|---|---|---|---:|");
+    let with_metrics = r.changed.iter().any(|c| c.metrics.as_ref().is_some_and(|m| !m.is_empty()));
+    let (mh, ms) = if with_metrics { (" Metrics |", "---|") } else { ("", "") };
+    let _ = writeln!(o, "| File | Status | Lines | Change | Language | Areas | Direct dependents |{mh}");
+    let _ = writeln!(o, "|---|---|---|---|---|---|---:|{ms}");
     for c in &r.changed {
         let mut file = code(&c.path);
         if let Some(old) = &c.old_path {
@@ -196,11 +198,24 @@ pub fn render(report: &Report, max_listed: usize) -> String {
             cell(&c.areas.join(", ")),
             deps
         );
+        if with_metrics {
+            o.pop();
+            let m = c.metrics.as_ref().map(crate::signals::metrics_line).unwrap_or_default();
+            let _ = writeln!(o, " {} |", cell(&m));
+        }
     }
     if r.counts.changed > r.changed.len() {
         let _ = writeln!(o, "\n…and {} more changed files.", r.counts.changed - r.changed.len());
     }
     let _ = writeln!(o);
+    if !r.usually_changes_with.is_empty() {
+        let _ = writeln!(o, "### Usually changes with\n");
+        let _ = writeln!(o, "<sub>Files not in this diff that git history shows changing together with a changed file.</sub>\n");
+        for u in r.usually_changes_with.iter().take(crate::signals::USUALLY_CHANGES_WITH) {
+            let _ = writeln!(o, "- {}: {}", code(&u.path), cell(&u.why));
+        }
+        let _ = writeln!(o);
+    }
 
     let _ = writeln!(o, "### Direct dependents ({})\n", r.counts.dependents);
     if r.counts.dependents == 0 {
@@ -293,6 +308,9 @@ pub fn render(report: &Report, max_listed: usize) -> String {
             let _ = writeln!(o, "- …and {} more", r.warnings.len() - 20);
         }
         let _ = writeln!(o);
+    }
+    if let Some(line) = r.signals.as_ref().and_then(super::text::not_ready_line) {
+        let _ = writeln!(o, "<sub>{}</sub>\n", cell(&line));
     }
 
     let _ = writeln!(

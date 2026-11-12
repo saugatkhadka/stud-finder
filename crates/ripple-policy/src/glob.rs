@@ -116,6 +116,26 @@ impl Patterns {
     }
 }
 
+/// A user-supplied list of globs (`ripple rank --path`), with the same
+/// syntax as `ripple.yml`.
+#[derive(Debug, Clone, Default)]
+pub struct PathFilter(Patterns);
+
+impl PathFilter {
+    pub fn new(patterns: &[String]) -> Result<Self, String> {
+        let mut issues = Vec::new();
+        let p = Patterns::list("path", patterns, &mut issues);
+        match issues.first() {
+            Some(i) => Err(i.message.clone()),
+            None => Ok(Self(p)),
+        }
+    }
+    /// True for every path when the list is empty.
+    pub fn is_match(&self, path: &str) -> bool {
+        self.0.is_empty() || self.0.is_match(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

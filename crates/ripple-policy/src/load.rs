@@ -102,11 +102,29 @@ pub fn validate(config: &Config, src: Option<&str>) -> Vec<Issue> {
         if w.within == Some(0) {
             issues.push(Issue::new(format!("rules[{i}].when.within"), "`within` must be at least 1 hop (omit it to use query.max_depth)"));
         }
+        for (key, v) in [("coverage_under", w.coverage_under), ("changed_lines_coverage_under", w.changed_lines_coverage_under)] {
+            if v.is_some_and(|v| !(0.0..=100.0).contains(&v)) {
+                issues.push(Issue::new(format!("rules[{i}].when.{key}"), "a percentage from 0 to 100"));
+            }
+        }
+        if w.cochange_min_confidence.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+            issues.push(Issue::new(format!("rules[{i}].when.cochange_min_confidence"), "a share from 0 to 1"));
+        }
+        if w.cochange_min_confidence.is_some() && w.missing_cochange.is_none() {
+            issues.push(Issue::new(format!("rules[{i}].when.cochange_min_confidence"), "`cochange_min_confidence` only applies together with `missing_cochange`"));
+        }
+        if w.uncovered_includes_unknown && w.uncovered.is_none() {
+            issues.push(Issue::new(format!("rules[{i}].when.uncovered_includes_unknown"), "`uncovered_includes_unknown` only applies together with `uncovered`"));
+        }
         for (j, r) in rule.require.iter().enumerate() {
             if r.trim().is_empty() {
                 issues.push(Issue::new(format!("rules[{i}].require[{j}]"), "required action must not be empty"));
             }
         }
+    }
+    let hp = config.rank.hotspot_percent;
+    if !(hp > 0.0 && hp <= 100.0) {
+        issues.push(Issue::new("rank.hotspot_percent", "a percentage above 0, at most 100"));
     }
     for (name, area) in &config.areas {
         if area.paths.is_empty() {
@@ -239,5 +257,22 @@ rules:
     #[test]
     fn unsupported_version() {
         assert!(err("version: 2\n").contains("unsupported version 2"));
+    }
+
+    #[test]
+    fn signal_conditions_are_checked() {
+        let ok = parse_config(
+            "rank: {hotspot_percent: 2.5}\nrules:\n  - id: a\n    risk: high\n    when: {churn_over: 10, complexity_over: 50, max_method_complexity_over: 15, coverage_under: 40, changed_lines_coverage_under: 60, uncovered: true, uncovered_includes_unknown: true, hotspot: true, missing_cochange: true, cochange_min_confidence: 0.4}\n",
+            "ripple.yml",
+        )
+        .unwrap();
+        assert_eq!(ok.rank.hotspot_percent, 2.5);
+        assert_eq!(parse_config("", "ripple.yml").unwrap().rank.hotspot_percent, 5.0);
+        let e = err("rank: {hotspot_percent: 0}\nrules:\n  - {id: a, risk: high, when: {coverage_under: 120, cochange_min_confidence: 0.5, uncovered_includes_unknown: true}}\n");
+        for want in ["rank.hotspot_percent", "rules[0].when.coverage_under", "rules[0].when.cochange_min_confidence", "rules[0].when.uncovered_includes_unknown"] {
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        assert!(err("rules:\n  - {id: a, risk: high, when: {missing_cochange: true, cochange_min_confidence: 2}}\n").contains("a share from 0 to 1"));
+        assert!(err("rank: {hotspot: 5}\n").contains("hotspot"));
     }
 }

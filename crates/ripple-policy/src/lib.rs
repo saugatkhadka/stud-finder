@@ -20,6 +20,7 @@ mod policy;
 pub mod render;
 mod report;
 pub mod schema;
+mod signals;
 
 pub use changed::{Change, ChangeKind, ChangedFile, DefLine, FileStatus, Hunk, WholeFileReason, classify_change, def_name, def_names, scopes_for_hunks};
 pub use defaults::default_rules;
@@ -30,3 +31,5 @@ pub use lang::{Language, Side};
 pub use load::{CONFIG_FILE_NAMES, LoadedConfig, find_config, load_config, parse_config};
 pub use policy::{CompiledArea, FileClass, Policy, PolicyIndex};
 pub use report::*;
+pub use signals::*;
+pub use glob::PathFilter;

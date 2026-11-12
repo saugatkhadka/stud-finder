@@ -37,6 +37,12 @@
 //! * `why {from, to, scopes?}` → shortest dependency path between two files
 //!   (`scopes`: only through these methods / actions of `to`).
 //! * `areas {file}` → how the policy classifies a file.
+//! * `file {file}` → one file's profile: classification, metrics (complexity,
+//!   churn, coverage, hotspot rank), its most complex methods, dependents,
+//!   dependencies, direct tests, co-change partners and signal states.
+//! * `rank {limit? = 20, path?: [glob], area?, by?: score|churn|complexity|coverage}`
+//!   → the riskiest non-test source files (see [`crate::signals::RANK_FORMULA`]).
+//!   Computed once per index generation / history head / coverage load and cached.
 //! * `stats` → index and daemon statistics. `reload` → full re-index. `shutdown`.
 //!
 //! **Freshness contract.** Every query answer reflects every file edit that
@@ -63,6 +69,10 @@
 //! In a stale `impact` answer, a changed file that is itself pending is
 //! treated as wholly changed: its diff hunks are not mapped onto method
 //! ranges that were indexed from older contents.
+//!
+//! **Signals.** The report itself carries `changed[].metrics`,
+//! `usually_changes_with` and `signals` (see the README); the envelope's
+//! `history` object below is kept for older clients.
 //!
 //! **Git history.** An `impact` answer carries one more envelope field,
 //! `"history": {"state": "ready|building|disabled|unavailable", "reason"?,
@@ -208,6 +218,23 @@ pub struct FileParams {
     /// `dependents` only: cut every list to this many entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    pub sync: bool,
+    pub no_wait: bool,
+    pub max_wait_ms: Option<u64>,
+}
+
+/// `rank` parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RankParams {
+    /// Rows returned (default 20).
+    pub limit: Option<usize>,
+    /// Only files matching one of these globs.
+    pub path: Vec<String>,
+    /// Only files in this area of `ripple.yml`.
+    pub area: Option<String>,
+    /// `score` (default), `churn`, `complexity` or `coverage` (lowest first; known coverage only).
+    pub by: Option<String>,
     pub sync: bool,
     pub no_wait: bool,
     pub max_wait_ms: Option<u64>,

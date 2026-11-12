@@ -32,6 +32,8 @@ pub struct Config {
     /// Existing test-coverage reports (`ripple-coverage`): read, never
     /// produced. A separate signal, never risk input by itself.
     pub coverage: CoverageConfig,
+    /// `ripple rank` and the hotspot signal.
+    pub rank: RankConfig,
 }
 
 impl Default for Config {
@@ -69,6 +71,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             history: HistoryConfig::default(),
             coverage: CoverageConfig::default(),
+            rank: RankConfig::default(),
         }
     }
 }
@@ -222,6 +225,52 @@ pub struct When {
     /// Only consider edges of at least this confidence when evaluating
     /// `reaches*` / `impacted_files_over` / `crosses_boundary` for this rule.
     pub min_confidence: Option<crate::model::Confidence>,
+    // Signal conditions. Each looks at the changed, non-deleted, non-test
+    // source files; a rule whose signal is not ready never fires (and says so).
+    /// A changed file was changed in more than this many commits in the
+    /// last 90 days of the history window (git history).
+    pub churn_over: Option<u32>,
+    /// A changed file's complexity (sum over its methods plus top level) is greater than this.
+    pub complexity_over: Option<u32>,
+    /// A changed file has a method more complex than this.
+    pub max_method_complexity_over: Option<u32>,
+    /// A changed file's line coverage is below this percentage. Files with
+    /// unknown coverage (in no report) never satisfy it.
+    pub coverage_under: Option<f64>,
+    /// The changed lines of a file (diff hunks) are covered below this
+    /// percentage. Needs a diff and files with known coverage.
+    pub changed_lines_coverage_under: Option<f64>,
+    /// `true`: a changed file has known 0% coverage (and, with
+    /// `uncovered_includes_unknown`, also one that is in no report).
+    pub uncovered: Option<bool>,
+    /// Lets `uncovered` count files with unknown coverage.
+    pub uncovered_includes_unknown: bool,
+    /// A changed file is in the top `rank.hotspot_percent` of `ripple rank`.
+    pub hotspot: Option<bool>,
+    /// A file that usually changes with the changed files (co-change share
+    /// at least `cochange_min_confidence`) is not in the diff.
+    pub missing_cochange: Option<bool>,
+    /// For `missing_cochange` (0..1; default 0.5). Partners below
+    /// `history.min_confidence` are never found.
+    pub cochange_min_confidence: Option<f32>,
+}
+
+/// Default of [`When::cochange_min_confidence`].
+pub const DEFAULT_COCHANGE_MIN_CONFIDENCE: f32 = 0.5;
+
+/// `rank:` in `ripple.yml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RankConfig {
+    /// A file is a hotspot when it is in this top share of `ripple rank`
+    /// (percent of the ranked files).
+    pub hotspot_percent: f64,
+}
+
+impl Default for RankConfig {
+    fn default() -> Self {
+        Self { hotspot_percent: 5.0 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

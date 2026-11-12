@@ -29,6 +29,7 @@ ripple-js.workspace = true
 ripple-boundary.workspace = true
 ripple-policy.workspace = true
 ripple-history = { path = "../ripple-history" }
+ripple-coverage.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
