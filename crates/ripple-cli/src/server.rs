@@ -487,7 +487,13 @@ fn begin_shutdown(shared: &Shared) {
     st.shutdown = true;
     shared.cv.notify_all();
     drop(st);
-    let _ = UnixStream::connect(&shared.paths.socket);
+    // Wake the accept loop. A full listen backlog refuses the connection, so retry.
+    for _ in 0..200 {
+        if UnixStream::connect(&shared.paths.socket).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn handle_conn(stream: UnixStream, shared: &Arc<Shared>) {

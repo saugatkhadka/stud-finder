@@ -263,30 +263,56 @@ fn idle_timeout_stops_daemon_and_allows_restart() {
     t.join().unwrap().unwrap();
 }
 
-/// More concurrent clients than connection slots: all are answered, and
-/// open connections never exceed the cap.
+/// Connects, retrying while the listen backlog is full (macOS refuses
+/// connections beyond 128 queued ones instead of blocking).
+fn connect_retry(p: &ripple_cli::paths::DaemonPaths) -> ripple_cli::client::Client {
+    let t = Instant::now();
+    loop {
+        if let Some(c) = ripple_cli::client::Client::connect(p) {
+            return c;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "connect refused for 10s");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The daemon holds at most `MAX_CONNECTIONS` connections; another client
+/// waits (in the listen backlog) until one closes. Bursts beyond the cap are
+/// all answered.
 #[test]
 fn connection_cap_queues_extra_clients() {
     let repo = chain();
     let d = Daemon::start(&repo.root);
-    // Extra clients wait in the listen backlog (128 on macOS), so stay below cap + backlog.
-    let n = ripple_cli::server::MAX_CONNECTIONS + 72;
-    let barrier = Arc::new(std::sync::Barrier::new(n));
-    let handles: Vec<_> = (0..n)
+    let cap = ripple_cli::server::MAX_CONNECTIONS;
+    let mut idle: Vec<_> = (0..cap).map(|_| connect_retry(&d.paths)).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let p = d.paths.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut c = connect_retry(&p);
+        let r = c.call("stats", &json!(null)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&r.result.unwrap()).unwrap();
+        tx.send(v["daemon"]["connections"].as_u64().unwrap()).unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "answered beyond the connection cap");
+    idle.pop();
+    let n = rx.recv_timeout(Duration::from_secs(5)).expect("answered once a slot freed");
+    assert!(n as usize <= cap, "{n}");
+    drop(idle);
+    let t = Instant::now();
+    while d.call("stats", json!(null)).0["daemon"]["connections"] != 1 {
+        assert!(t.elapsed() < Duration::from_secs(5), "closed connections still hold slots");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A burst of short-lived clients, more than the cap.
+    let handles: Vec<_> = (0..cap * 2)
         .map(|_| {
-            let (p, b) = (d.paths.clone(), barrier.clone());
+            let p = d.paths.clone();
             std::thread::spawn(move || {
-                // Open every connection first, then send: the daemon sees all at once.
-                let mut c = ripple_cli::client::Client::connect(&p).expect("connect");
-                b.wait();
-                let r = c.call("stats", &json!(null)).unwrap();
-                let v: serde_json::Value = serde_json::from_str(&r.result.unwrap()).unwrap();
-                v["daemon"]["connections"].as_u64().unwrap()
+                let mut c = connect_retry(&p);
+                c.call("stats", &json!(null)).unwrap().result.is_ok()
             })
         })
         .collect();
-    let peak = handles.into_iter().map(|h| h.join().unwrap()).max().unwrap();
-    assert!(peak as usize <= ripple_cli::server::MAX_CONNECTIONS, "{peak}");
-    let (s, _) = d.call("stats", json!(null));
-    assert_eq!(s["edges"], 3);
+    assert!(handles.into_iter().all(|h| h.join().unwrap()));
 }
