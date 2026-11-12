@@ -40,13 +40,14 @@ pub struct FileEntry {
     pub template: TemplateFacts,
     /// Methods defined and mentioned (Ruby files and templates).
     pub methods: MethodFacts,
+    /// What the file defines and mentions, for the mention filter (taken out
+    /// of `methods`); `None` when unknown (method facts off or failed).
+    pub mentions: Option<std::sync::Arc<ripple_core::FileMentions>>,
     /// Normalized constant names Zeitwerk would map this path to.
     pub zeitwerk_keys: Vec<String>,
     pub warnings: Vec<Warning>,
     /// The file could not be read; it contributes nothing.
     pub unreadable: bool,
-    /// The prism pass failed: no method facts, so no method precision.
-    pub methods_failed: bool,
 }
 
 pub struct Analysed {
@@ -128,15 +129,17 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
                 }
                 let result = ruby_prism::parse(source.as_bytes());
                 let root = result.node();
-                (rails::collect_root(&root, &source, controller), methods::collect(&root, source.as_bytes()))
+                (rails::collect_root(&root, &source, controller), methods::collect(&root, source.as_bytes(), controller))
             })) {
-                Ok((f, m)) => {
+                Ok((f, mut m)) => {
                     entry.facts = f;
+                    if method_level {
+                        entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
+                    }
                     entry.methods = m;
                 }
                 Err(_) => {
-                    // No method facts: the edge builder treats the file as opaque (whole file).
-                    entry.methods_failed = true;
+                    // No method facts: mentions unknown, no scopes (whole file).
                     entry.warnings.push(
                         Warning::new("ruby_prism_panic", "Rails DSL pass panicked; skipped").file(rel),
                     )
@@ -153,7 +156,9 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
         SourceKind::Template(lang) => {
             entry.template = templates::collect_with(&source, lang, method_level);
             if method_level {
-                entry.methods = methods::from_template(&entry.template);
+                let mut m = methods::from_template(&entry.template);
+                entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
+                entry.methods = m;
             }
         }
     }

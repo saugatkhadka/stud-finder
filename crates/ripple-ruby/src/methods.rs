@@ -1,8 +1,9 @@
-//! Per-file method facts for method-level scopes, from the ruby-prism tree:
+//! Per-file method facts for method-level queries, from the ruby-prism tree:
 //!
 //! - **defs**: outermost `def`s (any receiver, inside `class << self`,
 //!   blocks such as `included do`), with lines and byte offsets. A `def`
-//!   nested in another belongs to the outer one.
+//!   nested in another belongs to the outer one. Their ranges become
+//!   `Facts.scopes`.
 //! - **mentions**: every method-call name (any receiver or none, including
 //!   `a.b += 1`, `a.b ||= 1`, `a.b, c = ...`), every symbol literal, every
 //!   identifier-like string literal, each with its enclosing outermost `def`
@@ -21,17 +22,86 @@
 //!   arguments to receiverless/`self.` `include`/`extend`/`prepend`, so the
 //!   Rubydex constant references there can be told apart.
 //!
-//! Names are interned per file (`names`); `State::apply` maps them to
-//! workspace-wide ids. Everything here depends only on the file's content.
+//! Mentions and dynamic sites end up in a [`FileMentions`] (hashed names,
+//! no lines) for the query-time mention filter; the rest is interned per file
+//! (`names`) and mapped to workspace-wide ids by `State::apply`. Everything
+//! here depends only on the file's content.
 
 use ruby_prism::{
     CallAndWriteNode, CallNode, CallOperatorWriteNode, CallOrWriteNode, CallTargetNode, ClassNode,
     DefNode, Node, StringNode, SymbolNode, Visit,
 };
+use ripple_core::mentions::{FileMentions, name_id};
 use std::collections::HashMap;
 
 /// "No enclosing def": the mention sits at class/module/top level.
-pub const NONE: u32 = u32::MAX;
+pub const NONE: u32 = ripple_core::mentions::NO_DEF;
+
+/// Methods called implicitly (by Ruby, Rails or common gems) without their
+/// name being written at the call site. A change inside one = whole file.
+const IMPLICIT: &[&str] = &[
+    // Ruby hooks and conversions
+    "method_missing", "respond_to_missing?", "respond_to?", "inherited", "included", "extended",
+    "prepended", "method_added", "singleton_method_added", "method_removed", "method_undefined",
+    "const_missing", "initialize_copy", "initialize_dup", "initialize_clone", "to_s", "to_str",
+    "to_proc", "to_ary", "to_a", "to_h", "to_hash", "to_i", "to_int", "to_f", "to_r", "to_c",
+    "to_sym", "to_io", "to_path", "to_regexp", "to_json", "as_json", "to_xml", "to_yaml",
+    "to_liquid", "serializable_hash", "inspect", "pretty_print", "hash", "eql?", "each",
+    "call", "coerce", "marshal_dump", "marshal_load", "_dump", "encode_with", "init_with",
+    "dup", "clone", "freeze",
+    // Rails / ActiveModel
+    "to_param", "to_partial_path", "to_model", "to_key", "persisted?", "new_record?",
+    "model_name", "cache_key", "cache_key_with_version", "cache_version", "attributes",
+    "attribute_names", "read_attribute_for_serialization", "read_attribute_for_validation",
+    "perform", "validate", "validate_each", "up", "down", "change",
+    "before_validation", "after_validation", "before_save", "around_save", "after_save",
+    "before_create", "around_create", "after_create", "before_update", "around_update",
+    "after_update", "before_destroy", "around_destroy", "after_destroy", "after_commit",
+    "after_rollback", "after_initialize", "after_find", "after_touch", "after_create_commit",
+    "after_update_commit", "after_destroy_commit", "after_save_commit",
+    // GraphQL, Pundit, ViewComponent, ActionCable, test frameworks
+    "resolve", "resolve_type", "authorized?", "ready?", "visible?", "coerce_input",
+    "coerce_result", "index?", "show?", "new?", "create?", "edit?", "update?", "destroy?",
+    "permitted_attributes", "render_in", "before_render", "render?", "subscribed",
+    "unsubscribed", "receive", "connect", "disconnect", "setup", "teardown",
+];
+
+/// Why a method has no scope of its own: a change inside it is a change to
+/// the whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Denied {
+    Implicit,
+    Operator,
+    Setter,
+    Unmentioned,
+    ControllerNonAction,
+}
+
+impl Denied {
+    pub fn key(self) -> &'static str {
+        match self {
+            Denied::Implicit => "implicit_list",
+            Denied::Operator => "operator",
+            Denied::Setter => "setter",
+            Denied::Unmentioned => "unmentioned",
+            Denied::ControllerNonAction => "controller_non_action",
+        }
+    }
+}
+
+/// The rules that depend on the name alone: invoked implicitly, an
+/// operator, a setter.
+pub fn denied_by_name(name: &str) -> Option<Denied> {
+    if IMPLICIT.contains(&name) {
+        Some(Denied::Implicit)
+    } else if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()) {
+        Some(Denied::Operator)
+    } else if name.ends_with('=') {
+        Some(Denied::Setter)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Def {
@@ -50,24 +120,11 @@ pub struct Def {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Mention {
-    pub name: u32,
+struct Dynamic {
     /// Index into `defs`, or [`NONE`].
-    pub scope: u32,
-    /// First line of this (name, scope) pair.
-    pub line: u32,
-    /// Counts towards "is this name mentioned anywhere" (rule 5). Crude
-    /// template mentions are used for edges only.
-    pub counted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Dynamic {
-    /// Index into `defs`, or [`NONE`].
-    pub scope: u32,
+    scope: u32,
     /// Receiverless or `self.`: may call any method of this object.
-    pub on_self: bool,
-    pub line: u32,
+    on_self: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -76,15 +133,14 @@ pub struct MethodFacts {
     pub names: Vec<String>,
     /// Sorted by `start_off`; non-overlapping.
     pub defs: Vec<Def>,
-    /// One per distinct (name, scope), with the first line.
-    pub mentions: Vec<Mention>,
-    /// Per name: number of counted mentions outside a def of the same name.
+    /// Per name: number of counted mentions outside a def of the same name
+    /// (for "never mentioned anywhere"; crude template mentions do not count).
     pub counts: Vec<(u32, u32)>,
-    /// Distinct (scope, on_self).
-    pub dynamic: Vec<Dynamic>,
     pub inherit_ranges: Vec<(u32, u32)>,
     /// Distinct def names, sorted (filled with global ids by `State::apply`).
     pub own: Vec<u32>,
+    /// What the file defines and mentions, for the mention filter.
+    pub mentions: FileMentions,
 }
 
 /// Calls that run `initialize` on a new instance of the receiver.
@@ -135,42 +191,36 @@ const EVAL_WITH_ARGS: &[&[u8]] = &[b"class_eval", b"instance_eval", b"module_eva
 
 const MIXINS: &[&[u8]] = &[b"include", b"extend", b"prepend"];
 
-pub fn collect(root: &Node, source: &[u8]) -> MethodFacts {
+/// `controller`: the file's methods are controller actions (see [`FileMentions::controller`]).
+pub fn collect(root: &Node, source: &[u8], controller: bool) -> MethodFacts {
     let mut c = Collector { source, cur: NONE, ..Collector::default() };
     c.visit(root);
-    c.finish()
+    let mut m = c.finish();
+    m.mentions.controller = controller;
+    m
 }
 
 pub fn is_constructor(name: &str) -> bool {
     CONSTRUCTORS.contains(&name.as_bytes())
 }
 
-/// Facts for a template: its mentions (all at top level), no defs.
+/// Facts for a template: its mentions (all at top level, crude ones
+/// included), no defs. Any computed dispatch makes its mentions unknown.
 pub fn from_template(t: &crate::templates::TemplateFacts) -> MethodFacts {
     let mut names: Vec<String> = Vec::new();
     let mut index: HashMap<&str, u32> = HashMap::new();
-    let mut mentions = Vec::new();
-    for (list, counted) in [(&t.mentions, true), (&t.crude, false)] {
-        for (name, line) in list {
-            let id = *index.entry(name.as_str()).or_insert_with(|| {
-                names.push(name.clone());
-                (names.len() - 1) as u32
-            });
-            mentions.push(Mention { name: id, scope: NONE, line: *line, counted });
-        }
+    for (name, _) in &t.mentions {
+        index.entry(name.as_str()).or_insert_with(|| {
+            names.push(name.clone());
+            (names.len() - 1) as u32
+        });
     }
-    mentions.sort_unstable_by_key(|m| (m.name, m.line, !m.counted));
-    // Counted first per name when lines tie; keep one per name, counted if any.
-    let mut out: Vec<Mention> = Vec::with_capacity(mentions.len());
-    for m in mentions {
-        match out.last_mut() {
-            Some(last) if last.name == m.name => last.counted |= m.counted,
-            _ => out.push(m),
-        }
-    }
-    let counts = out.iter().filter(|m| m.counted).map(|m| (m.name, 1)).collect();
-    let dynamic = if t.dynamic { vec![Dynamic { scope: NONE, on_self: true, line: 0 }] } else { Vec::new() };
-    MethodFacts { names, defs: Vec::new(), mentions: out, counts, dynamic, inherit_ranges: Vec::new(), own: Vec::new() }
+    let counts = (0..names.len() as u32).map(|i| (i, 1)).collect();
+    let mut pairs: Vec<(u32, u32)> = t.mentions.iter().chain(&t.crude).map(|(n, _)| (name_id(n), NONE)).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mentions = FileMentions { pairs: pairs.into(), opaque: t.dynamic, ..FileMentions::default() };
+    MethodFacts { names, defs: Vec::new(), counts, inherit_ranges: Vec::new(), own: Vec::new(), mentions }
 }
 
 /// Identifier-like: `foo`, `foo?`, `foo!`, `foo=`, `_x1`. Used for strings.
@@ -192,8 +242,8 @@ struct Collector<'s> {
     names: Vec<String>,
     index: HashMap<Vec<u8>, u32>,
     defs: Vec<Def>,
-    /// (name, scope, line, counted)
-    raw: Vec<(u32, u32, u32, bool)>,
+    /// (name, scope)
+    raw: Vec<(u32, u32)>,
     dynamic: Vec<Dynamic>,
     inherit_ranges: Vec<(u32, u32)>,
     cur: u32,
@@ -225,16 +275,16 @@ impl Collector<'_> {
         i
     }
 
-    fn mention(&mut self, name: &[u8], line: u32) {
+    fn mention(&mut self, name: &[u8], _line: u32) {
         if name.is_empty() {
             return;
         }
         let id = self.intern(name);
-        self.raw.push((id, self.cur, line, true));
+        self.raw.push((id, self.cur));
     }
 
-    fn dynamic(&mut self, on_self: bool, line: u32) {
-        self.dynamic.push(Dynamic { scope: self.cur, on_self, line });
+    fn dynamic(&mut self, on_self: bool, _line: u32) {
+        self.dynamic.push(Dynamic { scope: self.cur, on_self });
     }
 
     fn clean(&self, start: usize, end: usize) -> bool {
@@ -247,33 +297,37 @@ impl Collector<'_> {
         before_ok && (trimmed.is_empty() || trimmed[0] == b'#')
     }
 
-    fn finish(mut self) -> MethodFacts {
-        self.dynamic.sort_by_key(|d| (d.scope, d.on_self, d.line));
-        self.dynamic.dedup_by_key(|d| (d.scope, d.on_self));
+    fn finish(self) -> MethodFacts {
         // Counted mentions outside a def of the same name ("its own definition").
         let mut counts: HashMap<u32, u32> = HashMap::new();
-        for &(name, scope, _, counted) in &self.raw {
-            if counted && !(scope != NONE && self.defs[scope as usize].name == name) {
+        for &(name, scope) in &self.raw {
+            if !(scope != NONE && self.defs[scope as usize].name == name) {
                 *counts.entry(name).or_default() += 1;
             }
         }
         let mut counts: Vec<(u32, u32)> = counts.into_iter().collect();
         counts.sort_unstable();
-        self.raw.sort_unstable_by_key(|&(n, s, l, c)| (n, s, l, !c));
-        self.raw.dedup_by_key(|r| (r.0, r.1));
-        let mentions = self.raw.iter().map(|&(name, scope, line, counted)| Mention { name, scope, line, counted }).collect();
+        let ids: Vec<u32> = self.names.iter().map(|n| name_id(n)).collect();
+        let mut pairs: Vec<(u32, u32)> = self.raw.iter().map(|&(n, s)| (ids[n as usize], s)).collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        let defs: Box<[u32]> = self.defs.iter().map(|d| ids[d.name as usize]).collect();
+        let implicit: Box<[u32]> = (0..self.defs.len() as u32).filter(|&i| denied_by_name(&self.names[self.defs[i as usize].name as usize]).is_some()).collect();
+        let mut self_dynamic: Vec<u32> = self.dynamic.iter().filter(|d| d.on_self).map(|d| d.scope).collect();
+        self_dynamic.sort_unstable();
+        self_dynamic.dedup();
+        let mentions = FileMentions {
+            pairs: pairs.into(),
+            defs,
+            implicit,
+            self_dynamic: self_dynamic.into(),
+            opaque: self.dynamic.iter().any(|d| !d.on_self),
+            controller: false,
+        };
         let mut own: Vec<u32> = self.defs.iter().map(|d| d.name).collect();
         own.sort_unstable();
         own.dedup();
-        MethodFacts {
-            names: self.names,
-            defs: self.defs,
-            mentions,
-            counts,
-            dynamic: self.dynamic,
-            inherit_ranges: self.inherit_ranges,
-            own,
-        }
+        MethodFacts { names: self.names, defs: self.defs, counts, inherit_ranges: self.inherit_ranges, own, mentions }
     }
 }
 
@@ -452,16 +506,18 @@ mod tests {
 
     fn facts(src: &str) -> MethodFacts {
         let r = ruby_prism::parse(src.as_bytes());
-        collect(&r.node(), src.as_bytes())
+        collect(&r.node(), src.as_bytes(), false)
     }
 
     fn mentions(f: &MethodFacts) -> Vec<String> {
+        let by_id: HashMap<u32, &str> = f.names.iter().map(|n| (name_id(n), n.as_str())).collect();
         let mut v: Vec<String> = f
             .mentions
+            .pairs
             .iter()
-            .map(|m| {
-                let scope = if m.scope == NONE { "-".to_string() } else { f.names[f.defs[m.scope as usize].name as usize].clone() };
-                format!("{}@{}", f.names[m.name as usize], scope)
+            .map(|&(name, scope)| {
+                let scope = if scope == NONE { "-".to_string() } else { f.names[f.defs[scope as usize].name as usize].clone() };
+                format!("{}@{}", by_id[&name], scope)
             })
             .collect();
         v.sort();
@@ -481,11 +537,11 @@ mod tests {
         for want in ["audit@-", "refund!@-", "where@-", "y@-", "charge!@refund!", "new@refund!", "initialize@refund!", "zap@refund!", "new@build", "initialize@build", "include@-", "before_save@-"] {
             assert!(m.contains(&want.to_string()), "{want} in {m:?}");
         }
-        // `private :refund!` does not mention it: only the lambda at line 4 does.
-        let refund = f.mentions.iter().find(|x| f.names[x.name as usize] == "refund!").unwrap();
-        assert_eq!(refund.line, 4);
         assert_eq!(f.inherit_ranges.len(), 3);
-        assert!(f.dynamic.is_empty());
+        assert!(f.mentions.self_dynamic.is_empty() && !f.mentions.opaque);
+        // Visibility modifiers do not mention their literal arguments.
+        let f = facts("class A\n  private :zz, \"yy\"\n  def zz; end\nend\n");
+        assert!(mentions(&f).iter().all(|m| !m.starts_with("zz@") && !m.starts_with("yy@")), "{:?}", mentions(&f));
     }
 
     #[test]
@@ -496,8 +552,12 @@ mod tests {
         for want in ["b@a", "c@a", "d@a"] {
             assert!(m.contains(&want.to_string()), "{want} in {m:?}");
         }
-        let d: Vec<(u32, bool)> = f.dynamic.iter().map(|d| (d.scope, d.on_self)).collect();
-        assert_eq!(d, vec![(1, true), (2, false), (3, true), (NONE, false)]);
+        // `send(name)` in e, `method_missing`; `other.public_send(x)` and the
+        // top-level `obj.instance_eval(code)` make the mentions unknown.
+        assert_eq!(&*f.mentions.self_dynamic, &[1, 3]);
+        assert!(f.mentions.opaque);
+        assert_eq!(&*f.mentions.implicit, &[3], "method_missing");
+        assert!(!facts("class A\n  def a\n    send(x)\n  end\nend\n").mentions.opaque);
     }
 
     #[test]

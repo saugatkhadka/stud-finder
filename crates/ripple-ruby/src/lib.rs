@@ -54,8 +54,6 @@ struct State {
     names: scoped::Interner,
     /// `ruby.method_level` the cached facts were collected with.
     method_level: bool,
-    /// `ruby.name_only_limit` the edges were assembled with.
-    name_only_limit: usize,
 }
 
 impl RubyExtractor {
@@ -122,29 +120,24 @@ impl State {
             Some(Ok(src)) => Inflector::new().with_app_rules(&src),
             _ => Inflector::new(),
         };
-        let plan = ws
-            .config
-            .ruby
-            .method_level
-            .then(|| scoped::Plan::new(&self.files, &self.names));
+        let method_level = ws.config.ruby.method_level;
         let builder = edges::EdgeBuilder::new(
             &self.graph,
             &self.files,
             &ws.files,
             ws.config.ruby.namespace_definition_limit,
             inflector,
-            plan.as_ref().map(|p| (p, &self.names)),
+            method_level,
         );
-        let (edges, is_ref, es) = builder.run();
+        let (edges, es) = builder.run();
         let edges_us = micros(start);
         let start = Instant::now();
-        let (edges, scopes, method_stats): (_, _, BTreeMap<String, u64>) = match &plan {
-            Some(plan) => {
-                let o = scoped::finish(edges, is_ref, &self.files, &self.names, plan, self.name_only_limit);
-                (o.edges, o.scopes, o.stats)
-            }
+        let (scopes, mentions, method_stats) = if method_level {
+            let o = scoped::compute(&self.files, &self.names);
+            (o.scopes, Some(std::sync::Arc::new(o.mentions)), o.stats)
+        } else {
             // `method_level` off: exactly the file-level output (no scope ranges).
-            None => (edges, BTreeMap::new(), BTreeMap::new()),
+            (BTreeMap::new(), None, BTreeMap::new())
         };
         let methods_us = micros(start);
 
@@ -236,7 +229,7 @@ impl State {
         put("ruby_time_merge_us", t.merge_us);
         put("ruby_time_resolve_us", t.resolve_us);
         put("ruby_time_edges_us", edges_us);
-        if plan.is_some() {
+        if method_level {
             put("ruby_time_methods_us", methods_us);
         }
         for (k, v) in method_stats {
@@ -249,6 +242,7 @@ impl State {
             edges,
             facts: ripple_core::Facts {
                 scopes,
+                mentions,
                 ..Default::default()
             },
             warnings: self
@@ -382,7 +376,6 @@ impl Extractor for RubyExtractor {
             inconsistent: HashSet::new(),
             names: scoped::Interner::default(),
             method_level: ws.config.ruby.method_level,
-            name_only_limit: ws.config.ruby.name_only_limit,
         };
         state.apply(analysed);
         t.merge_us = micros(start);
@@ -399,7 +392,7 @@ impl Extractor for RubyExtractor {
     /// the cache is analysed and any cached file no longer wanted is dropped,
     /// so the result always matches a fresh `build` of `ws.files`.
     fn update(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
-        let Some(state) = self.state.as_mut().filter(|s| s.method_level == ws.config.ruby.method_level && s.name_only_limit == ws.config.ruby.name_only_limit) else {
+        let Some(state) = self.state.as_mut().filter(|s| s.method_level == ws.config.ruby.method_level) else {
             return self.build(ws);
         };
         let wanted = wanted_files(ws);

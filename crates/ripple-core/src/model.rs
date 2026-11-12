@@ -82,15 +82,16 @@ pub struct Edge {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_scope: Option<String>,
     /// `from` inherits `to`'s behaviour (superclass, `include`, `extend`,
-    /// `prepend`): whatever part of `to` is affected, the same-named part of
-    /// `from` is affected. Scopes on the edge are ignored.
+    /// `prepend`): whatever methods of `to` are affected, `from` has them too,
+    /// so the method mention filter never drops it and its own dependents are
+    /// checked against the same names. Scopes on the edge are ignored.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherit: bool,
 }
 
-/// `to_scope` value meaning "depends only on the class-level part of `to`"
-/// (constants, DSL, anything outside a method): followed only when the whole
-/// of `to` is affected, never for a change confined to named methods.
+/// Scope name for the class-level part of a file (constants, DSL, anything
+/// outside a method). A query seed naming it is a whole-file change; edges
+/// may still carry it as `to_scope` (the mention filter ignores the name).
 pub const SCOPE_BODY: &str = "@body";
 
 /// A named part of a file (a Ruby method / controller action) and its lines.
@@ -167,12 +168,21 @@ pub struct Facts {
     /// outside every range, means "treat the whole file as changed".
     #[serde(default)]
     pub scopes: std::collections::BTreeMap<RelPath, Vec<ScopeRange>>,
+    /// Method names each file defines and mentions, for the hop-1 mention
+    /// filter of method-level queries (see [`crate::mentions`]). `None` when
+    /// no extractor reports them (the filter is then off). Shared, not
+    /// serialised.
+    #[serde(skip)]
+    pub mentions: Option<std::sync::Arc<crate::mentions::MentionTable>>,
 }
 
 impl Facts {
     pub fn merge(&mut self, other: Facts) {
         self.js_call_sites.extend(other.js_call_sites);
         self.scopes.extend(other.scopes);
+        if other.mentions.is_some() {
+            self.mentions = other.mentions;
+        }
     }
 }
 

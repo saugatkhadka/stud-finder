@@ -19,9 +19,8 @@
 //!   to 5 reached depth-1 files (for precision sampling).
 //! ```
 //!
-//! Only Ruby edges exist in this graph. Seed scope names that no edge names are
-//! given a probe edge so `impact_scoped` treats them as named scopes (it
-//! otherwise follows nothing from them, not even unscoped edges).
+//! Only Ruby edges exist in this graph; the mention filter uses the
+//! extractor's mention table.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -32,7 +31,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const PROBE: &str = "__probe__";
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -104,7 +102,7 @@ fn stats(root: &Path, file_level: bool, copy: Option<String>, updates: usize, ed
     println!("edges {} {:?}", out.edges.len(), by_kind);
     println!("scoped files {} scope ranges {}", out.facts.scopes.len(), out.facts.scopes.values().map(Vec::len).sum::<usize>());
     for (k, v) in &out.stats {
-        if k.starts_with("ruby_method_") || k.starts_with("ruby_time_") {
+        if k.starts_with("ruby_method_") || k.starts_with("ruby_mention_") || k.starts_with("ruby_time_") {
             println!("  {k} = {v}");
         }
     }
@@ -187,23 +185,19 @@ fn impact(root: &Path, file: &str, n: usize, seed: u64, depth: u32, methods: Opt
     let out = RubyExtractor::new().build(&w)?;
     let build_ms = t.elapsed().as_secs_f64() * 1000.0;
     let ranges = out.facts.scopes.get(file).cloned().unwrap_or_default();
-    let named: BTreeSet<&str> = out.edges.iter().flat_map(|e| [e.from_scope.as_deref(), e.to_scope.as_deref()]).flatten().collect();
-    // Probe edges for scope names no edge names (see module docs).
-    let probes: Vec<Edge> = ranges
-        .iter()
-        .filter(|r| !named.contains(r.name.as_str()))
-        .map(|r| Edge::new(PROBE, file, ripple_core::EdgeKind::RubyConstant, ripple_core::Confidence::Exact).to_scope(&r.name))
-        .collect();
-    let g = Graph::build(out.edges.iter().chain(&probes), w.files.iter().map(String::as_str));
+    let mut g = Graph::build(&out.edges, w.files.iter().map(String::as_str));
+    if let Some(m) = &out.facts.mentions {
+        g.set_mentions(m);
+    }
     let Some(id) = g.id(file) else { anyhow::bail!("{file} not in graph") };
     let opts = QueryOpts { max_depth: depth, ..Default::default() };
     let run = |scopes: Option<Vec<String>>, o: QueryOpts| -> BTreeMap<String, u32> {
-        g.impact_scoped(&[(id, scopes)], o).hits.iter().skip(1).filter(|h| g.path(h.node) != PROBE).map(|h| (g.path(h.node).to_string(), h.depth)).collect()
+        g.impact_scoped(&[(id, scopes)], o).hits.iter().skip(1).map(|h| (g.path(h.node).to_string(), h.depth)).collect()
     };
     let whole = run(None, opts);
     let fl = run(None, QueryOpts { file_level: true, ..opts });
     let d1 = |m: &BTreeMap<String, u32>| m.values().filter(|d| **d == 1).count();
-    println!("{} {file}: build {build_ms:.0} ms, {} scope ranges, {} probe names", root.display(), ranges.len(), probes.len());
+    println!("{} {file}: build {build_ms:.0} ms, {} scope ranges", root.display(), ranges.len());
     println!("(a) whole file: {} files (depth1 {}), file_level opts: {} (depth1 {})", whole.len(), d1(&whole), fl.len(), d1(&fl));
     let mut picks: Vec<String> = match methods {
         Some(m) => m.split(',').map(String::from).collect(),
@@ -257,7 +251,7 @@ fn impact(root: &Path, file: &str, n: usize, seed: u64, depth: u32, methods: Opt
         );
         // Precision sample: explanation for up to 5 depth-1 hits.
         let imp = g.impact_scoped(&[(id, Some(vec![m.clone()]))], opts);
-        let hits: Vec<_> = imp.hits.iter().filter(|h| h.depth == 1 && g.path(h.node) != PROBE).collect();
+        let hits: Vec<_> = imp.hits.iter().filter(|h| h.depth == 1).collect();
         let mut rng = support::Rng::new(seed ^ 0x9e3);
         let mut ps: BTreeSet<usize> = BTreeSet::new();
         while ps.len() < hits.len().min(5) {

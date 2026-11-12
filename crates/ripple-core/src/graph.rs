@@ -2,8 +2,10 @@
 //! query (reverse breadth-first search). Built once per index generation;
 //! queries are allocation-light and run in microseconds to low milliseconds.
 
+use crate::mentions::{FileMentions, MentionTable, NO_DEF, name_id};
 use crate::model::{Confidence, Edge, EdgeKind, RelPath};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 pub type NodeId = u32;
 
@@ -67,15 +69,20 @@ pub struct Graph {
     data: Vec<EdgeData>,
     details: Vec<String>,
     scopes: Vec<String>,
-    scope_index: HashMap<String, u32>,
+    /// [`name_id`] of each scope, to match `to_scope`s against method names.
+    scope_ids: Vec<u32>,
     /// Number of distinct other files depending on each node / each node
-    /// depends on (edges can repeat per scope, and scoped self-edges exist).
+    /// depends on (edges can repeat per scope).
     distinct_in: Vec<u32>,
     distinct_out: Vec<u32>,
     /// from -> to ("depends on").
     forward: Csr,
     /// to -> from ("is depended on by").
     reverse: Csr,
+    /// Per node, the method names it defines and mentions (see
+    /// [`Graph::set_mentions`]); `None` = unknown.
+    mentions: Vec<Option<Arc<FileMentions>>>,
+    unmentioned: Arc<[u32]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,13 +132,11 @@ pub struct Impact {
 #[derive(Debug, Clone, Copy)]
 struct Act {
     node: NodeId,
-    /// `u32::MAX` = whole file.
+    /// `u32::MAX` = whole file; see `impact_scoped` for the other values.
     scope: u32,
     parent: u32,
     edge: u32,
     depth: u32,
-    /// Reached through an edge inside the same file (method calls method).
-    internal: bool,
 }
 
 impl Impact {
@@ -157,10 +162,7 @@ impl Impact {
             let mut a = self.hit_act[p as usize];
             loop {
                 let act = self.acts[a as usize];
-                // Hops inside one file are not shown: the path lists files.
-                if !act.internal {
-                    out.push((act.node, act.edge));
-                }
+                out.push((act.node, act.edge));
                 if act.edge == u32::MAX {
                     break;
                 }
@@ -180,15 +182,21 @@ impl Impact {
     }
 }
 
+/// Edge kinds through which a file uses another file's methods by name, so
+/// the mention filter applies to them.
+fn is_reference(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::RubyConstant | EdgeKind::RailsInferred | EdgeKind::RubyRequire | EdgeKind::RailsView)
+}
+
 impl Graph {
     /// Builds the graph. Duplicate `(from, to, kind, scopes)` edges are collapsed,
-    /// keeping the highest confidence (then lowest line). Self-edges are dropped
-    /// unless they connect two different scopes of the file (method calls method).
-    /// `extra_nodes` lets files with no edges still be addressable.
+    /// keeping the highest confidence (then lowest line); the result inherits
+    /// if any duplicate does (an inheritance edge has no scopes). Self-edges
+    /// are dropped. `extra_nodes` lets files with no edges still be addressable.
     pub fn build<'a>(edges: impl IntoIterator<Item = &'a Edge>, extra_nodes: impl IntoIterator<Item = &'a str>) -> Self {
         // Intern paths first so dedup and ordering work on integers, not strings:
         // this runs on every index generation and dominates update latency.
-        let edges: Vec<&Edge> = edges.into_iter().filter(|e| e.from != e.to || (!e.inherit && e.to_scope.is_some() && e.from_scope != e.to_scope)).collect();
+        let edges: Vec<&Edge> = edges.into_iter().filter(|e| e.from != e.to).collect();
         let mut seen: HashMap<&str, u32> = HashMap::with_capacity(edges.len() / 4);
         let mut names: Vec<&str> = Vec::new();
         let mut intern = |s: &'a str| -> u32 {
@@ -223,25 +231,34 @@ impl Graph {
                 }),
             }
         };
-        let scoped: Vec<(u32, u32, bool)> = edges.iter().map(|e| if e.inherit { (u32::MAX, u32::MAX, true) } else { (scope(&e.from_scope), scope(&e.to_scope), false) }).collect();
-        let mut keyed: Vec<(NodeId, NodeId, EdgeKind, (u32, u32, bool), std::cmp::Reverse<Confidence>, u32, u32)> = raw
+        let scoped: Vec<(u32, u32)> = edges.iter().map(|e| if e.inherit { (u32::MAX, u32::MAX) } else { (scope(&e.from_scope), scope(&e.to_scope)) }).collect();
+        // (from, to, kind, scopes, best confidence first, line, edge index, inherits)
+        let mut keyed: Vec<(NodeId, NodeId, EdgeKind, (u32, u32), std::cmp::Reverse<Confidence>, u32, u32, bool)> = raw
             .iter()
             .enumerate()
-            .map(|(i, &(f, t))| (remap[f as usize], remap[t as usize], edges[i].kind, scoped[i], std::cmp::Reverse(edges[i].confidence), edges[i].line, i as u32))
+            .map(|(i, &(f, t))| (remap[f as usize], remap[t as usize], edges[i].kind, scoped[i], std::cmp::Reverse(edges[i].confidence), edges[i].line, i as u32, edges[i].inherit))
             .collect();
         keyed.sort_unstable();
-        keyed.dedup_by_key(|k| (k.0, k.1, k.2, k.3));
+        // Keep the best duplicate; it inherits if any duplicate does.
+        keyed.dedup_by(|b, a| {
+            let same = (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3);
+            if same {
+                a.7 |= b.7;
+            }
+            same
+        });
         // An edge with no scope on one side already covers every scope on that
         // side ("the whole file depends" / "depends on the whole file"), so a
         // more specific twin of the same from/to/kind adds nothing: drop it.
-        let present: HashSet<(NodeId, NodeId, EdgeKind, u32, u32)> = keyed.iter().filter(|k| !k.3 .2).map(|k| (k.0, k.1, k.2, k.3 .0, k.3 .1)).collect();
+        // (An inheritance edge passes the affected scope on instead, so it
+        // covers nothing.)
+        let present: HashSet<(NodeId, NodeId, EdgeKind, u32, u32)> = keyed.iter().filter(|k| !k.7).map(|k| (k.0, k.1, k.2, k.3 .0, k.3 .1)).collect();
         const ANY: u32 = u32::MAX;
         keyed.retain(|k| {
-            let (fs, ts, inherit) = k.3;
-            inherit
-                || !((fs != ANY && present.contains(&(k.0, k.1, k.2, ANY, ts)))
-                    || (ts != ANY && present.contains(&(k.0, k.1, k.2, fs, ANY)))
-                    || (fs != ANY && ts != ANY && present.contains(&(k.0, k.1, k.2, ANY, ANY))))
+            let (fs, ts) = k.3;
+            !((fs != ANY && present.contains(&(k.0, k.1, k.2, ANY, ts)))
+                || (ts != ANY && present.contains(&(k.0, k.1, k.2, fs, ANY)))
+                || (fs != ANY && ts != ANY && present.contains(&(k.0, k.1, k.2, ANY, ANY))))
         });
 
         let mut details = Vec::new();
@@ -257,7 +274,7 @@ impl Graph {
                 }
                 None => u32::MAX,
             };
-            data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail, from_scope: k.3 .0, to_scope: k.3 .1, inherit: k.3 .2 });
+            data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail, from_scope: k.3 .0, to_scope: k.3 .1, inherit: k.7 });
         }
         let n = paths.len();
         let forward = Csr::build(n, endpoints.iter().copied());
@@ -274,8 +291,27 @@ impl Graph {
             last = Some((f, t));
         }
         drop(scope);
-        let scope_index = scopes.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
-        Self { paths, index, endpoints, data, details, scopes, scope_index, distinct_in, distinct_out, forward, reverse }
+        let scope_ids = scopes.iter().map(|s| name_id(s)).collect();
+        let mentions = vec![None; n];
+        Self { paths, index, endpoints, data, details, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]) }
+    }
+
+    /// Attaches the per-file method mentions that let method-level queries
+    /// narrow a seed's direct dependents (see [`Graph::impact_scoped`]).
+    /// Files of the table that are not nodes are ignored.
+    pub fn set_mentions(&mut self, table: &MentionTable) {
+        self.mentions = vec![None; self.paths.len()];
+        for (path, m) in &table.files {
+            if let Some(&n) = self.index.get(path) {
+                self.mentions[n as usize] = Some(m.clone());
+            }
+        }
+        self.unmentioned = table.unmentioned.clone();
+    }
+
+    /// The method facts of `node`, if known.
+    pub fn mentions(&self, node: NodeId) -> Option<&FileMentions> {
+        self.mentions.get(node as usize).and_then(|m| m.as_deref())
     }
 
     pub fn node_count(&self) -> usize {
@@ -338,82 +374,126 @@ impl Graph {
 
     /// Everything that may be affected by a change to `seeds`, where a seed
     /// may be limited to some of its scopes (`Some(["refund!", "charge!"])` =
-    /// only those methods changed; `None` = the whole file changed).
+    /// only those methods / controller actions changed; `None` = the whole
+    /// file changed).
     ///
-    /// Each reached file carries the set of its scopes that are affected, or
-    /// "all of it". An edge is followed from `to` when it has no `to_scope`,
-    /// or `to` is wholly affected, or its `to_scope` is one of the affected
-    /// scopes; the dependent then becomes affected in the edge's `from_scope`
-    /// (whole file if none). Inheritance edges pass the affected scope on
-    /// unchanged. Edges inside one file (method calls method) cost no depth.
+    /// Each reached file carries the part of it that is affected: all of it,
+    /// one named scope (a controller action), or a seed's name set. An edge is
+    /// followed from `to` when it has no `to_scope`, or `to` is wholly
+    /// affected, or its `to_scope` is the affected scope (one of the names, for
+    /// a name set); the dependent then becomes affected in the edge's
+    /// `from_scope` (whole file if none). Inheritance edges pass the affected
+    /// part on unchanged.
+    ///
+    /// **Mention filter.** For a seed limited to names `M` whose method facts
+    /// are known (see [`Graph::set_mentions`]), `M` first grows to a fixed
+    /// point with every method of the seed and of its ancestors (inheritance
+    /// edges, transitively) that mentions a name in `M` or dispatches on
+    /// `self` by a computed name. The seed counts as wholly changed when a
+    /// class body there mentions a name in `M` (callback, validation,
+    /// `delegate`, DSL symbol) or dispatches on `self` by a computed name, or
+    /// when a name in `M` is a method that is invoked implicitly or never
+    /// mentioned anywhere. Otherwise a direct dependent reached through a
+    /// Ruby reference edge (no `to_scope`, not inheritance) is kept only if it
+    /// mentions a name in `M` or its mentions are unknown. Beyond that first
+    /// hop, everything is file-level (or action-level) as above.
     pub fn impact_scoped(&self, seeds: &[(NodeId, Option<Vec<String>>)], opts: QueryOpts) -> Impact {
         const ALL: u32 = u32::MAX;
-        /// A named scope no edge refers to: only whole-file and inheritance
-        /// edges lead on from it.
-        const NOWHERE: u32 = u32::MAX - 1;
         /// "Nothing another file can depend on changed": leads nowhere.
-        const NOTHING: u32 = u32::MAX - 2;
+        const NOTHING: u32 = u32::MAX - 1;
+        /// `SET + 2k + f`: the names `sets[k]` of a seed; `f` = 1 when the
+        /// mention filter applies (the seed itself), 0 when it does not
+        /// (heirs, seeds without method facts).
+        const SET: u32 = 1 << 31;
+        let set_of = |scope: u32| -> Option<(usize, bool)> { (SET..NOTHING).contains(&scope).then(|| (((scope - SET) >> 1) as usize, (scope - SET) & 1 == 1)) };
         let mut position = vec![u32::MAX; self.paths.len()];
         let mut whole = vec![false; self.paths.len()];
         let mut partial: HashSet<(NodeId, u32)> = HashSet::new();
         let mut found: Vec<(Hit, u32)> = Vec::new();
         let mut acts: Vec<Act> = Vec::new();
         let mut queue: VecDeque<u32> = VecDeque::new();
+        let mut sets: Vec<Vec<u32>> = Vec::new();
 
-        let mut merged: std::collections::BTreeMap<NodeId, Option<Vec<u32>>> = std::collections::BTreeMap::new();
+        // Merge per node: `None` (whole file) wins over any names.
+        let mut merged: std::collections::BTreeMap<NodeId, Option<Vec<&str>>> = std::collections::BTreeMap::new();
         for (node, scopes) in seeds {
-            let ids = scopes.as_ref().filter(|_| !opts.file_level).and_then(|names| {
-                names.iter().map(|n| if n == crate::model::SCOPE_BODY { None } else { Some(self.scope_index.get(n).copied().unwrap_or(NOWHERE)) }).collect::<Option<Vec<u32>>>()
-            });
-            match (merged.entry(*node).or_insert_with(|| Some(Vec::new())), ids) {
+            let names = scopes.as_ref().filter(|_| !opts.file_level).filter(|v| !v.iter().any(|n| n == crate::model::SCOPE_BODY));
+            match (merged.entry(*node).or_insert_with(|| Some(Vec::new())), names) {
                 (slot, None) => *slot = None,
-                (Some(have), Some(ids)) => have.extend(ids),
+                (Some(have), Some(names)) => have.extend(names.iter().map(String::as_str)),
                 (None, Some(_)) => {}
             }
         }
-        for (node, scopes) in merged {
+        for (node, names) in merged {
             position[node as usize] = 0;
             found.push((Hit { node, depth: 0, via: node, edge: u32::MAX }, acts.len() as u32));
-            let mut scopes = match scopes {
-                None => vec![ALL],
-                Some(v) if v.is_empty() => vec![NOTHING],
-                Some(v) => v,
-            };
-            scopes.sort_unstable();
-            scopes.dedup();
-            for scope in scopes {
-                if scope == ALL {
-                    whole[node as usize] = true;
-                } else {
-                    partial.insert((node, scope));
+            let scope = match names {
+                None => ALL,
+                Some(v) if v.is_empty() => NOTHING,
+                Some(v) => {
+                    let mut ids: Vec<u32> = v.iter().map(|n| name_id(n)).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    match self.mentions(node).map(|_| self.grow(node, ids.clone())) {
+                        Some(None) => ALL,
+                        Some(Some(grown)) => {
+                            sets.push(grown);
+                            SET + 2 * (sets.len() as u32 - 1) + 1
+                        }
+                        None => {
+                            sets.push(ids);
+                            SET + 2 * (sets.len() as u32 - 1)
+                        }
+                    }
                 }
-                queue.push_back(acts.len() as u32);
-                acts.push(Act { node, scope, parent: u32::MAX, edge: u32::MAX, depth: 0, internal: false });
+            };
+            if scope == ALL {
+                whole[node as usize] = true;
+            } else {
+                partial.insert((node, scope));
             }
+            queue.push_back(acts.len() as u32);
+            acts.push(Act { node, scope, parent: u32::MAX, edge: u32::MAX, depth: 0 });
         }
 
-        // 0-1 breadth-first search: same-file hops go to the front of the queue.
         while let Some(i) = queue.pop_front() {
             let cur = acts[i as usize];
             if cur.scope == NOTHING {
                 continue;
             }
+            let set = set_of(cur.scope);
             for (next, edge) in self.reverse.neighbours(cur.node) {
                 let d = &self.data[edge as usize];
-                if d.confidence < opts.min_confidence || whole[next as usize] {
+                if d.confidence < opts.min_confidence || whole[next as usize] || next == cur.node {
                     continue;
                 }
-                let scope = if opts.file_level {
-                    ALL
+                let scope = if opts.file_level || cur.scope == ALL {
+                    if opts.file_level || d.inherit { ALL } else { d.from_scope }
                 } else if d.inherit {
-                    cur.scope
-                } else if d.to_scope != ALL && cur.scope != ALL && d.to_scope != cur.scope {
-                    continue;
+                    // An heir has the same methods; its own dependents are not filtered.
+                    match set {
+                        Some((k, _)) => SET + 2 * k as u32,
+                        None => cur.scope,
+                    }
+                } else if d.to_scope != ALL {
+                    let hit = match set {
+                        Some((k, _)) => sets[k].binary_search(&self.scope_ids[d.to_scope as usize]).is_ok(),
+                        None => d.to_scope == cur.scope,
+                    };
+                    if !hit {
+                        continue;
+                    }
+                    d.from_scope
                 } else {
+                    if let Some((k, true)) = set
+                        && is_reference(d.kind)
+                        && !self.mentions(next).is_none_or(|m| m.opaque || m.mentions_any(&sets[k]))
+                    {
+                        continue;
+                    }
                     d.from_scope
                 };
-                let internal = next == cur.node;
-                let depth = cur.depth + u32::from(!internal);
+                let depth = cur.depth + 1;
                 if opts.max_depth != 0 && depth > opts.max_depth {
                     continue;
                 }
@@ -425,12 +505,8 @@ impl Graph {
                     continue;
                 }
                 let act = acts.len() as u32;
-                acts.push(Act { node: next, scope, parent: i, edge, depth, internal });
-                if internal {
-                    queue.push_front(act);
-                } else {
-                    queue.push_back(act);
-                }
+                acts.push(Act { node: next, scope, parent: i, edge, depth });
+                queue.push_back(act);
                 if position[next as usize] == u32::MAX {
                     position[next as usize] = 0;
                     found.push((Hit { node: next, depth, via: cur.node, edge }, act));
@@ -447,6 +523,60 @@ impl Graph {
             hit_act.push(act);
         }
         Impact { hits, position, acts, hit_act }
+    }
+
+    /// The names a change to methods `names` (sorted [`name_id`]s) of `node`
+    /// affects, grown to a fixed point over `node` and its ancestors, or
+    /// `None` when the whole file must count as changed (see
+    /// [`Graph::impact_scoped`]). An ancestor without method facts makes it
+    /// whole-file.
+    fn grow(&self, node: NodeId, mut names: Vec<u32>) -> Option<Vec<u32>> {
+        // The seed and its ancestors.
+        let mut files: Vec<NodeId> = vec![node];
+        let mut i = 0;
+        while i < files.len() {
+            for (to, e) in self.forward.neighbours(files[i]) {
+                if self.data[e as usize].inherit && !files.contains(&to) {
+                    files.push(to);
+                }
+            }
+            i += 1;
+        }
+        let tables: Vec<&FileMentions> = files.iter().map(|&f| self.mentions(f)).collect::<Option<_>>()?;
+        if tables.iter().any(|t| t.self_dynamic.last() == Some(&NO_DEF)) {
+            return None;
+        }
+        loop {
+            let mut add: Vec<u32> = Vec::new();
+            for t in &tables {
+                for &(name, def) in t.pairs.iter() {
+                    if names.binary_search(&name).is_ok() {
+                        if def == NO_DEF {
+                            return None;
+                        }
+                        add.push(t.defs[def as usize]);
+                    }
+                }
+                add.extend(t.self_dynamic.iter().map(|&d| t.defs[d as usize]));
+            }
+            add.retain(|n| names.binary_search(n).is_err());
+            if add.is_empty() {
+                break;
+            }
+            names.extend(add);
+            names.sort_unstable();
+            names.dedup();
+        }
+        for t in &tables {
+            for (i, d) in t.defs.iter().enumerate() {
+                if names.binary_search(d).is_ok()
+                    && (t.implicit.binary_search(&(i as u32)).is_ok() || (!t.controller && self.unmentioned.binary_search(d).is_ok()))
+                {
+                    return None;
+                }
+            }
+        }
+        Some(names)
     }
 
     /// Everything `seeds` rely on: forward BFS. Useful as agent context
@@ -579,51 +709,129 @@ mod tests {
         assert_eq!(g.edge_scopes(imp.path(g.id("page_s").unwrap())[1].1), (Some("show"), None));
     }
 
+    /// `FileMentions` from (def names, (name, def or "-") pairs).
+    fn fm(defs: &[&str], pairs: &[(&str, &str)]) -> FileMentions {
+        let mut p: Vec<(u32, u32)> = pairs
+            .iter()
+            .map(|&(n, d)| (name_id(n), if d == "-" { NO_DEF } else { defs.iter().position(|x| *x == d).unwrap() as u32 }))
+            .collect();
+        p.sort_unstable();
+        let implicit: Box<[u32]> = defs.iter().enumerate().filter(|(_, d)| **d == "to_s").map(|(i, _)| i as u32).collect();
+        FileMentions { pairs: p.into(), defs: defs.iter().map(|d| name_id(d)).collect(), implicit, ..Default::default() }
+    }
+
+    fn table(files: Vec<(&str, FileMentions)>, unmentioned: &[&str]) -> MentionTable {
+        let mut u: Vec<u32> = unmentioned.iter().map(|n| name_id(n)).collect();
+        u.sort_unstable();
+        MentionTable { files: files.into_iter().map(|(p, m)| (p.to_string(), Arc::new(m))).collect(), unmentioned: u.into() }
+    }
+
     #[test]
-    fn method_level_scopes() {
-        // model: refund! calls charge! (same file); callback at class level mentions audit.
-        // svc#run calls refund!; job#perform calls charge!; report only uses the constant.
-        // sub < model; sub_user calls refund! on sub. caller depends on all of svc.
+    fn mention_filter() {
+        // model: refund! calls charge!; `before_save :audit` at class level; to_s
+        // (implicit) calls fmt; conv is never mentioned anywhere. It includes
+        // concern, whose helper calls model's tax (template method).
+        // svc calls refund!, job charge!, report helper; sub < model; sub_user
+        // uses sub; caller uses svc; dyn dispatches dynamically; tmpl has no
+        // facts; page reaches model through GraphQL.
         let edges = vec![
-            Edge::new("model", "model", RubyConstant, Exact).from_scope("refund!").to_scope("charge!"),
-            Edge::new("model", "model", RubyConstant, Exact).to_scope("audit"),
-            Edge::new("svc", "model", RubyConstant, Exact).from_scope("run").to_scope("refund!"),
-            Edge::new("svc", "model", RubyConstant, Exact).from_scope("other").to_scope(crate::model::SCOPE_BODY),
-            Edge::new("job", "model", RubyConstant, Exact).from_scope("perform").to_scope("charge!"),
-            Edge::new("report", "model", RubyConstant, Exact).to_scope(crate::model::SCOPE_BODY),
+            Edge::new("svc", "model", RubyConstant, Exact),
+            Edge::new("job", "model", RailsInferred, Inferred),
+            Edge::new("report", "model", RubyConstant, Exact),
+            Edge::new("lazy", "model", RubyRequire, Exact),
             Edge::new("sub", "model", RubyConstant, Exact).inherit(),
-            Edge::new("sub_user", "sub", RubyConstant, Exact).to_scope("refund!"),
-            Edge::new("caller", "svc", RubyConstant, Exact).to_scope("run"),
-            Edge::new("caller2", "svc", RubyConstant, Exact).to_scope("other"),
+            Edge::new("sub_user", "sub", RubyConstant, Exact),
+            Edge::new("caller", "svc", RubyConstant, Exact),
+            Edge::new("model", "concern", RubyConstant, Exact).inherit(),
+            Edge::new("dyn", "model", RubyConstant, Exact),
+            Edge::new("tmpl", "model", RubyConstant, Exact),
+            Edge::new("page", "model", GraphQl, Inferred),
         ];
-        let g = Graph::build(&edges, []);
+        let mut g = Graph::build(&edges, []);
+        let mut opaque = fm(&[], &[]);
+        opaque.opaque = true;
+        g.set_mentions(&table(
+            vec![
+                ("model", fm(&["refund!", "charge!", "audit", "tax", "to_s", "conv"], &[("charge!", "refund!"), ("audit", "-"), ("fmt", "to_s")])),
+                ("concern", fm(&["helper"], &[("tax", "helper")])),
+                ("svc", fm(&["run"], &[("refund!", "run")])),
+                ("job", fm(&["perform"], &[("charge!", "perform")])),
+                ("report", fm(&[], &[("helper", "-"), ("where", "-")])),
+                ("lazy", fm(&[], &[])),
+                ("sub_user", fm(&[], &[])),
+                ("caller", fm(&[], &[])),
+                ("dyn", opaque),
+                ("nowhere", fm(&[], &[])),
+            ],
+            &["conv"],
+        ));
         let id = |n: &str| g.id(n).unwrap();
         let run = |scopes: Option<&[&str]>, depth: u32| {
             let seed = (id("model"), scopes.map(|s| s.iter().map(|x| x.to_string()).collect()));
             let imp = g.impact_scoped(&[seed], QueryOpts { max_depth: depth, ..Default::default() });
             names(&g, &imp).into_iter().skip(1).map(|(n, d)| format!("{n}:{d}")).collect::<Vec<_>>().join(" ")
         };
-        // charge! changed: job directly; refund! via the same-file call (no extra depth), so svc#run
-        // and its caller; the subclass inherits both. report and caller2 are untouched.
-        assert_eq!(run(Some(&["charge!"]), 0), "job:1 sub:1 svc:1 caller:2 sub_user:2");
-        assert_eq!(run(Some(&["charge!"]), 1), "job:1 sub:1 svc:1");
-        assert_eq!(run(Some(&["refund!"]), 0), "sub:1 svc:1 caller:2 sub_user:2");
-        // audit is wired up at class level: the whole model is affected.
-        assert_eq!(run(Some(&["audit"]), 0), "job:1 report:1 sub:1 svc:1 caller:2 caller2:2 sub_user:2");
-        assert_eq!(run(None, 0), run(Some(&["audit"]), 0));
-        assert_eq!(run(Some(&[crate::model::SCOPE_BODY]), 0), run(None, 0));
-        // A method nobody mentions, and "no method changed" (comment-only diff), reach nothing.
-        // A method no edge names still affects whole-file dependents and heirs.
-        assert_eq!(run(Some(&["unknown"]), 0), "sub:1");
+        let unfiltered = "dyn:1 page:1 sub:1 tmpl:1";
+        // charge! grows to refund! (same file): svc and job; beyond hop 1 file-level.
+        assert_eq!(run(Some(&["charge!"]), 1), "dyn:1 job:1 page:1 sub:1 svc:1 tmpl:1");
+        assert_eq!(run(Some(&["charge!"]), 0), "dyn:1 job:1 page:1 sub:1 svc:1 tmpl:1 caller:2 sub_user:2");
+        assert_eq!(run(Some(&["refund!"]), 1), "dyn:1 page:1 sub:1 svc:1 tmpl:1");
+        // tax grows to the concern's helper, which report mentions.
+        assert_eq!(run(Some(&["tax"]), 1), "dyn:1 page:1 report:1 sub:1 tmpl:1");
+        // Class body (callback), implicit (to_s calls fmt), never mentioned: whole file.
+        let whole = "dyn:1 job:1 lazy:1 page:1 report:1 sub:1 svc:1 tmpl:1";
+        assert_eq!(run(Some(&["audit"]), 1), whole);
+        assert_eq!(run(Some(&["fmt"]), 1), whole);
+        assert_eq!(run(Some(&["conv"]), 1), whole);
+        assert_eq!(run(None, 1), whole);
+        assert_eq!(run(Some(&[crate::model::SCOPE_BODY]), 1), whole);
+        // A name nothing mentions reaches only what is not filtered; no change reaches nothing.
+        assert_eq!(run(Some(&["zzz"]), 1), unfiltered);
         assert_eq!(run(Some(&[]), 0), "");
-        let imp = g.impact_scoped(&[(id("model"), Some(vec![]))], QueryOpts { file_level: true, ..Default::default() });
-        assert_eq!(imp.hits.len(), 8, "file-level mode ignores scopes");
-        // Same-file hops are not listed in the explanation.
-        let imp = g.impact_scoped(&[(id("model"), Some(vec!["charge!".into()]))], QueryOpts::default());
-        let path: Vec<&str> = imp.path(id("caller")).iter().map(|&(n, _)| g.path(n)).collect();
-        assert_eq!(path, ["caller", "svc", "model"]);
-        assert_eq!((g.fan_in(id("model")), g.fan_out(id("svc"))), (4, 1));
+        let imp = g.impact_scoped(&[(id("model"), Some(vec!["zzz".into()]))], QueryOpts { file_level: true, ..Default::default() });
+        assert_eq!(imp.hits.len(), 11, "file-level mode ignores scopes and mentions");
+        // A seed without facts is not filtered.
+        let imp = g.impact_scoped(&[(id("sub"), Some(vec!["zzz".into()]))], QueryOpts::default());
+        assert_eq!(names(&g, &imp).len(), 2);
+        // An ancestor without facts makes the change whole-file.
+        let mut g2 = Graph::build(&edges, []);
+        g2.set_mentions(&table(vec![("model", fm(&["refund!"], &[])), ("svc", fm(&[], &[]))], &[]));
+        let imp = g2.impact_scoped(&[(g2.id("model").unwrap(), Some(vec!["refund!".into()]))], QueryOpts { max_depth: 1, ..Default::default() });
+        assert_eq!(names(&g2, &imp).len(), 9);
         assert!(g.dependents(id("model")).all(|(n, _)| n != id("model")));
+    }
+
+    #[test]
+    fn mention_filter_keeps_action_scopes() {
+        // ctrl#index changed. Routes name actions; specs mention them; sub < ctrl.
+        let edges = vec![
+            Edge::new("routes", "ctrl", RailsRoute, Inferred).to_scope("index"),
+            Edge::new("routes2", "ctrl", RailsRoute, Inferred).to_scope("show"),
+            Edge::new("spec", "ctrl", RubyConstant, Exact),
+            Edge::new("spec2", "ctrl", RubyConstant, Exact),
+            Edge::new("sub", "ctrl", RubyConstant, Exact).inherit(),
+            Edge::new("routes3", "sub", RailsRoute, Inferred).to_scope("index"),
+            Edge::new("routes4", "sub", RailsRoute, Inferred).to_scope("show"),
+            Edge::new("sub_spec", "sub", RubyConstant, Exact),
+        ];
+        let mut g = Graph::build(&edges, []);
+        g.set_mentions(&table(
+            vec![
+                ("ctrl", fm(&["index", "show"], &[])),
+                ("spec", fm(&[], &[("index", "-")])),
+                ("spec2", fm(&[], &[("show", "-")])),
+                ("sub", fm(&[], &[])),
+                ("sub_spec", fm(&[], &[])),
+            ],
+            &[],
+        ));
+        let imp = g.impact_scoped(&[(g.id("ctrl").unwrap(), Some(vec!["index".into()]))], QueryOpts::default());
+        let got: Vec<String> = names(&g, &imp).into_iter().skip(1).map(|(n, d)| format!("{n}:{d}")).collect();
+        // The heir passes the action on; its own dependents are not mention-filtered.
+        assert_eq!(got, ["routes:1", "spec:1", "sub:1", "routes3:2", "sub_spec:2"]);
+        // Inheritance edges merge into a plain duplicate.
+        let g = Graph::build(&[Edge::new("a", "b", RubyConstant, Exact), Edge::new("a", "b", RubyConstant, Exact).inherit()], []);
+        assert_eq!((g.edge_count(), g.edge_inherits(0)), (1, true));
     }
 
     #[test]

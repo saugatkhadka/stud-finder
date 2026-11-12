@@ -49,10 +49,7 @@ fn list(root: &Path) -> Vec<String> {
 }
 
 fn workspace(root: &Path) -> Workspace {
-    // The fixtures exercise name-only edges, which are off by default.
-    let mut config = Config::default();
-    config.ruby.name_only_limit = 3;
-    Workspace { root: root.to_path_buf(), files: list(root), config }
+    Workspace { root: root.to_path_buf(), files: list(root), config: Config::default() }
 }
 
 /// `ruby.method_level: false`: file-level edges, exactly as before method scopes.
@@ -392,65 +389,55 @@ fn method_app() -> ExtractOutput {
         .expect("build")
 }
 
-fn has_edge(out: &[String], want: &str) -> bool {
-    out.iter().any(|e| e.starts_with(want))
+fn mentions(out: &ExtractOutput, path: &str) -> std::sync::Arc<ripple_core::FileMentions> {
+    let t = out.facts.mentions.as_ref().expect("mention table");
+    t.files.iter().find(|(p, _)| p == path).map(|(_, m)| m.clone()).unwrap_or_else(|| panic!("no mentions for {path}"))
 }
 
-/// One test per rule; each line is a prefix of the formatted edge
-/// (`from -> to [Kind Conf Lline @from_scope ->to_scope inherit] detail`).
+fn mentions_name(m: &ripple_core::FileMentions, name: &str) -> bool {
+    m.mentions_any(&[ripple_core::mentions::name_id(name)])
+}
+
+/// Edges stay file-level (superclass and mixins flagged `inherit`); the
+/// per-file mention facts and the method scopes carry the method detail.
 #[test]
-fn method_app_edges() {
+fn method_app_facts() {
     let out = method_app();
     let got = edges(&out);
-    let present = [
-        // Rule 1: constant references depend on the class body; superclass and
-        // mixins are inherit edges.
-        "app/services/refunder.rb -> app/models/order.rb [RubyConstant Exact L11 @lookup_order ->@body] Order",
+    assert!(out.edges.iter().all(|e| e.to_scope.is_none() && e.from_scope.is_none() && e.from != e.to), "{got:#?}");
+    for want in [
         "app/models/order.rb -> app/models/application_record.rb [RubyConstant Exact L1 inherit] ApplicationRecord",
         "app/models/order.rb -> app/models/concerns/priceable.rb [RubyConstant Exact L2 inherit] Priceable",
-        // Rule 2: method use through a referenced constant, including inherited methods
-        // and `initialize` through `new`.
-        "app/services/refunder.rb -> app/models/order.rb [RubyConstant Exact L7 @run_refund ->total_amount] Order#total_amount",
-        "app/services/refunder.rb -> app/models/order.rb [RubyConstant Exact L15 @charge_price ->price_with_currency] Order#price_with_currency",
-        "app/services/runner.rb -> app/services/refunder.rb [RubyConstant Exact L3 ->initialize] Refunder#initialize",
-        // Rule 3: same-file calls, by bare name and by symbol.
-        "app/models/order.rb -> app/models/order.rb [RubyConstant Exact L5 @total_amount ->line_total] #line_total",
-        "app/models/concerns/priceable.rb -> app/models/concerns/priceable.rb [RubyConstant Exact L3 @price_with_currency ->price_cents_value]",
-        "app/services/dyn.rb -> app/services/dyn.rb [RubyConstant Exact L16 @params_key ->quiet_method]",
-        // Rule 4: by-name edges for unknown receivers; templates count.
-        "app/services/report.rb -> app/models/order.rb [RailsInferred Heuristic L3 @build_report ->line_total] #line_total (by name)",
-        "app/views/orders/show.html.erb -> app/models/order.rb [RailsInferred Heuristic L1 ->badge_label] #badge_label (by name)",
-        // Dynamic dispatch: whole-file dependency from the enclosing method, and
-        // on `self` a dependency on every method of the file.
-        "app/services/dyn.rb -> app/models/order.rb [RubyConstant Exact L4 @call_it] Order (dynamic call)",
-        "app/services/dyn.rb -> app/services/dyn.rb [RubyConstant Exact L12 @self_dispatch ->call_it]",
-    ];
-    for want in present {
-        assert!(has_edge(&got, want), "missing {want}\n{got:#?}");
+        "app/services/refunder.rb -> app/models/order.rb [RubyConstant Exact L11] Order",
+        "app/services/dyn.rb -> app/models/order.rb [RubyConstant Exact L3] Order",
+    ] {
+        assert!(got.iter().any(|e| e.starts_with(want)), "missing {want}\n{got:#?}");
     }
-    let absent = [
-        // Over LIMIT (4 definers), and too short for a by-name edge.
-        "app/services/report.rb -> lib/helper_",
-        "app/services/report.rb -> app/models/order.rb [RailsInferred Heuristic L7",
-        // Covered by `Order#price_with_currency` plus the inherit edge.
-        "app/services/refunder.rb -> app/models/concerns/priceable.rb",
-        // `send(x)` on self dispatches to Dyn's own methods, not to Order's.
-        "app/services/dyn.rb -> app/models/order.rb [RubyConstant Exact L12 @self_dispatch",
-        // Scoped twin absorbed by the unscoped dynamic edge.
-        "app/services/dyn.rb -> app/models/order.rb [RubyConstant Exact L3 @call_it ->@body]",
-    ];
-    for bad in absent {
-        assert!(!has_edge(&got, bad), "unexpected {bad}\n{got:#?}");
-    }
+    // No by-name edges: Report and the view never name `Order`.
+    assert!(!got.iter().any(|e| e.starts_with("app/services/report.rb -> app/models/order.rb")), "{got:#?}");
+    assert!(!got.iter().any(|e| e.starts_with("app/views/orders/show.html.erb -> app/models/order.rb")), "{got:#?}");
 
-    // Rule 5: implicit, setter and never-mentioned defs get no scope.
+    let refunder = mentions(&out, "app/services/refunder.rb");
+    assert!(mentions_name(&refunder, "total_amount") && mentions_name(&refunder, "price_with_currency"));
+    assert!(!mentions_name(&refunder, "tax_amount") && !refunder.opaque);
+    // `record.public_send(name)`: opaque; `send(x)` on self: self-dynamic in `self_dispatch`.
+    let dyn_ = mentions(&out, "app/services/dyn.rb");
+    assert!(dyn_.opaque);
+    assert_eq!(dyn_.self_dynamic.iter().map(|&i| dyn_.defs[i as usize]).collect::<Vec<_>>(), [ripple_core::mentions::name_id("self_dispatch")]);
+    // Templates mention too.
+    assert!(mentions_name(&mentions(&out, "app/views/orders/show.html.erb"), "badge_label"));
+    let order = mentions(&out, "app/models/order.rb");
+    assert_eq!(order.implicit.len(), 2, "to_s, status=");
+
+    // Implicit, setter and never-mentioned defs get no scope.
     let st = &out.stats;
     assert_eq!(st["ruby_method_denied_implicit_list"], 1, "to_s");
     assert_eq!(st["ruby_method_denied_setter"], 1, "status=");
-    assert_eq!(st["ruby_method_denied_unmentioned"], 3, "never_called_anywhere and dup_name x2? {st:#?}");
-    assert_eq!(st["ruby_method_dynamic_files"], 1);
+    assert_eq!(st["ruby_method_denied_unmentioned"], 3, "never_called_anywhere, persist_record, run_everything {st:#?}");
+    assert_eq!(st["ruby_mention_opaque_files"], 1);
+    assert!(!st.keys().any(|k| k.contains("name_only")));
 
-    // Rule 7: sorted, non-overlapping ranges; no duplicated names; unscoped defs absent.
+    // Sorted, non-overlapping ranges; no duplicated names; unscoped defs absent.
     let order: Vec<(&str, u32, u32)> = out.facts.scopes["app/models/order.rb"].iter().map(|r| (r.name.as_str(), r.start, r.end)).collect();
     assert_eq!(
         order,
@@ -472,12 +459,18 @@ fn method_app_edges() {
     }
 }
 
-/// Impact queries over the method-level graph.
+fn method_graph(out: &ExtractOutput) -> ripple_core::Graph {
+    let mut g = ripple_core::Graph::build(&out.edges, out.facts.scopes.keys().map(String::as_str));
+    g.set_mentions(out.facts.mentions.as_ref().expect("mention table"));
+    g
+}
+
+/// Impact queries with the hop-1 mention filter.
 #[test]
 fn method_app_impact() {
-    use ripple_core::{Graph, QueryOpts};
+    use ripple_core::QueryOpts;
     let out = method_app();
-    let g = Graph::build(&out.edges, out.facts.scopes.keys().map(String::as_str));
+    let g = method_graph(&out);
     let reached = |file: &str, scopes: Option<&[&str]>| -> Vec<String> {
         let seed = (g.id(file).unwrap(), scopes.map(|s| s.iter().map(|x| x.to_string()).collect()));
         let imp = g.impact_scoped(&[seed], QueryOpts::default());
@@ -485,51 +478,45 @@ fn method_app_impact() {
         v.sort();
         v
     };
-    // tax_amount <- total_amount (same file) <- Refunder#run_refund <- Order#refund_order
-    // <- Runner (by name); Dyn#call_it depends on all of Order (dynamic call).
-    // Report (line_total, shared_helper) and the view (badge_label) are not reached.
+    // tax_amount grows to total_amount (same file), which Refunder mentions;
+    // Dyn is opaque (`record.public_send`). Runner is hop 2 (file-level).
     assert_eq!(reached("app/models/order.rb", Some(&["tax_amount"])), ["app/services/dyn.rb", "app/services/refunder.rb", "app/services/runner.rb"]);
-    // line_total also reaches the by-name caller.
-    assert_eq!(
-        reached("app/models/order.rb", Some(&["line_total"])),
-        ["app/services/dyn.rb", "app/services/refunder.rb", "app/services/report.rb", "app/services/runner.rb"]
-    );
-    // Not asserted: `abc` (short name, no edge names it) should reach Dyn through
-    // its unscoped dynamic edge, but `Graph::impact_scoped` treats a seed scope
-    // that no edge names as NOWHERE and follows nothing, not even edges without
-    // a `to_scope` (ripple-core behaviour, reported).
-    // badge_label: the view (by name), Dyn#call_it (dynamic) and Runner (calls Dyn#call_it);
-    // not Refunder or Report.
-    assert_eq!(
-        reached("app/models/order.rb", Some(&["badge_label"])),
-        ["app/services/dyn.rb", "app/services/runner.rb", "app/views/orders/show.html.erb"]
-    );
-    // Through the mixin: Priceable#price_cents_value -> #price_with_currency -> Order -> Refunder#charge_price -> Runner
-    // (and Dyn, which depends on all of Order).
+    // badge_label: only Dyn (opaque) names Order and passes; the view mentions
+    // badge_label but has no edge to Order (`@order` is untyped).
+    assert_eq!(reached("app/models/order.rb", Some(&["badge_label"])), ["app/services/dyn.rb", "app/services/runner.rb"]);
+    // never_called_anywhere is mentioned nowhere: called by convention, so the
+    // change is a change to the whole file.
+    let all = reached("app/models/order.rb", None);
+    assert_eq!(reached("app/models/order.rb", Some(&["never_called_anywhere"])), all);
+    assert_eq!(reached("app/models/order.rb", Some(&["to_s"])), all);
+    // Through the mixin: price_cents_value grows to price_with_currency; Order
+    // (inherit) passes and, as an heir, is followed unfiltered.
     assert_eq!(
         reached("app/models/concerns/priceable.rb", Some(&["price_cents_value"])),
         ["app/models/order.rb", "app/services/dyn.rb", "app/services/refunder.rb", "app/services/runner.rb"]
     );
-    // Whole-file change reaches everything that names Order, dynamic callers included.
-    let all = reached("app/models/order.rb", None);
-    for f in ["app/services/dyn.rb", "app/services/refunder.rb", "app/services/report.rb", "app/services/runner.rb"] {
-        assert!(all.iter().any(|x| x == f), "{f} not in {all:?}");
-    }
+    // A scope that matches nothing still follows opaque dependents.
+    assert_eq!(reached("app/models/order.rb", Some(&["one_liner"])), ["app/services/dyn.rb", "app/services/runner.rb"]);
+    // file_level disables the filter.
+    let seed = (g.id("app/models/order.rb").unwrap(), Some(vec!["badge_label".to_string()]));
+    let imp = g.impact_scoped(&[seed], QueryOpts { file_level: true, ..QueryOpts::default() });
+    assert_eq!(imp.hits.len() - 1, all.len());
 }
 
-/// `method_level: false` emits no method edges and only controller scopes.
+/// `method_level: false` emits no scopes, inherit flags or mention facts.
 #[test]
 fn method_app_file_level() {
     let out = RubyExtractor::new()
         .build(&file_level_workspace(&fixture("method_app")))
         .expect("build");
     assert!(out.facts.scopes.is_empty());
+    assert!(out.facts.mentions.is_none());
     assert!(out.edges.iter().all(|e| e.to_scope.is_none() && e.from_scope.is_none() && !e.inherit && e.from != e.to));
-    assert!(!out.stats.keys().any(|k| k.starts_with("ruby_method_")));
+    assert!(!out.stats.keys().any(|k| k.starts_with("ruby_method_") || k.starts_with("ruby_mention_")));
 }
 
-/// Incremental updates on the method fixture: add a first mention, push a
-/// name over LIMIT, remove a def; each must equal a fresh build.
+/// Incremental updates on the method fixture: add a first mention, remove a
+/// def, delete a file; each must equal a fresh build.
 #[test]
 fn method_app_update_matches_build() {
     let tmp = std::env::temp_dir().join(format!("ripple-method-app-{}", std::process::id()));
@@ -540,15 +527,16 @@ fn method_app_update_matches_build() {
     let steps: &[(&str, Option<&str>)] = &[
         // First mention of `never_called_anywhere` (was denied as unmentioned).
         ("app/services/report.rb", Some("class Report\n  def build_report(record)\n    record.line_total\n  end\n\n  def summary_text(record)\n    record.never_called_anywhere\n  end\nend\n")),
-        // A second and third definer of `line_total`, then a fourth: over LIMIT.
-        ("lib/extra_a.rb", Some("class ExtraA\n  def line_total\n    1\n  end\nend\n")),
-        ("lib/extra_b.rb", Some("class ExtraB\n  def line_total\n    1\n  end\nend\n")),
-        ("lib/extra_c.rb", Some("class ExtraC\n  def line_total\n    1\n  end\nend\n")),
+        ("lib/extra_a.rb", Some("class ExtraA\n  def line_total\n    Order.new.badge_label\n  end\nend\n")),
         // Remove a def.
         ("app/models/order.rb", Some(&std::fs::read_to_string(tmp.join("app/models/order.rb")).unwrap().replace("  def tax_amount\n    1\n  end\n", ""))),
         // Delete a file.
-        ("lib/extra_c.rb", None),
+        ("lib/extra_a.rb", None),
     ];
+    let dump = |o: &ExtractOutput| {
+        let t = o.facts.mentions.as_ref().expect("mentions");
+        format!("{:?} {:?}", t.files, t.unmentioned)
+    };
     for (i, (path, content)) in steps.iter().enumerate() {
         let full = tmp.join(path);
         let mut cs = ChangeSet::default();
@@ -567,13 +555,12 @@ fn method_app_update_matches_build() {
         let fresh = RubyExtractor::new().build(&ws).expect("build");
         assert_eq!(edges(&inc), edges(&fresh), "step {i}");
         assert_eq!(format!("{:?}", inc.facts.scopes), format!("{:?}", fresh.facts.scopes), "step {i}");
-        let got = edges(&inc);
+        assert_eq!(dump(&inc), dump(&fresh), "step {i}");
         match i {
             0 => assert!(out_scopes(&inc, "app/models/order.rb").contains(&"never_called_anywhere".to_string())),
-            2 => assert!(has_edge(&got, "app/services/report.rb -> lib/extra_b.rb [RailsInferred Heuristic L3 @build_report ->line_total]")),
-            3 => assert!(!got.iter().any(|e| e.contains("#line_total (by name)")), "{got:#?}"),
-            4 => assert!(!got.iter().any(|e| e.contains("->tax_amount")), "{got:#?}"),
-            5 => assert!(has_edge(&got, "app/services/report.rb -> lib/extra_b.rb [RailsInferred Heuristic L3 @build_report ->line_total]")),
+            1 => assert!(mentions_name(&mentions(&inc, "lib/extra_a.rb"), "badge_label")),
+            2 => assert!(!out_scopes(&inc, "app/models/order.rb").contains(&"tax_amount".to_string())),
+            3 => assert!(!inc.facts.mentions.as_ref().unwrap().files.iter().any(|(p, _)| p == "lib/extra_a.rb")),
             _ => {}
         }
     }
