@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs the ripple binary from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/ripple/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/main/install.sh | bash
 #
 # Environment:
 #   RIPPLE_VERSION      release tag to install (default: latest), e.g. ripple-v0.1.0
@@ -26,12 +26,12 @@ command -v tar >/dev/null 2>&1 || die "tar is required"
 case "$(uname -s)" in
   Darwin) os="apple-darwin" ;;
   Linux) os="unknown-linux-gnu" ;;
-  *) die "unsupported OS $(uname -s); build from source: cargo install --git https://github.com/$repo --branch ripple ripple-cli" ;;
+  *) die "unsupported OS $(uname -s); build from source: cargo install --git https://github.com/$repo --branch main ripple-cli" ;;
 esac
 case "$(uname -m)" in
   arm64 | aarch64) arch="aarch64" ;;
   x86_64 | amd64) arch="x86_64" ;;
-  *) die "unsupported CPU $(uname -m); build from source: cargo install --git https://github.com/$repo --branch ripple ripple-cli" ;;
+  *) die "unsupported CPU $(uname -m); build from source: cargo install --git https://github.com/$repo --branch main ripple-cli" ;;
 esac
 target="$arch-$os"
 asset="ripple-$target.tar.gz"
@@ -47,7 +47,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 say "downloading $asset ($version)"
 curl -fsSL "$base/$asset" -o "$tmp/$asset" ||
-  die "no release asset for $target at $base. Build from source: cargo install --git https://github.com/$repo --branch ripple ripple-cli"
+  die "no release asset for $target at $base. Build from source: cargo install --git https://github.com/$repo --branch main ripple-cli"
 curl -fsSL "$base/$asset.sha256" -o "$tmp/$asset.sha256" || die "checksum file missing for $asset"
 
 want="$(awk '{print $1}' "$tmp/$asset.sha256")"

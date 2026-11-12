@@ -27,9 +27,9 @@ jobs:
 
       - name: Install ripple
         # A pinned release binary (checksum-verified). From source instead:
-        #   cargo install --locked --git https://github.com/saugatkhadka/stud-finder --branch ripple ripple-cli
+        #   cargo install --locked --git https://github.com/saugatkhadka/stud-finder --branch main ripple-cli
         run: |
-          curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/ripple/install.sh | RIPPLE_VERSION=ripple-v0.1.0 bash
+          curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/main/install.sh | RIPPLE_VERSION=ripple-v0.1.0 bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/ripple" --version
 

@@ -5,8 +5,8 @@ ripple stays at tag `v0.7.0` and is not listed here.
 
 ## ripple-v0.1.0
 
-First release of stud-finder, ripple edition: a Rust binary that succeeds
-the Ruby gem. It lives on the `ripple` branch; the gem is still on `main`.
+First release of stud-finder, ripple edition: a Rust binary that replaces
+the Ruby gem on `main`.
 
 **Analysis**
 
