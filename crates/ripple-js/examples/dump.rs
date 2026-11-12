@@ -8,7 +8,9 @@
 //!   --prefixes             top 10 unresolved alias/workspace specifier prefixes
 //!   --bench                time 10 single-file updates on a throwaway clone
 //!   --edges <out.tsv>      write all edges (from, to, kind, confidence, line, detail), sorted
-//!   --calls <out.tsv>      write all call sites, sorted
+//!   --calls <out.tsv>      write all call sites, sorted (file:line, method, url, callee,
+//!                          route_helper, class = link | data | ?<unclassified context>)
+//!   --unclassified         top 25 contexts of unclassified call sites
 //!   --parse-errors         list js_parse_error / js_read_error warnings
 //! With `[file]`, also prints its dependencies and direct dependents.
 
@@ -24,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut positional = Vec::new();
     let mut cfg = Config::default();
-    let (mut list_unresolved, mut prefixes, mut bench, mut parse_errors) = (false, false, false, false);
+    let (mut list_unresolved, mut prefixes, mut bench, mut parse_errors, mut unclassified) = (false, false, false, false, false);
     let (mut edges_out, mut calls_out) = (None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -39,6 +41,7 @@ fn main() -> anyhow::Result<()> {
             "--prefixes" => prefixes = true,
             "--bench" => bench = true,
             "--parse-errors" => parse_errors = true,
+            "--unclassified" => unclassified = true,
             "--edges" => edges_out = args.next(),
             "--calls" => calls_out = args.next(),
             _ => positional.push(a),
@@ -103,12 +106,34 @@ fn main() -> anyhow::Result<()> {
         }
         std::fs::write(path, s)?;
     }
+    let unclassified_sites = ex.unclassified_call_sites();
+    let class_of = |c: &ripple_core::JsCallSite| -> String {
+        match unclassified_sites.iter().find(|(u, _)| *u == c) {
+            Some((_, l)) => format!("?{l}"),
+            None if c.link => "link".into(),
+            None => "data".into(),
+        }
+    };
     if let Some(path) = calls_out {
         let mut s = String::new();
         for c in sorted_calls(&out) {
-            s.push_str(&format!("{}:{}\t{}\t{}\t{}\t{}\n", c.file, c.line, c.method.unwrap_or_default(), c.url, c.callee, c.route_helper));
+            let class = class_of(&c);
+            s.push_str(&format!("{}:{}\t{}\t{}\t{}\t{}\t{}\n", c.file, c.line, c.method.unwrap_or_default(), c.url, c.callee, c.route_helper, class));
         }
         std::fs::write(path, s)?;
+    }
+    if unclassified {
+        let mut by: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, l) in &unclassified_sites {
+            // `arg:foo.bar(..)` -> shape `arg:foo.bar`; keep the callee, drop arguments.
+            *by.entry(l.to_string()).or_default() += 1;
+        }
+        let mut v: Vec<_> = by.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!("unclassified call sites: {} (top contexts)", unclassified_sites.len());
+        for (l, n) in v.iter().take(25) {
+            println!("  {n:6}  {l}");
+        }
     }
     if let Some(file) = positional.get(1) {
         println!("\n{file} depends on:");
@@ -122,7 +147,7 @@ fn main() -> anyhow::Result<()> {
         let calls: Vec<_> = out.facts.js_call_sites.iter().filter(|c| &c.file == file).collect();
         println!("call sites in {file}: {}", calls.len());
         for c in calls {
-            println!("  {}:{} {:?} {} via {} helper={}", c.file, c.line, c.method, c.url, c.callee, c.route_helper);
+            println!("  {}:{} {:?} {} via {} helper={} {}", c.file, c.line, c.method, c.url, c.callee, c.route_helper, class_of(c));
         }
     }
 

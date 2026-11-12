@@ -35,6 +35,9 @@ pub struct Parsed {
     pub hash: u64,
     pub refs: Vec<Ref>,
     pub calls: Vec<JsCallSite>,
+    /// Parallel to `calls`: the context of a call site whose URL use is
+    /// neither clearly navigation nor data (`None` = classified).
+    pub unclassified: Vec<Option<String>>,
     /// First syntax error, if any. The refs/calls above are still best-effort.
     pub error: Option<String>,
     /// The file could not be read at all (then `error` holds the I/O message).

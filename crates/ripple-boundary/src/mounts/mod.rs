@@ -1,5 +1,6 @@
 //! View/controller <-> JS mounts (`EdgeKind::ViewMount`).
 
+pub mod actions;
 pub mod resolve;
 pub mod templates;
 
@@ -21,12 +22,14 @@ pub struct MountRecord {
 /// GitLab-style page bundles: `app/assets/javascripts/pages/<controller>/<action>/index.js`
 /// is loaded by `webpack_controller_bundle_tags` for that controller action
 /// (and `pages/<controller>/index.js` for every action of the controller).
-/// Returns (ruby file, js file, label) for each controller and action template
-/// that exists.
+/// Returns (ruby file, js file, label, action) for each controller and action
+/// template that exists; `action` is set for a controller's action bundle
+/// (`pages/projects/show` -> `show`), `None` for whole-controller bundles and
+/// template rows.
 /// `actions` holds the routed `(controller, action)` pairs: a directory is an
 /// action bundle only if that action is routed or has a view, so
 /// `pages/projects/project_members` is not mistaken for `projects#project_members`.
-pub fn page_bundles(files: &[RelPath], controllers: &HashMap<String, Vec<RelPath>>, actions: &HashSet<(&str, &str)>, file_set: &JsIndex<'_>) -> Vec<(RelPath, RelPath, String)> {
+pub fn page_bundles(files: &[RelPath], controllers: &HashMap<String, Vec<RelPath>>, actions: &HashSet<(&str, &str)>, file_set: &JsIndex<'_>) -> Vec<(RelPath, RelPath, String, Option<String>)> {
     const ROOT: &str = "app/assets/javascripts/pages/";
     let mut out = Vec::new();
     for f in files {
@@ -39,7 +42,7 @@ pub fn page_bundles(files: &[RelPath], controllers: &HashMap<String, Vec<RelPath
         let label = format!("pages.{}", dir.replace('/', "."));
         // Whole-controller bundle.
         for c in controllers.get(dir).into_iter().flatten() {
-            out.push((c.clone(), f.clone(), label.clone()));
+            out.push((c.clone(), f.clone(), label.clone(), None));
         }
         // Action bundle; GitLab maps create -> new and update -> edit.
         if let Some((controller, action)) = dir.rsplit_once('/') {
@@ -54,10 +57,10 @@ pub fn page_bundles(files: &[RelPath], controllers: &HashMap<String, Vec<RelPath
                     .filter(|v| file_set.exists(v))
                     .collect();
                 if routed || !views.is_empty() {
-                    out.push((c.clone(), f.clone(), label.clone()));
+                    out.push((c.clone(), f.clone(), label.clone(), Some(action.to_string())));
                 }
                 for v in views {
-                    out.push((v, f.clone(), label.clone()));
+                    out.push((v, f.clone(), label.clone(), None));
                 }
             }
         }

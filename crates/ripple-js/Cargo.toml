@@ -18,6 +18,7 @@ oxc_ast = "=0.152.0"
 oxc_ast_visit = "=0.152.0"
 oxc_parser = { version = "=0.152.0", default-features = false }
 oxc_span = "=0.152.0"
+oxc_syntax = "=0.152.0"
 oxc_resolver = "=11.24.3"
 rayon = "1.12"
 globset = "0.4"

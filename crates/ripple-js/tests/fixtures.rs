@@ -182,11 +182,12 @@ fn call_sites_builtin_forms() {
             "src/calls.ts:16 - /api/v1/items/:param/concat via fetch",
             "src/calls.ts:17 GET /api/v1/superagent via request.get",
             "src/calls.ts:18 POST /api/v1/superagent-post via superagent.post",
-            // not built-in callees: only the "/api/" literal pass sees these
-            "src/calls.ts:19 - /api/v1/chain via <literal>",
-            "src/calls.ts:20 - /api/v1/chain/:param via <literal>",
-            "src/calls.ts:23 - /api/v1/dotted via <literal>",
-            "src/calls.ts:24 - /api/v1/dotted-this via <literal>",
+            // not built-in callees: only the "/api/" literal pass sees these;
+            // the verb comes from the data context (`x.get(...)`, `x.put(...)`)
+            "src/calls.ts:19 GET /api/v1/chain via <literal>",
+            "src/calls.ts:20 DELETE /api/v1/chain/:param via <literal>",
+            "src/calls.ts:23 PUT /api/v1/dotted via <literal>",
+            "src/calls.ts:24 PUT /api/v1/dotted-this via <literal>",
             // route helpers: `url` holds the helper name
             "src/calls.ts:25 - admin_user_path via Routes.admin_user_path (route helper)",
             "src/calls.ts:26 - user_path via user_path (route helper)",
@@ -229,7 +230,7 @@ fn call_sites_configured_callees_and_prefixes() {
         assert!(got.contains(&expected.to_string()), "missing {expected:?} in {got:#?}");
     }
     // A configured call must not also be reported as a bare literal.
-    assert!(!got.contains(&"src/calls.ts:19 - /api/v1/chain via <literal>".to_string()));
+    assert!(!got.iter().any(|c| c.starts_with("src/calls.ts:19 ") && c.ends_with("via <literal>")));
     // Strings that merely contain an API-ish path in the wrong place are not reported.
     assert!(!got.iter().any(|c| c.contains("/not-an-api/path")));
 }
@@ -245,4 +246,108 @@ fn parse_errors_are_warnings_and_still_extract() {
     assert!(w.iter().any(|w| w.starts_with("js_parse_error broken.ts")), "{w:?}");
     assert!(edges(&out).contains(&"broken.ts -> ok.ts [JsImport Exact L1] ./ok".to_string()), "{:?}", edges(&out));
     assert_eq!(out.stats["js_parse_errors"], out.warnings.iter().filter(|w| w.code != "js_unresolved_import").count() as u64);
+}
+
+/// `file:line url class`, class = `link`, `data` or `?<context>` (unclassified).
+fn classified(ex: &JsExtractor, out: &ripple_core::ExtractOutput) -> Vec<String> {
+    let unclassified: Vec<(&ripple_core::JsCallSite, &str)> = ex.unclassified_call_sites();
+    let mut v: Vec<String> = out
+        .facts
+        .js_call_sites
+        .iter()
+        .map(|c| {
+            let class = match unclassified.iter().find(|(u, _)| *u == c) {
+                Some((_, label)) => format!("?{label}"),
+                None if c.link => "link".into(),
+                None => "data".into(),
+            };
+            assert!(!(c.link && class.starts_with('?')), "unclassified site marked link: {c:?}");
+            format!("{}:{} {} {}", c.file, c.line, c.url, class)
+        })
+        .collect();
+    v.sort_by_key(|s| {
+        let (file, rest) = s.split_once(':').unwrap();
+        (file.to_string(), rest.split(' ').next().unwrap().parse::<u32>().unwrap(), s.clone())
+    });
+    v
+}
+
+#[test]
+fn call_sites_navigation_vs_data() {
+    let root = fixture("links");
+    let mut ex = JsExtractor::new();
+    let out = ex.build(&workspace(&root, Config::default())).unwrap();
+    assert_lines(
+        "links",
+        classified(&ex, &out),
+        &[
+            "src/Calls.ts:6 home_path link",                // window.location =
+            "src/Calls.ts:7 dashboard_path link",           // location.href =
+            "src/Calls.ts:8 wallet_path link",              // window.location.href = x + "?x=1"
+            "src/Calls.ts:9 assign_path link",              // location.assign
+            "src/Calls.ts:10 replace_path link",            // location.replace
+            "src/Calls.ts:11 open_path link",               // window.open
+            "src/Calls.ts:12 visit_path link",              // Inertia router.visit
+            "src/Calls.ts:13 get_path link",                // Inertia router.get (query data only)
+            "src/Calls.ts:14 visit_post_path data",         // router.visit with method: post
+            "src/Calls.ts:15 post_path data",               // router.post
+            "src/Calls.ts:16 destroy_path data",            // router.delete
+            "src/Calls.ts:18 form_patch_path data",         // useForm().patch
+            "src/Calls.ts:19 fetch_path data",              // fetch
+            "src/Calls.ts:20 axios_path data",              // axios.get
+            "src/Calls.ts:21 wrapped_path data",            // fetch(withQuery(...))
+            "src/Calls.ts:22 after_path link",              // location in a success callback
+            "src/Calls.ts:22 ajax_path data",               // $.ajax({ url })
+            "src/Calls.ts:23 push_state_path link",         // history.pushState
+            "src/Calls.ts:24 active_path link",             // compared against location.pathname
+            "src/Calls.ts:28 items_home_path link",         // { href } in a nav menu
+            "src/Calls.ts:29 items_lib_path link",          // { url } in a nav menu
+            "src/Calls.ts:33 var_data_path data",           // const url = ..; fetch(url)
+            "src/Calls.ts:38 var_link_path link",           // const next = ..; location.href = next
+            "src/Calls.ts:43 library_url link",             // new URL(..), mutated, then navigated
+            "src/Calls.ts:49 state_path ?arg:useState",
+            "src/Calls.ts:50 passed_path ?var:arg:doSomething",
+            "src/Calls.ts:52 unused_path ?var:unused",
+            "src/Calls.ts:53 returned_path ?return",
+            "src/Calls.ts:56 exported_path ?export",
+            "src/Calls.ts:57 endpoint_path ?prop:endpoint",
+            "src/Calls.ts:58 query_path ?arg:useQuery",     // { url } passed to an unknown call
+            "src/Calls.ts:59 /api/graphql data",            // { path } next to method: a request description
+            "src/Calls.ts:60 client_request_path data",     // client.request({ url })
+            "src/Calls.ts:62 switch_path link",             // switch-case comparison
+            "src/Calls.ts:67 var_post_a_path data",         // const postUrl = a ? b : c; form.post(postUrl)
+            "src/Calls.ts:67 var_post_b_path data",
+            "src/Nav.tsx:7 root_url link",                  // <a href>
+            "src/Nav.tsx:8 library_path link",              // <Link href>
+            "src/Nav.tsx:9 settings_path link",             // <NavLink to>
+            "src/Nav.tsx:10 avatar_url link",               // <img src>
+            "src/Nav.tsx:11 profile_url link",              // template around the helper
+            "src/Nav.tsx:12 a_path link",                   // either branch of ?:
+            "src/Nav.tsx:12 b_path link",
+            "src/Nav.tsx:13 logout_path data",              // <Link method="delete">
+            "src/Nav.tsx:14 checkout_path data",            // <Form method="post">
+            "src/Nav.tsx:15 search_path link",              // GET <form action>
+            "src/Nav.tsx:16 search_api_path ?jsx:endpoint", // component prop: may be fetched
+            "src/Nav.tsx:17 raw_path ?jsx-child",
+            "src/Nav.tsx:18 /api/v1/docs link",             // literal href
+        ],
+    );
+    assert_eq!(out.stats["js_call_sites"], 49);
+    assert_eq!(out.stats["js_call_sites_link"], 25);
+    assert_eq!(out.stats["js_call_sites_unclassified"], 9);
+    // Data contexts that name a verb lend it to route helpers inside them.
+    let verbs: Vec<String> = out
+        .facts
+        .js_call_sites
+        .iter()
+        .filter(|c| c.route_helper)
+        .filter_map(|c| c.method.as_ref().map(|m| format!("{} {m}", c.url)))
+        .collect();
+    for expected in ["visit_post_path POST", "post_path POST", "destroy_path DELETE", "form_patch_path PATCH", "logout_path DELETE", "checkout_path POST", "var_post_a_path POST", "var_post_b_path POST"] {
+        assert!(verbs.contains(&expected.to_string()), "missing {expected:?} in {verbs:?}");
+    }
+    // A request description names its verb.
+    assert!(out.facts.js_call_sites.iter().any(|c| c.url == "/api/graphql" && c.method.as_deref() == Some("POST")));
+    // `fetch(x)` names no verb and links have none.
+    assert!(!verbs.iter().any(|v| v.starts_with("fetch_path ") || v.starts_with("var_data_path ") || v.starts_with("visit_path ") || v.starts_with("get_path ")), "{verbs:?}");
 }

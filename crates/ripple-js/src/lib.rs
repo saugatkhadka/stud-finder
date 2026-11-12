@@ -19,6 +19,7 @@
 
 mod callsites;
 mod edges;
+mod linkctx;
 mod parse;
 mod paths;
 mod refs;
@@ -118,7 +119,7 @@ fn parse_text(rel: &str, text: &str, cfg: &CallSiteConfig) -> Parsed {
     } else if let Some(st) = parse::source_type_for(rel) {
         error = parse::parse_block(text, st, 0, rel, cfg, &mut collected);
     }
-    Parsed { hash: 0, refs: collected.refs, calls: collected.calls, error, unreadable: false }
+    Parsed { hash: 0, refs: collected.refs, calls: collected.calls, unclassified: collected.unclassified, error, unreadable: false }
 }
 
 impl State {
@@ -126,6 +127,7 @@ impl State {
         let mut out = ExtractOutput::default();
         let mut counts = edges::Counts::default();
         let mut parse_errors = 0u64;
+        let mut unclassified = 0u64;
         for (code, msg) in &self.resolver.problems {
             out.warnings.push(Warning::new(code, msg.clone()));
         }
@@ -136,6 +138,7 @@ impl State {
                 out.warnings.push(Warning::new(code, format!("{file}: {err}")).file(file));
             }
             out.facts.js_call_sites.extend(parsed.calls.iter().cloned());
+            unclassified += parsed.unclassified.iter().filter(|u| u.is_some()).count() as u64;
             if let Some(res) = self.results.get(file) {
                 out.edges.extend(res.edges.iter().cloned());
                 out.warnings.extend(res.warnings.iter().cloned());
@@ -162,6 +165,8 @@ impl State {
         put("js_globs", counts.globs);
         put("js_glob_matches", counts.glob_matches);
         put("js_call_sites", out.facts.js_call_sites.len() as u64);
+        put("js_call_sites_link", out.facts.js_call_sites.iter().filter(|c| c.link).count() as u64);
+        put("js_call_sites_unclassified", unclassified);
         put("js_edges", out.edges.len() as u64);
         put("js_workspace_packages", self.resolver.workspaces.packages.len() as u64);
         put("js_tsconfigs", self.resolver.config_count() as u64);
@@ -178,6 +183,17 @@ impl State {
 
 fn micros(t: Instant) -> u128 {
     t.elapsed().as_micros()
+}
+
+impl JsExtractor {
+    /// Call sites from the last build/update whose URL use could not be
+    /// classified as navigation or data (they keep `link = false`), with a
+    /// short description of the context (`arg:useState`, `prop:endpoint`,
+    /// `var:return`, ...). For diagnostics.
+    pub fn unclassified_call_sites(&self) -> Vec<(&ripple_core::JsCallSite, &str)> {
+        let Some(state) = &self.state else { return Vec::new() };
+        state.parsed.values().flat_map(|p| p.calls.iter().zip(&p.unclassified).filter_map(|(c, u)| u.as_deref().map(|u| (c, u)))).collect()
+    }
 }
 
 impl Extractor for JsExtractor {

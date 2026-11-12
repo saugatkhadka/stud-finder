@@ -31,6 +31,11 @@ pub struct MountRef {
     pub helper: String,
     pub name: String,
     pub line: u32,
+    /// The controller action whose body holds the mount (`render inertia:`
+    /// inside `def show`), when the file is a controller and the line is in
+    /// a public action. `None` = the whole file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 /// Is `path` a file whose text may contain mounts?
@@ -129,7 +134,7 @@ pub fn scan(text: &str, path: &str) -> Vec<MountRef> {
         if in_comment(text, offset, ruby) {
             return;
         }
-        out.push(MountRef { kind, helper: helper.to_string(), name, line: lines.line(offset) });
+        out.push(MountRef { kind, helper: helper.to_string(), name, line: lines.line(offset), action: None });
     };
     for c in p.inertia.captures_iter(text) {
         let (Some(m), Some(name)) = (c.get(0), c.get(1)) else { continue };

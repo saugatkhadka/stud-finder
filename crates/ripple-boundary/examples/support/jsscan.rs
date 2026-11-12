@@ -139,7 +139,7 @@ pub fn scan(file: &str, text: &str) -> Vec<JsCallSite> {
     let p = patterns();
     let mut out = Vec::new();
     let mut push = |offset: usize, method: Option<String>, url: String, callee: String, route_helper: bool| {
-        out.push(JsCallSite { file: file.to_string(), line: line_of(text, offset), method, url, callee, route_helper });
+        out.push(JsCallSite { file: file.to_string(), line: line_of(text, offset), method, url, callee, route_helper, link: false });
     };
     for c in p.verb_call.captures_iter(text) {
         let (recv, verb, q) = (&c[1], &c[2], c.get(3).unwrap());

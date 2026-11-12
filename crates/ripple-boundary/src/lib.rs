@@ -80,6 +80,11 @@ fn api_only(ws: &Workspace) -> bool {
     read_text(ws, "config/application.rb").is_some_and(|t| t.lines().any(|l| l.trim_start().starts_with("config.api_only = true")))
 }
 
+/// A Ruby method name usable as an edge scope (`index`, `show?` excluded: not an action).
+fn is_action_name(a: &str) -> bool {
+    !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !a.starts_with(|c: char| c.is_ascii_digit())
+}
+
 fn bump(stats: &mut BTreeMap<String, u64>, key: impl Into<String>) {
     *stats.entry(key.into()).or_default() += 1;
 }
@@ -161,7 +166,18 @@ impl BoundaryLinker {
         self.registrations.retain(|p, _| present.contains(p.as_str()));
         for f in ws.files.iter().filter(|f| mounts::templates::is_candidate(f)) {
             if !self.mount_scans.contains_key(f) {
-                let found = read_text(ws, f).map(|t| mounts::templates::scan(&t, f)).unwrap_or_default();
+                let found = read_text(ws, f)
+                    .map(|t| {
+                        let mut found = mounts::templates::scan(&t, f);
+                        if f.ends_with("_controller.rb") && !found.is_empty() {
+                            let actions = mounts::actions::public_actions(t.as_bytes());
+                            for m in &mut found {
+                                m.action = mounts::actions::action_at(&actions, m.line).map(str::to_string);
+                            }
+                        }
+                        found
+                    })
+                    .unwrap_or_default();
                 self.mount_scans.insert(f.clone(), found);
             }
         }
@@ -231,23 +247,38 @@ impl BoundaryLinker {
 
     fn call_edges(&mut self, ws: &Workspace, facts: &Facts, controllers: &HashMap<String, Vec<RelPath>>, out: &mut ExtractOutput) {
         let routes = &self.table.routes;
+        let link_edges = ws.config.boundary.link_edges;
         self.calls = facts.js_call_sites.iter().enumerate().map(|(i, s)| calls::match_call(i, s, routes, &self.matcher, &ws.config.boundary)).collect();
         let (mut unmatched, mut ambiguous) = (0usize, 0usize);
         out.stats.insert("calls.total".into(), self.calls.len() as u64);
+        out.stats.insert("calls.skipped_links".into(), 0);
         for m in &self.calls {
             let site = &facts.js_call_sites[m.site];
+            // A page that only links to a URL does not depend on its controller.
+            if site.link && !link_edges {
+                bump(&mut out.stats, "calls.skipped_links");
+                continue;
+            }
             let label = || format!("{}:{}: {} {} ({})", site.file, site.line, site.method.as_deref().unwrap_or("ANY"), site.url, site.callee);
             match &m.outcome {
                 CallOutcome::Matched(c) => {
                     bump(&mut out.stats, format!("calls.{}", mounts::confidence_label(*c)));
+                    let confidence = if site.link { Confidence::Heuristic } else { *c };
+                    let prefix = if site.link { "link: " } else { "" };
                     for &ri in &m.routes {
-                        let r = &routes[ri];
-                        let Some(files) = controllers.get(&r.controller) else {
+                        if !controllers.contains_key(&routes[ri].controller) {
                             bump(&mut out.stats, "calls.controller_missing");
-                            continue;
-                        };
+                        }
+                    }
+                    for &ri in &m.actions {
+                        let r = &routes[ri];
+                        let Some(files) = controllers.get(&r.controller) else { continue };
                         for f in files {
-                            out.edges.push(Edge::new(&site.file, f, EdgeKind::ApiCall, *c).at(site.line).detail(format!("{} {} → {}", r.verb, r.path, r.endpoint())));
+                            let mut e = Edge::new(&site.file, f, EdgeKind::ApiCall, confidence).at(site.line).detail(format!("{prefix}{} {} → {}", r.verb, r.path, r.endpoint()));
+                            if is_action_name(&r.action) {
+                                e = e.to_scope(&r.action);
+                            }
+                            out.edges.push(e);
                         }
                     }
                 }
@@ -302,9 +333,28 @@ impl BoundaryLinker {
                 match &outcome {
                     Outcome::Resolved(targets, c) => {
                         bump(&mut out.stats, "mounts.resolved");
+                        // A template's props come from the controller action rendering it.
+                        let owner = mounts::actions::template_action(f).and_then(|(prefix, ctrl, action)| {
+                            let files: Vec<&RelPath> = controllers.get(ctrl)?.iter().filter(|c| c.starts_with(prefix) && c[prefix.len()..].starts_with("app/controllers/")).collect();
+                            (!files.is_empty()).then_some((files, ctrl, action))
+                        });
                         for t in targets {
-                            out.edges.push(Edge::new(f, t, EdgeKind::ViewMount, *c).at(m.line).detail(format!("mounts {}", m.name)));
-                            out.edges.push(Edge::new(t, f, EdgeKind::ViewMount, *c).detail(format!("props from {f}")));
+                            let mut mounts_edge = Edge::new(f, t, EdgeKind::ViewMount, *c).at(m.line).detail(format!("mounts {}", m.name));
+                            let mut props_edge = Edge::new(t, f, EdgeKind::ViewMount, *c).detail(format!("props from {f}"));
+                            if let Some(a) = &m.action {
+                                mounts_edge = mounts_edge.from_scope(a);
+                                props_edge = props_edge.to_scope(a);
+                            }
+                            out.edges.push(mounts_edge);
+                            out.edges.push(props_edge);
+                            if let Some((files, ctrl, action)) = &owner {
+                                for cf in files {
+                                    for a in mounts::actions::rendering_actions(action) {
+                                        let conf = (*c).min(Confidence::Inferred);
+                                        out.edges.push(Edge::new(t, *cf, EdgeKind::ViewMount, conf).detail(format!("props from {ctrl}#{a} via {}", m.name)).to_scope(a));
+                                    }
+                                }
+                            }
                         }
                     }
                     Outcome::NoTarget => bump(&mut out.stats, "mounts.no_target"),
@@ -321,13 +371,25 @@ impl BoundaryLinker {
             }
         }
         let actions: HashSet<(&str, &str)> = self.table.routes.iter().map(|r| (r.controller.as_str(), r.action.as_str())).collect();
-        for (ruby, js, label) in mounts::page_bundles(&ws.files, controllers, &actions, &index) {
+        for (ruby, js, label, action) in mounts::page_bundles(&ws.files, controllers, &actions, &index) {
             bump(&mut out.stats, "mounts.found");
             bump(&mut out.stats, "mounts.resolved");
             bump(&mut out.stats, "mounts.kind.page_bundle");
-            out.edges.push(Edge::new(&ruby, &js, EdgeKind::ViewMount, Confidence::Inferred).detail(format!("mounts {label}")));
-            out.edges.push(Edge::new(&js, &ruby, EdgeKind::ViewMount, Confidence::Inferred).detail(format!("props from {ruby}")));
-            let mount = MountRef { kind: MountKind::PageBundle, helper: "webpack_controller_bundle_tags".into(), name: label, line: 0 };
+            match &action {
+                // An action bundle is loaded for that action (GitLab also loads
+                // `new` for `create` and `edit` for `update`).
+                Some(a) => {
+                    for a in mounts::actions::rendering_actions(a) {
+                        out.edges.push(Edge::new(&ruby, &js, EdgeKind::ViewMount, Confidence::Inferred).detail(format!("mounts {label}")).from_scope(a));
+                        out.edges.push(Edge::new(&js, &ruby, EdgeKind::ViewMount, Confidence::Inferred).detail(format!("props from {ruby}")).to_scope(a));
+                    }
+                }
+                None => {
+                    out.edges.push(Edge::new(&ruby, &js, EdgeKind::ViewMount, Confidence::Inferred).detail(format!("mounts {label}")));
+                    out.edges.push(Edge::new(&js, &ruby, EdgeKind::ViewMount, Confidence::Inferred).detail(format!("props from {ruby}")));
+                }
+            }
+            let mount = MountRef { kind: MountKind::PageBundle, helper: "webpack_controller_bundle_tags".into(), name: label, line: 0, action };
             self.mounts.push(MountRecord { file: ruby, mount, outcome: Outcome::Resolved(vec![js], Confidence::Inferred) });
         }
     }
@@ -356,7 +418,7 @@ impl Linker for BoundaryLinker {
         self.call_edges(ws, facts, &controllers, &mut out);
         self.mount_edges(ws, &controllers, &mut out);
 
-        out.edges.sort_by(|a, b| (&a.from, &a.to, a.kind, a.line, &a.detail).cmp(&(&b.from, &b.to, b.kind, b.line, &b.detail)));
+        out.edges.sort_by(|a, b| (&a.from, &a.to, a.kind, a.line, &a.detail, &a.from_scope, &a.to_scope).cmp(&(&b.from, &b.to, b.kind, b.line, &b.detail, &b.from_scope, &b.to_scope)));
         out.edges.dedup();
         Ok(out)
     }

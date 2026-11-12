@@ -39,6 +39,7 @@ fn site(method: Option<&str>, url: &str) -> JsCallSite {
         url: url.into(),
         callee: "fetch".into(),
         route_helper: false,
+        link: false,
     }
 }
 
@@ -167,8 +168,8 @@ fn mounts_link_both_directions() {
     // Comments are skipped; the dynamic pack tag is counted, not linked.
     assert!(!l.mounts().iter().any(|m| m.mount.name == "Hidden" || m.mount.name == "Commented" || m.mount.name == "Commented/Out"));
     assert_eq!(out.stats["mounts.dynamic"], 1);
-    assert_eq!(out.stats["mounts.found"], 7);
-    assert_eq!(out.stats["mounts.resolved"], 6);
+    assert_eq!(out.stats["mounts.found"], 8);
+    assert_eq!(out.stats["mounts.resolved"], 7);
     let line = mounts.iter().find(|e| e.from == view && e.detail.as_deref() == Some("mounts Nav")).unwrap().line;
     assert_eq!(line, 2);
 }
@@ -243,4 +244,97 @@ fn warm_link_equals_full_link() {
         assert_ne!(w, prev, "{name} should change the output");
         prev = w;
     }
+}
+
+fn link_site(url: &str) -> JsCallSite {
+    JsCallSite { file: "app/javascript/components/Nav.tsx".into(), line: 3, link: true, ..helper(url) }
+}
+
+#[test]
+fn navigation_links_are_skipped_unless_enabled() {
+    let mut ws = workspace(&fixture_root());
+    let facts = Facts { js_call_sites: vec![link_site("Routes.photo_path"), site(Some("GET"), "/api/v2/widgets")] };
+    let out = BoundaryLinker::new().link(&ws, &facts, None).unwrap();
+    let calls = edges_of(&out, EdgeKind::ApiCall);
+    assert!(calls.iter().all(|e| e.from == "app/javascript/widgets/api.ts"), "{calls:?}");
+    assert_eq!(out.stats["calls.skipped_links"], 1);
+    assert_eq!(out.stats["calls.total"], 2);
+
+    ws.config.boundary.link_edges = true;
+    let out = BoundaryLinker::new().link(&ws, &facts, None).unwrap();
+    let links: Vec<_> = edges_of(&out, EdgeKind::ApiCall).into_iter().filter(|e| e.from == "app/javascript/components/Nav.tsx").collect();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(links[0].confidence, Confidence::Heuristic);
+    assert_eq!(links[0].detail.as_deref(), Some("link: GET /photos/:id → photos#show"));
+    assert_eq!(links[0].to_scope.as_deref(), Some("show"));
+    assert_eq!(out.stats["calls.skipped_links"], 0);
+}
+
+#[test]
+fn api_call_edges_are_scoped_to_each_matched_action() {
+    let ws = workspace(&fixture_root());
+    let facts = Facts {
+        js_call_sites: vec![
+            helper("Routes.photos_path"),                // index (GET) and create (POST)
+            site(Some("POST"), "/photos"),               // create only
+            site(None, "/photos/:param/comments"),       // comments#index and comments#create
+        ],
+    };
+    let mut l = BoundaryLinker::new();
+    let out = l.link(&ws, &facts, None).unwrap();
+    let scoped = |to: &str, detail_part: &str| -> Vec<(Option<String>, u32)> {
+        let mut v: Vec<_> = edges_of(&out, EdgeKind::ApiCall).into_iter().filter(|e| e.to == to && e.detail.as_deref().unwrap_or("").contains(detail_part)).map(|e| (e.to_scope.clone(), e.line)).collect();
+        v.sort();
+        v
+    };
+    let photos = "app/controllers/photos_controller.rb";
+    assert_eq!(scoped(photos, "photos#index"), [(Some("index".into()), 7)]);
+    assert_eq!(scoped(photos, "photos#create"), [(Some("create".into()), 7), (Some("create".into()), 7)]);
+    assert_eq!(l.call_matches()[0].actions.len(), 2);
+    assert_eq!(l.call_matches()[1].actions.len(), 1);
+    let comments = "app/controllers/comments_controller.rb";
+    assert_eq!(scoped(comments, "comments#"), [(Some("create".into()), 7), (Some("index".into()), 7)]);
+    // Every ApiCall edge names its action.
+    assert!(edges_of(&out, EdgeKind::ApiCall).iter().all(|e| e.to_scope.is_some() && e.from_scope.is_none()));
+}
+
+#[test]
+fn a_verb_the_path_does_not_serve_falls_back_to_any_verb() {
+    let ws = workspace(&fixture_root());
+    // `POST` with `_method: "DELETE"`, or a verb guessed from context: no
+    // DELETE /photos route, so every verb of the path, heuristically.
+    let facts = Facts { js_call_sites: vec![site(Some("DELETE"), "/photos"), JsCallSite { method: Some("DELETE".into()), ..helper("Routes.photos_path") }] };
+    let mut l = BoundaryLinker::new();
+    let out = l.link(&ws, &facts, None).unwrap();
+    let mut got: Vec<_> = edges_of(&out, EdgeKind::ApiCall).into_iter().map(|e| (e.to_scope.clone().unwrap(), e.confidence)).collect();
+    got.sort();
+    got.dedup();
+    assert_eq!(got, [("create".to_string(), Confidence::Heuristic), ("index".to_string(), Confidence::Heuristic)]);
+}
+
+#[test]
+fn view_mount_edges_are_scoped_to_the_rendering_action() {
+    let ws = workspace(&fixture_root());
+    let out = BoundaryLinker::new().link(&ws, &Facts::default(), None).unwrap();
+    let mounts = edges_of(&out, EdgeKind::ViewMount);
+    let find = |from: &str, to: &str| -> Vec<(Option<&str>, Option<&str>, &str)> {
+        let mut v: Vec<_> = mounts.iter().filter(|e| e.from == from && e.to == to).map(|e| (e.from_scope.as_deref(), e.to_scope.as_deref(), e.detail.as_deref().unwrap_or(""))).collect();
+        v.sort();
+        v
+    };
+    let ctrl = "app/controllers/profiles_controller.rb";
+    let page = "app/javascript/pages/Users/Show.tsx";
+    // `render inertia:` in public `show`, and again in a private helper (whole file).
+    assert_eq!(find(ctrl, page), [(None, None, "mounts Users/Show"), (Some("show"), None, "mounts Users/Show")]);
+    assert_eq!(find(page, ctrl), [(None, None, "props from app/controllers/profiles_controller.rb"), (None, Some("show"), "props from app/controllers/profiles_controller.rb")]);
+    // Template mounts: template edges stay unscoped; the page also depends on
+    // the action that renders the template.
+    let view = "app/views/photos/index.html.erb";
+    let nav = "app/javascript/components/Nav.tsx";
+    assert_eq!(find(view, nav), [(None, None, "mounts Nav")]);
+    assert_eq!(find(nav, view), [(None, None, "props from app/views/photos/index.html.erb")]);
+    assert_eq!(find(nav, "app/controllers/photos_controller.rb"), [(None, Some("index"), "props from photos#index via Nav")]);
+    // A layout belongs to no action: no controller edge.
+    let gallery = "app/javascript/widgets/Gallery.tsx";
+    assert!(mounts.iter().filter(|e| e.from == gallery).all(|e| e.to == "app/views/layouts/application.html.haml"));
 }

@@ -75,16 +75,23 @@ impl<'c> CallSites<'c> {
         }
     }
 
-    pub fn on_call(&mut self, call: &CallExpression<'_>) {
+    /// Handles one call; says whether it is a route helper or an HTTP call
+    /// (sites it emits for an HTTP call consume the response: never links).
+    pub fn on_call(&mut self, call: &CallExpression<'_>) -> CallKind {
         if self.try_route_helper(call, None, call.span.start) {
-            return;
+            return CallKind::RouteHelper;
         }
         let mut text = std::mem::take(&mut self.scratch);
         text.clear();
+        let mut kind = CallKind::Other;
         if write_callee(&call.callee, &mut text) {
+            if self.classify(&text).is_some() {
+                kind = CallKind::Http;
+            }
             self.classify_and_emit(call, &text);
         }
         self.scratch = text;
+        kind
     }
 
     /// A `"/api/..."`-looking string literal that is not an argument to a recognised call.
@@ -266,6 +273,13 @@ struct Callee {
     verb: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    RouteHelper,
+    Http,
+    Other,
+}
+
 pub enum RouteBinding {
     /// `import Routes from` / `import * as Routes from`.
     Namespace(String),
@@ -319,7 +333,7 @@ fn verb_from_name(text: &str) -> Option<&'static str> {
 
 /// Writes the callee as written (`api().get`, `this.http.post`); false when it is
 /// not a simple identifier / member / call chain.
-fn write_callee(e: &Expression<'_>, out: &mut String) -> bool {
+pub(crate) fn write_callee(e: &Expression<'_>, out: &mut String) -> bool {
     match e.get_inner_expression() {
         Expression::Identifier(id) => {
             out.push_str(&id.name);
