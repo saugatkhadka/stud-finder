@@ -152,6 +152,8 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             }
             let mut seen = std::collections::HashSet::new();
             entry.refs.retain(|r| seen.insert((r.line, r.name_id, r.inherit)));
+            // Sized for every Rubydex reference; ~30% survive (GitLab: 13 MB of slack).
+            entry.refs.shrink_to_fit();
         }
         SourceKind::Template(lang) => {
             entry.template = templates::collect_with(&source, lang, method_level);
