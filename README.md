@@ -173,13 +173,35 @@ If no rule fires, the risk is low.
 
 ### Method-level analysis
 
-Extractors can report, per file, the line ranges of its methods and controller
-actions (`Facts.scopes`), and, per edge, which method of the dependent it sits
-in (`from_scope`) and which method of the dependency it uses (`to_scope`; the
-class body is `@body`). When both are known, an edit inside `Purchase#refund!`
-seeds only `refund!`: callers of `charge!` are not impacted. Everything is
-conservative, so method-level results are always a subset of file-level ones:
+Extractors report, per file, the line ranges of its methods and controller
+actions (`Facts.scopes`), so a diff maps onto the methods it changed. The
+graph itself stays file-level. Two mechanisms narrow a change confined to
+named methods; both are conservative, so method-level results are always a
+subset of file-level ones:
 
+- **Controller actions.** Route, view, API-call and view-mount edges carry
+  `from_scope` (the action a reference sits in) and `to_scope` (the action an
+  edge targets). An edit inside `PostsController#show` reaches the views,
+  routes and JS callers of `show`, not those of `index`.
+- **Ruby mention filter (hop 1 only).** Ruby files also report which method
+  names each of their methods mentions (calls with or without a receiver,
+  symbols, `delegate`, templates included). For a seed changed only in
+  methods `M`, `M` first grows inside the file and its superclasses/mixins:
+  any method that mentions a name in `M` joins it. A direct dependent reached
+  through a Ruby constant, require, inferred-association or view edge is kept
+  only if it mentions a name in `M`. Matching is by name (Ruby has no static
+  types), so `record.total` keeps every file that calls any `total`.
+  Everything beyond the first hop is file-level, and dependents through
+  inheritance (subclasses, includers) are always kept and followed in full.
+  The seed is treated as wholly changed when a method in `M` is mentioned in
+  the class body (callbacks, validations, `delegate`), is invoked implicitly
+  (hooks such as `perform`/`call`/`to_s`/Pundit predicates, setters,
+  operators), is mentioned nowhere in the workspace (called by convention),
+  or when the file dispatches on `self` with a computed name (`send(x)`,
+  `method_missing`). A dependent that dispatches with a computed name on
+  another receiver (`record.public_send(x)`, any dynamic call in a template)
+  always passes. `ruby.method_level: false` turns the filter (and the
+  per-method scopes) off.
 - The diff is read with `git diff -U0`; only new-side hunks matter. A hunk
   with new lines `[a, b]` belongs to method `m` iff `m.start < a` and
   `b <= m.end` (the `def` line itself is not "inside": renaming or changing a
@@ -200,7 +222,8 @@ conservative, so method-level results are always a subset of file-level ones:
   `untested` (a file counts as tested if a test reaches one of its changed
   methods), `crosses_boundary`. The per-file `dependents` count stays the
   file-level fan-in.
-- `--file-level` turns all of this off (seeds and edge scopes). The report
+- `--file-level` turns all of this off (seeds, edge scopes and the mention
+  filter). The report
   always carries `impacted.file_level_total`, and the markdown headline reads
   e.g. "**212** impacted files (method-level; 1,362 if whole files are assumed
   changed)". The footer states which mode was used.
@@ -403,7 +426,10 @@ per-extractor counters.
   files whose imports of it no longer resolve (`deleted_file_still_imported`);
   Ruby constant references to a deleted file are not recoverable cold.
 - Method-level narrowing is only as good as the scope data: files without
-  scope ranges, and edges without a `to_scope`, count as whole-file.
+  scope ranges count as whole-file. The Ruby mention filter matches by name
+  and applies to direct dependents only; a dependent that only `require`s the
+  file and reaches its methods by a convention (Thor subcommands, for
+  example) is dropped.
 - Each incremental pass rebuilds the whole graph. On a 400k-edge graph that
   costs about 0.3 s. Queries that do not name a pending file are not blocked
   during the pass.
