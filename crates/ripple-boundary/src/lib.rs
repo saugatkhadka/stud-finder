@@ -46,6 +46,34 @@ pub struct BoundaryLinker {
     registrations: HashMap<RelPath, Vec<(String, String)>>,
     mounts: Vec<MountRecord>,
     calls: Vec<CallMatch>,
+    /// `match_call` results by what they depend on in a site (verb, URL,
+    /// helper flag); valid for `memo_for` (the boundary config) and the
+    /// current route table, cleared when either changes.
+    call_memo: HashMap<(Option<String>, String, bool), CallMatch>,
+    memo_for: String,
+    /// Inputs of the last `mount_edges` and what it produced: reused while
+    /// the inputs are equal (see [`MountKey`]).
+    mount_memo: Option<(MountKey, ExtractOutput, Vec<MountRecord>)>,
+    /// Bumped whenever a mount scan or registration actually changes.
+    scan_gen: u64,
+    table_gen: u64,
+}
+
+/// Everything `mount_edges` reads besides the scans: the file list (by
+/// hash), the bundler config, the route table and scan generations.
+#[derive(PartialEq, Eq)]
+struct MountKey {
+    files: (usize, u64),
+    config: BundlerConfig,
+    table_gen: u64,
+    scan_gen: u64,
+}
+
+fn files_hash(files: &[RelPath]) -> (usize, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    files.hash(&mut h);
+    (files.len(), h.finish())
 }
 
 fn glob_set(globs: &[String]) -> Vec<glob::Pattern> {
@@ -167,18 +195,29 @@ impl BoundaryLinker {
     /// Registrations (`ReactOnRails.register`) are only scanned while some
     /// template mounts a component by name, since that reads every JS file.
     fn refresh_scans(&mut self, ws: &Workspace, changes: Option<&ChangeSet>) {
+        let mut old_scans: HashMap<RelPath, Vec<MountRef>> = HashMap::new();
+        let mut old_regs: HashMap<RelPath, Vec<(String, String)>> = HashMap::new();
         if changes.is_none() || !self.built {
             self.mount_scans.clear();
             self.registrations.clear();
+            self.scan_gen += 1;
         } else if let Some(c) = changes {
             for p in c.modified.iter().chain(&c.removed) {
-                self.mount_scans.remove(p);
-                self.registrations.remove(p);
+                if let Some(v) = self.mount_scans.remove(p) {
+                    old_scans.insert(p.clone(), v);
+                }
+                if let Some(v) = self.registrations.remove(p) {
+                    old_regs.insert(p.clone(), v);
+                }
             }
         }
         let present: HashSet<&str> = ws.files.iter().map(String::as_str).collect();
+        let (n_scans, n_regs) = (self.mount_scans.len(), self.registrations.len());
         self.mount_scans.retain(|p, _| present.contains(p.as_str()));
         self.registrations.retain(|p, _| present.contains(p.as_str()));
+        if (n_scans, n_regs) != (self.mount_scans.len(), self.registrations.len()) {
+            self.scan_gen += 1;
+        }
         for f in ws.files.iter().filter(|f| mounts::templates::is_candidate(f)) {
             if !self.mount_scans.contains_key(f) {
                 let found = read_text(ws, f)
@@ -193,19 +232,32 @@ impl BoundaryLinker {
                         found
                     })
                     .unwrap_or_default();
+                if old_scans.remove(f).as_ref() != Some(&found) {
+                    self.scan_gen += 1;
+                }
                 self.mount_scans.insert(f.clone(), found);
             }
+        }
+        if !old_scans.is_empty() {
+            self.scan_gen += 1;
         }
         let need_registrations = self.mount_scans.values().flatten().any(|m| m.kind == MountKind::ReactComponent);
         if need_registrations {
             for f in ws.files.iter().filter(|f| mounts::resolve::is_js(f) && !mounts::resolve::is_test_like(f)) {
                 if !self.registrations.contains_key(f) {
                     let regs = read_text(ws, f).map(|t| mounts::resolve::scan_registrations(&t)).unwrap_or_default();
+                    if old_regs.remove(f).as_ref() != Some(&regs) {
+                        self.scan_gen += 1;
+                    }
                     self.registrations.insert(f.clone(), regs);
                 }
             }
-        } else {
+            if !old_regs.is_empty() {
+                self.scan_gen += 1;
+            }
+        } else if !self.registrations.is_empty() {
             self.registrations.clear();
+            self.scan_gen += 1;
         }
     }
 
@@ -261,9 +313,10 @@ impl BoundaryLinker {
     }
 
     fn call_edges(&mut self, ws: &Workspace, facts: &Facts, controllers: &HashMap<String, Vec<RelPath>>, out: &mut ExtractOutput) {
+        let calls: Vec<CallMatch> = facts.js_call_sites.iter().enumerate().map(|(i, s)| self.match_memo(i, s, ws)).collect();
+        self.calls = calls;
         let routes = &self.table.routes;
         let link_edges = ws.config.boundary.link_edges;
-        self.calls = facts.js_call_sites.iter().enumerate().map(|(i, s)| calls::match_call(i, s, &self.table, &self.matcher, &ws.config.boundary)).collect();
         let (mut unmatched, mut ambiguous) = (0usize, 0usize);
         out.stats.insert("calls.total".into(), self.calls.len() as u64);
         out.stats.insert("calls.skipped_links".into(), 0);
@@ -325,11 +378,11 @@ impl BoundaryLinker {
     /// request spec, `visit "/settings"` in a system spec. Same matching as
     /// JS call sites; unmatched requests (external URLs, Grape APIs, engines)
     /// are only counted, since tests routinely hit URLs Rails does not route.
-    fn request_edges(&self, ws: &Workspace, facts: &Facts, controllers: &HashMap<String, Vec<RelPath>>, out: &mut ExtractOutput) {
+    fn request_edges(&mut self, ws: &Workspace, facts: &Facts, controllers: &HashMap<String, Vec<RelPath>>, out: &mut ExtractOutput) {
+        let ms: Vec<CallMatch> = facts.http_requests.iter().enumerate().map(|(i, s)| self.match_memo(i, s, ws)).collect();
         let routes = &self.table.routes;
         out.stats.insert("requests.total".into(), facts.http_requests.len() as u64);
-        for (i, site) in facts.http_requests.iter().enumerate() {
-            let m = calls::match_call(i, site, &self.table, &self.matcher, &ws.config.boundary);
+        for (site, m) in facts.http_requests.iter().zip(ms) {
             let c = match m.outcome {
                 CallOutcome::Matched(c) => c,
                 CallOutcome::Ambiguous(_) => {
@@ -364,9 +417,43 @@ impl BoundaryLinker {
         }
     }
 
+    /// `calls::match_call`, memoized (it depends on the site only through
+    /// its verb, URL and helper flag).
+    fn match_memo(&mut self, i: usize, site: &ripple_core::JsCallSite, ws: &Workspace) -> CallMatch {
+        let key = (site.method.clone(), site.url.clone(), site.route_helper);
+        if let Some(m) = self.call_memo.get(&key) {
+            return CallMatch { site: i, ..m.clone() };
+        }
+        let m = calls::match_call(i, site, &self.table, &self.matcher, &ws.config.boundary);
+        self.call_memo.insert(key, m.clone());
+        m
+    }
+
     fn mount_edges(&mut self, ws: &Workspace, controllers: &HashMap<String, Vec<RelPath>>, out: &mut ExtractOutput) {
-        let config = BundlerConfig::read(ws);
-        let index = JsIndex::new(&ws.files, &config);
+        let key = MountKey { files: files_hash(&ws.files), config: BundlerConfig::read(ws), table_gen: self.table_gen, scan_gen: self.scan_gen };
+        if let Some((k, o, records)) = &self.mount_memo
+            && *k == key
+        {
+            out.edges.extend(o.edges.iter().cloned());
+            out.warnings.extend(o.warnings.iter().cloned());
+            for (s, n) in &o.stats {
+                *out.stats.entry(s.clone()).or_default() += n;
+            }
+            self.mounts = records.clone();
+            return;
+        }
+        let mut mine = ExtractOutput::default();
+        self.mount_edges_uncached(ws, controllers, &key.config, &mut mine);
+        out.edges.extend(mine.edges.iter().cloned());
+        out.warnings.extend(mine.warnings.iter().cloned());
+        for (s, n) in &mine.stats {
+            *out.stats.entry(s.clone()).or_default() += n;
+        }
+        self.mount_memo = Some((key, mine, self.mounts.clone()));
+    }
+
+    fn mount_edges_uncached(&mut self, ws: &Workspace, controllers: &HashMap<String, Vec<RelPath>>, config: &BundlerConfig, out: &mut ExtractOutput) {
+        let index = JsIndex::new(&ws.files, config);
         let mut registry: Registry = BTreeMap::new();
         let mut reg_files: Vec<&RelPath> = self.registrations.keys().collect();
         reg_files.sort();
@@ -468,6 +555,14 @@ impl Linker for BoundaryLinker {
             let sources: Vec<(RelPath, Vec<u8>)> = self.route_sources.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             self.table = routes::build(&sources, self.api_only);
             self.matcher = Matcher::new(&self.table.routes);
+            self.table_gen += 1;
+            self.call_memo.clear();
+        }
+        let memo_for = serde_json::to_string(&ws.config.boundary).unwrap_or_default();
+        // Stale keys (edited-away URLs) would otherwise accumulate in a daemon.
+        if memo_for != self.memo_for || self.call_memo.len() > 2 * (facts.js_call_sites.len() + facts.http_requests.len()) + 1024 {
+            self.call_memo.clear();
+            self.memo_for = memo_for;
         }
         let controllers = controller_index(&ws.files);
         self.refresh_scans(ws, changes);

@@ -64,8 +64,8 @@ impl Csr {
 #[derive(Debug, Default)]
 pub struct Graph {
     /// Sorted (node ids follow path order), so [`Graph::id`] is a binary
-    /// search and no path is stored twice.
-    paths: Vec<RelPath>,
+    /// search and no path is stored twice. Shared with patched graphs.
+    paths: Arc<[RelPath]>,
     /// (from, to) per edge id.
     endpoints: Vec<(NodeId, NodeId)>,
     data: Vec<EdgeData>,
@@ -91,6 +91,75 @@ pub struct Graph {
     /// Size/complexity tables (see [`Graph::set_metrics`]), shared with the
     /// extractors' outputs.
     metrics: Vec<Arc<MetricsTable>>,
+    /// Details appended by [`Graph::patched`] since the last build (some
+    /// may be unused); bounds the garbage in `detail_text`.
+    details_appended: u32,
+}
+
+/// Per-row dedup key, as in [`Graph::build`]: (from, to, kind, scopes, best
+/// confidence first, line, edge index, inherits).
+type Key = (NodeId, NodeId, EdgeKind, (u32, u32), std::cmp::Reverse<Confidence>, u32, u32, bool);
+
+/// Sorts `keyed`, keeps the best duplicate (it inherits if any duplicate
+/// does) and drops scoped twins that an unscoped edge covers. Both only
+/// relate keys with the same `from`, so this can run per row.
+fn dedup_keys(keyed: &mut Vec<Key>) {
+    keyed.sort_unstable();
+    keyed.dedup_by(|b, a| {
+        let same = (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3);
+        if same {
+            a.7 |= b.7;
+        }
+        same
+    });
+    // An edge with no scope on one side already covers every scope on that
+    // side ("the whole file depends" / "depends on the whole file"), so a
+    // more specific twin of the same from/to/kind adds nothing: drop it.
+    // (An inheritance edge passes the affected scope on instead, so it
+    // covers nothing.)
+    let present: HashSet<(NodeId, NodeId, EdgeKind, u32, u32)> = keyed.iter().filter(|k| !k.7).map(|k| (k.0, k.1, k.2, k.3 .0, k.3 .1)).collect();
+    const ANY: u32 = u32::MAX;
+    keyed.retain(|k| {
+        let (fs, ts) = k.3;
+        !((fs != ANY && present.contains(&(k.0, k.1, k.2, ANY, ts)))
+            || (ts != ANY && present.contains(&(k.0, k.1, k.2, fs, ANY)))
+            || (fs != ANY && ts != ANY && present.contains(&(k.0, k.1, k.2, ANY, ANY))))
+    });
+}
+
+/// `distinct_in` / `distinct_out` from endpoints sorted by (from, to).
+fn distinct(n: usize, endpoints: &[(NodeId, NodeId)]) -> (Vec<u32>, Vec<u32>) {
+    let mut distinct_in = vec![0u32; n];
+    let mut distinct_out = vec![0u32; n];
+    let mut last: Option<(NodeId, NodeId)> = None;
+    // Duplicates are adjacent.
+    for &(f, t) in endpoints {
+        if f != t && last != Some((f, t)) {
+            distinct_in[t as usize] += 1;
+            distinct_out[f as usize] += 1;
+        }
+        last = Some((f, t));
+    }
+    (distinct_in, distinct_out)
+}
+
+/// Scope strings in the order [`Graph::build`] interns them: first
+/// appearance in input order, `from_scope` before `to_scope`, inheritance
+/// edges and self-edges skipped.
+fn scope_order<'a>(edges: impl Iterator<Item = &'a Edge>) -> Vec<&'a str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for e in edges {
+        if e.inherit || e.from == e.to {
+            continue;
+        }
+        for s in [&e.from_scope, &e.to_scope].into_iter().flatten() {
+            if seen.insert(s.as_str()) {
+                out.push(s.as_str());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -226,7 +295,7 @@ impl Graph {
         for (new, &old) in order.iter().enumerate() {
             remap[old as usize] = new as NodeId;
         }
-        let paths: Vec<RelPath> = order.iter().map(|&i| names[i as usize].to_string()).collect();
+        let paths: Arc<[RelPath]> = order.iter().map(|&i| names[i as usize].to_string()).collect();
 
         // Sort so the best duplicate (highest confidence, then lowest line) comes first, then dedup.
         let mut scope_ids: HashMap<&str, u32> = HashMap::new();
@@ -242,33 +311,12 @@ impl Graph {
         };
         let scoped: Vec<(u32, u32)> = edges.iter().map(|e| if e.inherit { (u32::MAX, u32::MAX) } else { (scope(&e.from_scope), scope(&e.to_scope)) }).collect();
         // (from, to, kind, scopes, best confidence first, line, edge index, inherits)
-        let mut keyed: Vec<(NodeId, NodeId, EdgeKind, (u32, u32), std::cmp::Reverse<Confidence>, u32, u32, bool)> = raw
+        let mut keyed: Vec<Key> = raw
             .iter()
             .enumerate()
             .map(|(i, &(f, t))| (remap[f as usize], remap[t as usize], edges[i].kind, scoped[i], std::cmp::Reverse(edges[i].confidence), edges[i].line, i as u32, edges[i].inherit))
             .collect();
-        keyed.sort_unstable();
-        // Keep the best duplicate; it inherits if any duplicate does.
-        keyed.dedup_by(|b, a| {
-            let same = (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3);
-            if same {
-                a.7 |= b.7;
-            }
-            same
-        });
-        // An edge with no scope on one side already covers every scope on that
-        // side ("the whole file depends" / "depends on the whole file"), so a
-        // more specific twin of the same from/to/kind adds nothing: drop it.
-        // (An inheritance edge passes the affected scope on instead, so it
-        // covers nothing.)
-        let present: HashSet<(NodeId, NodeId, EdgeKind, u32, u32)> = keyed.iter().filter(|k| !k.7).map(|k| (k.0, k.1, k.2, k.3 .0, k.3 .1)).collect();
-        const ANY: u32 = u32::MAX;
-        keyed.retain(|k| {
-            let (fs, ts) = k.3;
-            !((fs != ANY && present.contains(&(k.0, k.1, k.2, ANY, ts)))
-                || (ts != ANY && present.contains(&(k.0, k.1, k.2, fs, ANY)))
-                || (fs != ANY && ts != ANY && present.contains(&(k.0, k.1, k.2, ANY, ANY))))
-        });
+        dedup_keys(&mut keyed);
 
         let mut detail_ids: HashMap<&str, u32> = HashMap::new();
         let mut detail_text = String::new();
@@ -291,23 +339,154 @@ impl Graph {
         let n = paths.len();
         let forward = Csr::build(n, endpoints.iter().copied());
         let reverse = Csr::build(n, endpoints.iter().map(|&(f, t)| (t, f)));
-        let mut distinct_in = vec![0u32; n];
-        let mut distinct_out = vec![0u32; n];
-        let mut last: Option<(NodeId, NodeId)> = None;
-        // `endpoints` is sorted by (from, to, ..), so duplicates are adjacent.
-        for &(f, t) in &endpoints {
-            if f != t && last != Some((f, t)) {
-                distinct_in[t as usize] += 1;
-                distinct_out[f as usize] += 1;
-            }
-            last = Some((f, t));
-        }
+        // `endpoints` is sorted by (from, to, ..).
+        let (distinct_in, distinct_out) = distinct(n, &endpoints);
         drop(scope);
         let scope_ids = scopes.iter().map(|s| name_id(s)).collect();
         let mentions = vec![None; n];
         drop(detail_ids);
         let (detail_text, detail_ends) = (detail_text.into_boxed_str(), detail_ends.into_boxed_slice());
-        Self { paths, endpoints, data, detail_text, detail_ends, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]), metrics: Vec::new() }
+        Self { paths, endpoints, data, detail_text, detail_ends, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]), metrics: Vec::new(), details_appended: 0 }
+    }
+
+    /// The graph [`Graph::build`] returns for `all` (the complete new input,
+    /// in the same order) with the same `extra_nodes`, computed from `self`
+    /// when only the out-edges of the files in `rows` changed: each row is
+    /// `(from, every edge of all with that from, in input order)`. Edge ids,
+    /// scope ids, adjacency order and counts equal a build's; detail ids may
+    /// differ (they are not observable). Mentions and metrics are not
+    /// carried over.
+    ///
+    /// `None` when the result would have a different node set (an endpoint
+    /// that is not a node, or a node no longer touched by any edge for
+    /// which `listed` is false), a different scope table, or too many
+    /// appended details: the caller then builds.
+    pub fn patched<'a>(&self, rows: &[(&'a str, Vec<&'a Edge>)], all: impl Iterator<Item = &'a Edge>, listed: impl Fn(&str) -> bool) -> Option<Graph> {
+        // Scope ids depend on first appearance anywhere in the input.
+        let order = scope_order(all);
+        if order.len() != self.scopes.len() || order.iter().zip(&self.scopes).any(|(a, b)| *a != b.as_str()) {
+            return None;
+        }
+        let scope_ix: HashMap<&str, u32> = self.scopes.iter().enumerate().map(|(i, s)| (s.as_str(), i as u32)).collect();
+        let scope = |s: &Option<String>| s.as_deref().map_or(Some(u32::MAX), |s| scope_ix.get(s).copied());
+
+        let mut detail_text = String::from(&*self.detail_text);
+        let mut detail_ends: Vec<u32> = self.detail_ends.to_vec();
+        let mut new_details: HashMap<&str, u32> = HashMap::new();
+        let mut rows_out: Vec<(NodeId, Vec<(NodeId, NodeId)>, Vec<EdgeData>)> = Vec::with_capacity(rows.len());
+        // Nodes that may have lost their last edge.
+        let mut touched: Vec<NodeId> = Vec::new();
+        for (from, edges) in rows {
+            let Some(f) = self.id(from) else {
+                // Not a node and no edges now: nothing to patch.
+                if edges.iter().all(|e| e.from == e.to) {
+                    continue;
+                }
+                return None;
+            };
+            touched.push(f);
+            touched.extend(self.forward.neighbours(f).map(|(t, _)| t));
+            let edges: Vec<&Edge> = edges.iter().copied().filter(|e| e.from != e.to).collect();
+            let mut keyed: Vec<Key> = Vec::with_capacity(edges.len());
+            for (i, e) in edges.iter().enumerate() {
+                debug_assert_eq!(e.from, *from);
+                let t = self.id(&e.to)?;
+                let sc = if e.inherit { (u32::MAX, u32::MAX) } else { (scope(&e.from_scope)?, scope(&e.to_scope)?) };
+                keyed.push((f, t, e.kind, sc, std::cmp::Reverse(e.confidence), e.line, i as u32, e.inherit));
+            }
+            dedup_keys(&mut keyed);
+            let mut ends = Vec::with_capacity(keyed.len());
+            let mut data = Vec::with_capacity(keyed.len());
+            for k in &keyed {
+                let e = edges[k.6 as usize];
+                ends.push((k.0, k.1));
+                let detail = match &e.detail {
+                    Some(d) => *new_details.entry(d.as_str()).or_insert_with(|| {
+                        detail_text.push_str(d);
+                        detail_ends.push(detail_text.len() as u32);
+                        (detail_ends.len() - 1) as u32
+                    }),
+                    None => u32::MAX,
+                };
+                data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail, from_scope: k.3 .0, to_scope: k.3 .1, inherit: k.7 });
+            }
+            rows_out.push((f, ends, data));
+        }
+        let details_appended = self.details_appended + new_details.len() as u32;
+        if details_appended as usize > (self.detail_ends.len() / 4).max(1 << 12) {
+            return None;
+        }
+        rows_out.sort_unstable_by_key(|r| r.0);
+        if rows_out.windows(2).any(|w| w[0].0 == w[1].0) {
+            return None;
+        }
+
+        // Splice the rows into the from-major edge arrays.
+        let n = self.paths.len();
+        let mut endpoints = Vec::with_capacity(self.endpoints.len() + 64);
+        let mut data = Vec::with_capacity(self.data.len() + 64);
+        let mut at = 0usize;
+        for (f, ends, d) in rows_out {
+            let (a, b) = (self.forward.offsets[f as usize] as usize, self.forward.offsets[f as usize + 1] as usize);
+            endpoints.extend_from_slice(&self.endpoints[at..a]);
+            data.extend_from_slice(&self.data[at..a]);
+            endpoints.extend(ends);
+            data.extend(d);
+            at = b;
+        }
+        endpoints.extend_from_slice(&self.endpoints[at..]);
+        data.extend_from_slice(&self.data[at..]);
+
+        let forward = Csr::build(n, endpoints.iter().copied());
+        let reverse = Csr::build(n, endpoints.iter().map(|&(f, t)| (t, f)));
+        for t in touched {
+            let deg = |c: &Csr| c.offsets[t as usize + 1] - c.offsets[t as usize];
+            if deg(&forward) == 0 && deg(&reverse) == 0 && !listed(&self.paths[t as usize]) {
+                return None;
+            }
+        }
+        let (distinct_in, distinct_out) = distinct(n, &endpoints);
+        Some(Self {
+            paths: self.paths.clone(),
+            endpoints,
+            data,
+            detail_text: detail_text.into_boxed_str(),
+            detail_ends: detail_ends.into_boxed_slice(),
+            scopes: self.scopes.clone(),
+            scope_ids: self.scope_ids.clone(),
+            distinct_in,
+            distinct_out,
+            forward,
+            reverse,
+            mentions: vec![None; n],
+            unmentioned: Arc::from([]),
+            metrics: Vec::new(),
+            details_appended,
+        })
+    }
+
+    /// Every edge in id order as an [`Edge`] (detail resolved), for
+    /// comparing graphs in tests.
+    pub fn edges_for_test(&self) -> Vec<Edge> {
+        (0..self.endpoints.len() as u32)
+            .map(|i| {
+                let (f, t, d) = self.edge(i);
+                let mut e = Edge::new(self.path(f), self.path(t), d.kind, d.confidence).at(d.line);
+                e.detail = self.edge_detail(i).map(String::from);
+                let (fs, ts) = self.edge_scopes(i);
+                e.from_scope = fs.map(String::from);
+                e.to_scope = ts.map(String::from);
+                e.inherit = d.inherit;
+                e
+            })
+            .collect()
+    }
+
+    /// (forward, reverse) adjacency as (node, [(neighbour, edge id)]) for
+    /// comparing graphs in tests.
+    pub fn adjacency_for_test(&self) -> (Vec<Vec<(NodeId, u32)>>, Vec<Vec<(NodeId, u32)>>) {
+        let n = self.paths.len() as NodeId;
+        ((0..n).map(|i| self.forward.neighbours(i).collect()).collect(), (0..n).map(|i| self.reverse.neighbours(i).collect()).collect())
     }
 
     /// Attaches the per-file method mentions that let method-level queries

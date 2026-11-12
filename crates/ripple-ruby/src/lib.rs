@@ -9,10 +9,32 @@
 //!    the resolver, which is incremental over the pending work.
 //! 3. **edges** (all files): resolve cached facts against the graph and the
 //!    file list. See [`edges`] for why this step is not incremental.
+//!
+//! Fast path: when every changed file keeps its [`fingerprint`] (a
+//! "body-only" edit: method bodies, comments, Rails DSL arguments...), step 2
+//! is skipped and step 3 runs for the changed files only
+//! ([`Extractor::update_rows`]). In a batch, files that keep their
+//! fingerprint are never fed to Rubydex; only the others are. A batch whose
+//! Rubydex merge would cost more than a fresh build is rebuilt instead.
+//!
+//! A file whose definitions keep their fingerprint and whose plain constant
+//! references name the same set of names *between the same superclass /
+//! mixin references* (`FileEntry::fp_names`) takes the fast path too,
+//! however many references of each name there are: Rubydex resolves *names*
+//! (a position-free id of the string, its parent scope and its lexical
+//! nesting), so every reference of a name resolves like the others; the
+//! resolver handles every definition before any reference; references go in
+//! offset order, and the only order-dependence is a lookup made while an
+//! ancestor chain is incomplete (settled through `Object` for good), so the
+//! position of a name's references relative to the ancestor references is
+//! hashed. The file's document in Rubydex, while stale, holds the same names
+//! (keeping them alive and making [`shadow::documents_using`] see the file),
+//! in the same order relative to its ancestor references.
 
 mod actions;
 mod analyse;
 mod edges;
+mod fingerprint;
 mod inflector;
 mod lex;
 mod methods;
@@ -30,13 +52,13 @@ use analyse::{Analysed, FileEntry};
 use inflector::Inflector;
 use paths::SourceKind;
 use rayon::prelude::*;
-use ripple_core::{ChangeSet, EdgeKind, ExtractOutput, Extractor, Workspace};
+use ripple_core::{ChangeSet, Edge, EdgeKind, ExtractOutput, Extractor, Workspace};
 use rubydex::model::declaration::{Declaration, Namespace};
 use rubydex::model::graph::Graph;
 use rubydex::model::ids::{DeclarationId, NameId};
 use rubydex::model::name::NameRef;
 use rubydex::resolution::Resolver;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 const INFLECTIONS: &str = "config/initializers/inflections.rb";
@@ -57,6 +79,36 @@ struct State {
     names: scoped::Interner,
     /// `ruby.method_level` the cached facts were collected with.
     method_level: bool,
+    /// Edge stats of the current files against the current graph, so a
+    /// fast-path update can patch them (see [`State::row_edges`]).
+    totals: edges::EdgeStats,
+    kind_counts: [u64; 4],
+    over: edges::OverLimit,
+    /// The last resolve reached its fixed point (else the fast path is off).
+    converged: bool,
+    /// Decayed sums of Rubydex merge time and of structurally changed files
+    /// over past slow-path updates, and the decayed resolve+repair time, to
+    /// predict a batch's cost against `cold_us` (the last full build).
+    merge_us_sum: f64,
+    merge_docs_sum: f64,
+    resolve_us_avg: Option<f64>,
+    cold_us: u64,
+    /// Scopes and mentions by file, kept in step with `files` by
+    /// [`State::put`] / [`State::take`] (only with `method_level`).
+    scoped: scoped::Cache,
+}
+
+/// Edge kinds Ruby emits, in stats order.
+const KINDS: [EdgeKind; 4] = [EdgeKind::RubyConstant, EdgeKind::RubyRequire, EdgeKind::RailsInferred, EdgeKind::RailsView];
+
+fn kind_counts(edges: &[Edge]) -> [u64; 4] {
+    let mut out = [0u64; 4];
+    for e in edges {
+        if let Some(i) = KINDS.iter().position(|k| *k == e.kind) {
+            out[i] += 1;
+        }
+    }
+    out
 }
 
 impl RubyExtractor {
@@ -72,6 +124,16 @@ struct Timings {
     resolve_us: u64,
     shadow_us: u64,
     shadow_docs: usize,
+    /// Files that kept / changed their fingerprint (update only).
+    fast_files: usize,
+    /// Of `fast_files`, those whose references changed (same name set).
+    ref_files: usize,
+    slow_files: usize,
+    batch_rebuilt: bool,
+}
+
+fn verify_rows() -> bool {
+    std::env::var_os("RIPPLE_RUBY_VERIFY_ROWS").is_some_and(|v| v == "1")
 }
 
 fn micros(since: Instant) -> u64 {
@@ -97,6 +159,25 @@ fn analyse_all(ws: &Workspace, todo: &[(&str, SourceKind)]) -> Vec<Analysed> {
 }
 
 impl State {
+    /// Inserts or replaces a file's entry (method ids already global).
+    fn put(&mut self, path: String, entry: FileEntry) {
+        if self.method_level {
+            if let Some(old) = self.files.get(&path) {
+                self.scoped.retract(&path, old);
+            }
+            self.scoped.add(&path, &entry);
+        }
+        self.files.insert(path, entry);
+    }
+
+    fn take(&mut self, path: &str) -> Option<FileEntry> {
+        let e = self.files.remove(path)?;
+        if self.method_level {
+            self.scoped.retract(path, &e);
+        }
+        Some(e)
+    }
+
     /// Applies analysed files to the Rubydex graph and the per-file cache.
     fn apply(&mut self, analysed: Vec<Analysed>) {
         for mut a in analysed {
@@ -109,34 +190,106 @@ impl State {
                 }
                 None => {}
             }
-            self.files.insert(a.path, a.entry);
+            self.put(a.path, a.entry);
         }
     }
 
-    fn output(&self, ws: &Workspace, t: Timings, files_analysed: usize) -> ExtractOutput {
-        let start = Instant::now();
-        let inflector = match self
+    fn inflector(&self, ws: &Workspace) -> Inflector {
+        match self
             .files
             .contains_key(INFLECTIONS)
             .then(|| std::fs::read_to_string(ws.abs(INFLECTIONS)))
         {
             Some(Ok(src)) => Inflector::new().with_app_rules(&src),
             _ => Inflector::new(),
-        };
-        let method_level = ws.config.ruby.method_level;
-        let builder = edges::EdgeBuilder::new(
+        }
+    }
+
+    fn builder<'a>(&'a self, ws: &'a Workspace) -> edges::EdgeBuilder<'a> {
+        edges::EdgeBuilder::new(
             &self.graph,
             &self.files,
             &ws.files,
             ws.config.ruby.namespace_definition_limit,
-            inflector,
-            method_level,
-        );
-        let (edges, es) = builder.run();
-        let edges_us = micros(start);
+            self.inflector(ws),
+            ws.config.ruby.method_level,
+        )
+    }
+
+    /// Every file's edges; resets the totals.
+    fn all_edges(&mut self, ws: &Workspace) -> Vec<Edge> {
+        let (edges, stats, over) = self.builder(ws).run();
+        self.kind_counts = kind_counts(&edges);
+        self.totals = stats;
+        self.over = over;
+        edges
+    }
+
+    /// Fast path: swaps in `body` (files whose fingerprint did not change)
+    /// and returns their new edges, patching the totals by the difference
+    /// between their old and new contributions. Sound because neither the
+    /// graph nor anything another file's edges read changes.
+    fn row_edges(&mut self, ws: &Workspace, body: Vec<Analysed>) -> (Vec<Edge>, Vec<String>) {
+        let mut body: Vec<(String, FileEntry)> = body.into_iter().map(|a| (a.path, a.entry)).collect();
+        body.sort_by(|a, b| a.0.cmp(&b.0));
+        let ((old_edges, old_stats, old_over), (new_edges, new_stats, new_over)) = {
+            let mut b = self.builder(ws);
+            let old = b.run_entries(body.iter().filter_map(|(p, _)| self.files.get_key_value(p).map(|(k, e)| (k.as_str(), e))));
+            let new = b.run_entries(body.iter().map(|(p, e)| (p.as_str(), e)));
+            (old, new)
+        };
+        self.totals.add(&old_stats, -1);
+        self.totals.add(&new_stats, 1);
+        let (old_k, new_k) = (kind_counts(&old_edges), kind_counts(&new_edges));
+        for i in 0..KINDS.len() {
+            self.kind_counts[i] = self.kind_counts[i] + new_k[i] - old_k[i];
+        }
+        for (d, (n, _)) in old_over {
+            if let Some(e) = self.over.get_mut(&d) {
+                e.0 -= n;
+            }
+        }
+        for (d, (n, c)) in new_over {
+            self.over.entry(d).or_insert((0, c)).0 += n;
+        }
+        self.over.retain(|_, (n, _)| *n > 0);
+        let paths: Vec<String> = body.iter().map(|(p, _)| p.clone()).collect();
+        for (p, e) in body {
+            self.put(p, e);
+        }
+        (new_edges, paths)
+    }
+
+    /// `RIPPLE_RUBY_VERIFY_ROWS=1` (tests): checks a fast-path result against
+    /// a full edge pass and panics on any difference.
+    fn verify_rows(&mut self, ws: &Workspace, rows: &[Edge], paths: &[String]) {
+        let (totals, kinds, over) = (self.totals.clone(), self.kind_counts, self.over.clone());
+        let all = self.all_edges(ws);
+        let want: Vec<&Edge> = all.iter().filter(|e| paths.binary_search(&e.from).is_ok()).collect();
+        let got: Vec<&Edge> = rows.iter().collect();
+        assert_eq!(want, got, "fast-path rows differ from a full edge pass");
+        assert_eq!(self.totals, totals, "fast-path edge stats differ");
+        assert_eq!(self.kind_counts, kinds, "fast-path edge kind counts differ");
+        assert_eq!(edges::namespace_counts(&self.over), edges::namespace_counts(&over), "fast-path namespace counts differ");
+    }
+
+    /// The output for `edges` (all edges, or with `replaced` the rows of
+    /// those files) and the current totals.
+    fn output(&mut self, ws: &Workspace, t: Timings, files_analysed: usize, edges: Vec<Edge>, edges_us: u64, replaced: Option<Vec<String>>) -> ExtractOutput {
+        let es = &self.totals;
+        let (namespace_canonical, namespace_no_canonical) = edges::namespace_counts(&self.over);
+        let method_level = ws.config.ruby.method_level;
         let start = Instant::now();
         let (scopes, mentions, method_stats) = if method_level {
-            let o = scoped::compute(&self.files, &self.names);
+            let o = self.scoped.refresh(&mut self.files, &self.names);
+            if verify_rows() {
+                let want = scoped::compute(&self.files, &self.names);
+                assert_eq!(o.scopes, want.scopes, "incremental scopes differ");
+                assert_eq!(o.stats, want.stats, "incremental method stats differ");
+                assert_eq!(o.mentions.unmentioned, want.mentions.unmentioned, "incremental unmentioned names differ");
+                let key = |t: &ripple_core::MentionTable| t.files.iter().map(|(p, m)| (p.clone(), std::sync::Arc::as_ptr(m))).collect::<Vec<_>>();
+                assert_eq!(key(&o.mentions), key(&want.mentions), "incremental mention table differs");
+            }
             (o.scopes, Some(std::sync::Arc::new(o.mentions)), o.stats)
         } else {
             // `method_level` off: exactly the file-level output (no scope ranges).
@@ -146,6 +299,7 @@ impl State {
         let start = Instant::now();
         let metrics = self.metrics_table();
         let metrics_us = micros(start);
+        let rest = Instant::now();
 
         let mut stats = BTreeMap::new();
         let mut put = |k: &str, v: u64| {
@@ -176,14 +330,8 @@ impl State {
             "ruby_refs_to_namespace_without_canonical",
             es.refs_to_namespace_without_canonical,
         );
-        put(
-            "ruby_namespaces_over_limit_canonical",
-            es.namespace_canonical,
-        );
-        put(
-            "ruby_namespaces_over_limit_no_canonical",
-            es.namespace_no_canonical,
-        );
+        put("ruby_namespaces_over_limit_canonical", namespace_canonical);
+        put("ruby_namespaces_over_limit_no_canonical", namespace_no_canonical);
         put("ruby_inferred_unresolved", es.inferred_unresolved);
         put("ruby_serializer_model_unresolved", es.serializer_model_unresolved);
         put("ruby_template_helper_calls", es.template_helper_calls);
@@ -216,13 +364,7 @@ impl State {
                 .filter(|w| w.code == "ruby_parse_error")
                 .count() as u64,
         );
-        for kind in [
-            EdgeKind::RubyConstant,
-            EdgeKind::RubyRequire,
-            EdgeKind::RailsInferred,
-            EdgeKind::RailsView,
-        ] {
-            let n = edges.iter().filter(|e| e.kind == kind).count() as u64;
+        for (kind, n) in KINDS.into_iter().zip(self.kind_counts) {
             put(
                 &format!(
                     "ruby_edges_{}",
@@ -247,6 +389,17 @@ impl State {
         }
         put("ruby_time_shadow_repair_us", t.shadow_us);
         put("ruby_shadow_docs_reindexed", t.shadow_docs as u64);
+        put("ruby_fast_files_this_run", t.fast_files as u64);
+        put("ruby_fast_ref_files_this_run", t.ref_files as u64);
+        put("ruby_slow_files_this_run", t.slow_files as u64);
+        put("ruby_slow_batch_rebuilt_this_run", u64::from(t.batch_rebuilt));
+        let http_requests = self.http_requests();
+        let warnings = self
+            .files
+            .values()
+            .flat_map(|e| e.warnings.iter().cloned())
+            .collect();
+        stats.insert("ruby_time_output_rest_us".into(), micros(rest));
 
         ExtractOutput {
             edges,
@@ -254,15 +407,12 @@ impl State {
                 scopes,
                 mentions,
                 metrics: metrics.into_iter().collect(),
-                http_requests: self.http_requests(),
+                http_requests,
                 ..Default::default()
             },
-            warnings: self
-                .files
-                .values()
-                .flat_map(|e| e.warnings.iter().cloned())
-                .collect(),
+            warnings,
             stats,
+            replaced,
         }
     }
 
@@ -378,19 +528,47 @@ impl State {
     /// on mastodon 12 names), so a single pass makes a fresh build differ
     /// from an update. Each extra pass retries every unresolved reference:
     /// about 60-70 ms on GitLab, 10 ms on mastodon.
+    ///
+    /// Sets `converged` when the fixed point was reached within the cap.
     fn resolve(&mut self) -> u64 {
         const MAX_PASSES: usize = 6;
         let start = Instant::now();
         let mut last = None;
+        self.converged = false;
         for _ in 0..MAX_PASSES {
             Resolver::new(&mut self.graph).resolve();
             let now = self.progress_marker();
             if last == Some(now) {
+                self.converged = true;
                 break;
             }
             last = Some(now);
         }
         micros(start)
+    }
+
+    /// Whether updating Rubydex for `docs` structurally changed files is
+    /// predicted to cost more than a fresh build. Merge time grows with the
+    /// batch (Rubydex scans every declaration per changed document) and is
+    /// predicted from past updates; before any, from the build time.
+    fn batch_too_costly(&self, docs: usize) -> bool {
+        if docs < 8 || self.cold_us == 0 {
+            return false;
+        }
+        let per_doc = if self.merge_docs_sum > 0.0 { self.merge_us_sum / self.merge_docs_sum } else { self.cold_us as f64 / 150.0 };
+        let predicted = per_doc * docs as f64 + self.resolve_us_avg.unwrap_or(0.0);
+        predicted > 1.25 * self.cold_us as f64
+    }
+
+    fn record_cost(&mut self, docs: usize, merge_us: u64, resolve_us: u64) {
+        if docs == 0 {
+            return;
+        }
+        const DECAY: f64 = 0.7;
+        self.merge_us_sum = DECAY * self.merge_us_sum + merge_us as f64;
+        self.merge_docs_sum = DECAY * self.merge_docs_sum + docs as f64;
+        let r = resolve_us as f64;
+        self.resolve_us_avg = Some(self.resolve_us_avg.map_or(r, |a| DECAY * a + (1.0 - DECAY) * r));
     }
 
     /// (resolved names, singleton classes).
@@ -411,44 +589,11 @@ impl State {
     }
 }
 
-impl Extractor for RubyExtractor {
-    fn name(&self) -> &'static str {
-        "ruby"
-    }
-
-    fn build(&mut self, ws: &Workspace) -> anyhow::Result<ExtractOutput> {
-        let todo: Vec<(&str, SourceKind)> = wanted_files(ws).into_iter().collect();
-        let mut t = Timings::default();
-        let start = Instant::now();
-        let analysed = analyse_all(ws, &todo);
-        t.analyse_us = micros(start);
-
-        let start = Instant::now();
-        let mut state = State {
-            graph: Graph::new(),
-            files: BTreeMap::new(),
-            inconsistent: HashSet::new(),
-            names: scoped::Interner::default(),
-            method_level: ws.config.ruby.method_level,
-        };
-        state.apply(analysed);
-        // Inserting in key order leaves B-tree leaves half full, and a
-        // `FileEntry` is 512 bytes: a bulk rebuild packs them (GitLab: -15 MB).
-        state.files = std::mem::take(&mut state.files).into_iter().collect();
-        t.merge_us = micros(start);
-        t.resolve_us = state.resolve();
-        state.inconsistent = shadow::misattached(&state.graph);
-
-        let out = state.output(ws, t, todo.len());
-        self.state = Some(state);
-        Ok(out)
-    }
-
-    /// Re-analyses changed files, updates the Rubydex graph in place and
-    /// recomputes all edges. Besides `changes`, any wanted file missing from
-    /// the cache is analysed and any cached file no longer wanted is dropped,
-    /// so the result always matches a fresh `build` of `ws.files`.
-    fn update(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
+impl RubyExtractor {
+    /// [`Extractor::update`] (`rows` false: all edges) or
+    /// [`Extractor::update_rows`] (`rows` true: on the fast path, only the
+    /// changed files' edges).
+    fn update_impl(&mut self, ws: &Workspace, changes: &ChangeSet, rows: bool) -> anyhow::Result<ExtractOutput> {
         let Some(state) = self.state.as_mut().filter(|s| s.method_level == ws.config.ruby.method_level) else {
             return self.build(ws);
         };
@@ -460,18 +605,10 @@ impl Extractor for RubyExtractor {
             .files
             .keys()
             .filter(|p| !wanted.contains_key(p.as_str()))
-            .chain(
-                changes
-                    .removed
-                    .iter()
-                    .filter(|p| state.files.contains_key(*p) && !wanted.contains_key(p.as_str())),
-            )
             .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
             .collect();
         for path in &stale {
-            if let Some(entry) = state.files.remove(path)
+            if let Some(entry) = state.take(path)
                 && entry.kind == Some(SourceKind::Ruby)
             {
                 state.graph.delete_document(path);
@@ -493,19 +630,69 @@ impl Extractor for RubyExtractor {
         let analysed = analyse_all(ws, &todo);
         t.analyse_us = micros(start);
 
+        // Same file set (so the same template index, helper map, Zeitwerk
+        // keys...) and the inflections unchanged: a file that keeps its
+        // fingerprint needs no Rubydex work.
+        let same_set = stale.is_empty() && todo.iter().all(|(p, k)| state.files.get(*p).is_some_and(|e| e.kind == Some(*k)));
+        // `RIPPLE_RUBY_NO_FAST=1`: every changed file takes the slow path (for comparisons).
+        let fast_ok = same_set && std::env::var_os("RIPPLE_RUBY_NO_FAST").is_none_or(|v| v != "1");
+        let (body, structural): (Vec<Analysed>, Vec<Analysed>) = analysed.into_iter().partition(|a| {
+            fast_ok
+                && a.path != INFLECTIONS
+                && state.files.get(&a.path).is_some_and(|e| e.fp_names == a.entry.fp_names)
+        });
+        t.ref_files = body.iter().filter(|a| state.files.get(&a.path).is_some_and(|e| e.fp != a.entry.fp)).count();
+        t.fast_files = body.len();
+        t.slow_files = structural.len();
+        let mut body = body;
+        for a in &mut body {
+            state.names.globalize(&mut a.entry.methods);
+        }
+
+        if same_set && structural.is_empty() && state.converged {
+            let start = Instant::now();
+            let (edges, replaced) = if rows {
+                let (edges, paths) = state.row_edges(ws, body);
+                if verify_rows() {
+                    state.verify_rows(ws, &edges, &paths);
+                }
+                (edges, Some(paths))
+            } else {
+                for a in body {
+                    state.put(a.path, a.entry);
+                }
+                (state.all_edges(ws), None)
+            };
+            let edges_us = micros(start);
+            return Ok(state.output(ws, t, todo.len(), edges, edges_us, replaced));
+        }
+
+        let structural_ruby: Vec<String> = structural
+            .iter()
+            .filter(|a| a.entry.kind == Some(SourceKind::Ruby))
+            .map(|a| a.path.clone())
+            .collect();
+        if state.batch_too_costly(structural_ruby.len()) {
+            let mut out = self.build(ws)?;
+            out.stats.insert("ruby_slow_batch_rebuilt_this_run".into(), 1);
+            out.stats.insert("ruby_fast_files_this_run".into(), t.fast_files as u64);
+            out.stats.insert("ruby_fast_ref_files_this_run".into(), t.ref_files as u64);
+            out.stats.insert("ruby_slow_files_this_run".into(), t.slow_files as u64);
+            return Ok(out);
+        }
+
         let start = Instant::now();
-        let changed_ruby = || {
-            todo.iter()
-                .filter(|(_, k)| *k == SourceKind::Ruby)
-                .map(|(p, _)| *p)
-        };
-        let before = shadow::constant_decls(&state.graph, changed_ruby());
-        state.apply(analysed);
+        let before = shadow::constant_decls(&state.graph, structural_ruby.iter().map(String::as_str));
+        // Files that kept their fingerprint keep their Rubydex document.
+        for a in body {
+            state.put(a.path, a.entry);
+        }
+        state.apply(structural);
         t.merge_us = micros(start);
         t.resolve_us = state.resolve();
 
         let start = Instant::now();
-        let changed: Vec<&str> = changed_ruby().collect();
+        let changed: Vec<&str> = structural_ruby.iter().map(String::as_str).collect();
         match state.repair_shadowing(ws, &changed, &before) {
             Some(n) => t.shadow_docs = n,
             None => {
@@ -516,6 +703,79 @@ impl Extractor for RubyExtractor {
             }
         }
         t.shadow_us = micros(start);
-        Ok(state.output(ws, t, todo.len()))
+        state.record_cost(structural_ruby.len(), t.merge_us, t.resolve_us + t.shadow_us);
+        let start = Instant::now();
+        let edges = state.all_edges(ws);
+        let edges_us = micros(start);
+        Ok(state.output(ws, t, todo.len(), edges, edges_us, None))
+    }
+}
+
+impl Extractor for RubyExtractor {
+    fn name(&self) -> &'static str {
+        "ruby"
+    }
+
+    fn build(&mut self, ws: &Workspace) -> anyhow::Result<ExtractOutput> {
+        let todo: Vec<(&str, SourceKind)> = wanted_files(ws).into_iter().collect();
+        let mut t = Timings::default();
+        let start = Instant::now();
+        let analysed = analyse_all(ws, &todo);
+        t.analyse_us = micros(start);
+        let t_analyse_us = t.analyse_us;
+
+        let start = Instant::now();
+        let mut state = State {
+            graph: Graph::new(),
+            files: BTreeMap::new(),
+            inconsistent: HashSet::new(),
+            names: scoped::Interner::default(),
+            method_level: ws.config.ruby.method_level,
+            totals: Default::default(),
+            kind_counts: [0; 4],
+            over: Default::default(),
+            converged: false,
+            merge_us_sum: 0.0,
+            merge_docs_sum: 0.0,
+            resolve_us_avg: None,
+            cold_us: 0,
+            scoped: Default::default(),
+        };
+        let build_start = start;
+        state.apply(analysed);
+        // Inserting in key order leaves B-tree leaves half full, and a
+        // `FileEntry` is 512 bytes: a bulk rebuild packs them (GitLab: -15 MB).
+        state.files = std::mem::take(&mut state.files).into_iter().collect();
+        t.merge_us = micros(start);
+        t.resolve_us = state.resolve();
+        state.inconsistent = shadow::misattached(&state.graph);
+        let start = Instant::now();
+        let edges = state.all_edges(ws);
+        let edges_us = micros(start);
+        let out = state.output(ws, t, todo.len(), edges, edges_us, None);
+        state.cold_us = micros(build_start) + t_analyse_us;
+        // Cost history carries over a rebuild of the same workspace.
+        if let Some(old) = self.state.take() {
+            state.merge_us_sum = old.merge_us_sum;
+            state.merge_docs_sum = old.merge_docs_sum;
+            state.resolve_us_avg = old.resolve_us_avg;
+        }
+        self.state = Some(state);
+        Ok(out)
+    }
+
+    /// Re-analyses changed files, updates the Rubydex graph in place (unless
+    /// every changed file kept its fingerprint) and recomputes all edges.
+    /// Besides `changes`, any wanted file missing from the cache is analysed
+    /// and any cached file no longer wanted is dropped, so the result always
+    /// matches a fresh `build` of `ws.files`.
+    fn update(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
+        self.update_impl(ws, changes, false)
+    }
+
+    /// [`Extractor::update`], but on the fast path only the changed files'
+    /// edges are computed and returned.
+    fn update_rows(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
+        self.update_impl(ws, changes, true)
     }
 }

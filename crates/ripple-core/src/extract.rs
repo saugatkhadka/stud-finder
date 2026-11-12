@@ -46,6 +46,19 @@ pub struct ExtractOutput {
     pub warnings: Vec<Warning>,
     /// Free-form counters for `ripple stats` (files_parsed, refs_resolved, ...).
     pub stats: BTreeMap<String, u64>,
+    /// Set only by [`Extractor::update_rows`]. `Some(files)` (sorted, unique):
+    /// `edges` holds only the out-edges of these files (their complete new
+    /// out-edges, grouped by file in this order; a file may have none), and
+    /// every other file's out-edges are exactly those of the previous output.
+    /// `None`: `edges` is the complete edge set.
+    pub replaced: Option<Vec<RelPath>>,
+}
+
+impl ExtractOutput {
+    /// Whether `edges` is the complete edge set (see [`ExtractOutput::replaced`]).
+    pub fn is_complete(&self) -> bool {
+        self.replaced.is_none()
+    }
 }
 
 /// A per-language analyser. One long-lived instance per workspace; it owns
@@ -62,6 +75,14 @@ pub trait Extractor: Send {
     fn update(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
         let _ = changes;
         self.build(ws)
+    }
+
+    /// Like [`Extractor::update`], but the result may list only the files
+    /// whose out-edges changed (see [`ExtractOutput::replaced`]); facts,
+    /// warnings and stats are complete as always. The engine uses this to
+    /// patch the graph instead of rebuilding it. Default: `update`.
+    fn update_rows(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
+        self.update(ws, changes)
     }
 }
 
