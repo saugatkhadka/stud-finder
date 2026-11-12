@@ -17,7 +17,7 @@
     "also_mentioned": { "type": "array", "items": { "$ref": "#/$defs/also_mentioned" } },
     "relies_on": { "type": "array", "items": { "$ref": "#/$defs/dependency" } },
     "further": { "$ref": "#/$defs/further" },
-    "tests": { "type": "array", "items": { "$ref": "#/$defs/test" } },
+    "tests": { "type": "array", "description": "Test files that depend on the change through the graph: changed tests and hop-1 tests by default (counts.tests has them all). Not coverage, and not a selection of tests to run.", "items": { "$ref": "#/$defs/test" } },
     "incomplete": { "type": "array", "items": { "$ref": "#/$defs/incomplete" } },
     "blind_spots": { "type": "array", "items": { "type": "string" } },
     "usually_changes_with": { "type": "array", "description": "At most 5 files outside the diff and its direct dependents that git history shows changing together with a changed file, best first. Absent when there are none or co-change is not ready (see `signals`).", "items": { "$ref": "#/$defs/cochange" } },

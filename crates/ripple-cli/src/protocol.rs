@@ -175,7 +175,7 @@ pub struct ImpactParams {
     pub color: bool,
     /// Cut every list to at most this many entries (counts stay complete).
     pub limit: Option<usize>,
-    /// No list budget: every dependent, further file, test and mention.
+    /// No list budget: dependents, further files, tests and mentions are not cut.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub all: bool,
     /// Always include the policy section (risk, rules, owners, areas) with

@@ -840,7 +840,7 @@ pub fn summary_line(r: &Report) -> String {
         let hops = if r.query.max_depth == 0 { "further hops".to_string() } else { format!("hops 2-{}", r.query.max_depth) };
         parts.push(format!("{} more at {hops}", c.further));
     }
-    parts.push(format!("{} test{} reach{} it", c.tests, plural(c.tests), if c.tests == 1 { "es" } else { "" }));
+    parts.push(format!("{} test{} depend{} on it", c.tests, plural(c.tests), if c.tests == 1 { "s" } else { "" }));
     if c.removed_methods > 0 {
         parts.push(format!("{} removed method{} still mentioned", c.removed_methods, plural(c.removed_methods)));
     }

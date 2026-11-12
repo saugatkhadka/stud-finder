@@ -133,6 +133,13 @@ mod tests {
         assert_eq!(validate(&schema, &json!({}))[0], "/: missing required field `a`");
     }
 
+    /// `docs/report.schema.json` is the published copy of the embedded schema.
+    #[test]
+    fn published_copy_matches_the_embedded_schema() {
+        let published = include_str!("../../../docs/report.schema.json");
+        assert!(published == REPORT_SCHEMA, "docs/report.schema.json differs: cp crates/ripple-policy/src/report.schema.json docs/");
+    }
+
     #[test]
     fn every_ref_in_the_report_schema_resolves() {
         let schema = report_schema();

@@ -2,9 +2,10 @@
 #
 # ripple builds a dependency graph of the repo (Ruby constants and requires,
 # Rails conventions, JS/TS imports, frontend API calls to Rails routes) and,
-# for a set of changed files, reports every file that depends on them,
-# directly or transitively. The rules below turn that "blast radius" into a
-# risk level (low / medium / high / critical) plus required actions.
+# for a set of changed files, reports the files it finds depending on them,
+# directly or transitively. This is static analysis, not a complete list.
+# The rules below turn that "blast radius" into a risk level
+# (low / medium / high / critical) plus required actions.
 #
 # Check this file with:   ripple config check
 # Try it on your changes: ripple impact            (working tree vs HEAD)
@@ -58,7 +59,7 @@ areas:
 #   - config/initializers/**
 #   - Gemfile.lock
 
-# Test files are listed under "tests to run" and never count toward the blast radius.
+# Test files are listed under "tests that depend on it" and never count toward the blast radius.
 # Setting this replaces the defaults (spec/**, test/**, __tests__, *.test.*, *.spec.*, *_spec.rb, *_test.rb, *.stories.*).
 # tests:
 #   - spec/**

@@ -205,11 +205,11 @@ struct ImpactArgs {
     query: QueryArgs,
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
-    /// List every dependent, further file, test and mention (default: each
-    /// list is cut to a small budget and ends with "+N more").
+    /// Do not cut the lists of dependents, further files, tests and mentions
+    /// (default: each list is cut to a small budget and ends with "+N more").
     #[arg(long, conflicts_with = "limit")]
     all: bool,
-    /// List at most N entries per list (counts stay complete).
+    /// List at most N entries per list (the counts are not cut).
     #[arg(long)]
     limit: Option<usize>,
     /// Wait until every file change made before this command is indexed
@@ -264,7 +264,7 @@ struct DependentsArgs {
     depth: Option<u32>,
     #[arg(long, value_enum)]
     min_confidence: Option<ConfArg>,
-    /// List everything (default: each list is cut to a small budget).
+    /// Do not cut the lists (default: each list is cut to a small budget).
     #[arg(long, conflicts_with = "limit")]
     all: bool,
     /// List at most N entries per list.
@@ -272,6 +272,13 @@ struct DependentsArgs {
     limit: Option<usize>,
     #[arg(long, value_enum, default_value_t = OutFormat::Text)]
     format: OutFormat,
+    /// Wait until every file change made before this command is indexed
+    /// (default: wait at most `daemon.max_wait_ms`, then answer marked stale).
+    #[arg(long, conflicts_with = "no_wait")]
+    sync: bool,
+    /// Answer from the current index at once (may be marked stale).
+    #[arg(long)]
+    no_wait: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -635,8 +642,8 @@ fn dependents(root: &Path, a: DependentsArgs, mut b: Backend) -> Result<u8> {
         min_confidence: a.min_confidence.map(Confidence::from),
         all: a.all,
         limit: a.limit,
-        sync: false,
-        no_wait: false,
+        sync: a.sync,
+        no_wait: a.no_wait,
         max_wait_ms: None,
     };
     let out = result_of(b.call("dependents", &serde_json::to_value(&params)?)?)?;
