@@ -17,8 +17,10 @@
 //! check, the query, policy evaluation and rendering.
 //!
 //! Methods and params:
-//! * `impact {files?: [path], changed?: [ChangedFile], diff?: {base?: ref, staged?: bool}, scopes?: [name], file_level?, max_depth?, min_confidence?, format?: json|text|markdown, color?, limit?, max_listed?, sync?, no_wait?, max_wait_ms?}`
+//! * `impact {files?: [path], changed?: [ChangedFile], diff?: {base?: ref, staged?: bool}, scopes?: [name], file_level?, max_depth?, min_confidence?, format?: json|text|markdown, color?, limit?, all?, policy?, max_listed?, sync?, no_wait?, max_wait_ms?}`
 //!   → the [`ripple_policy::Report`] for `format: json` (default), else a string.
+//!   Lists are cut to their default budget unless `all` (or `limit`);
+//!   `policy` always includes the policy section (`check` sets both).
 //!   `diff` asks the daemon to find the changed files itself, exactly as
 //!   `ripple impact [--base REF | --staged]` would (`{}` = working tree vs
 //!   HEAD); it excludes `files` and `changed`.
@@ -27,8 +29,11 @@
 //!   scopes from its own index, so line numbers always match what it indexed.
 //!   `scopes` limits the bare `files` (exactly one) to those methods / actions.
 //!   `file_level: true` ignores every scope (seeds and edges).
-//! * `dependents {file, scopes?, depth? = 1, min_confidence?}` / `dependencies {file, depth? = 1, min_confidence?}`
-//!   (plus `sync?`, `no_wait?`, `max_wait_ms?`, as for every query)
+//! * `dependents {file, scopes?, depth?, min_confidence?, all?, limit?}` → the
+//!   [`ripple_policy::Report`] of `file` (or those `scopes` of it) as if it
+//!   had changed: the same model as `impact`.
+//! * `dependencies {file, depth? = 1, min_confidence?}` → the files `file` depends on.
+//!   Every query also takes `sync?`, `no_wait?`, `max_wait_ms?`.
 //! * `why {from, to, scopes?}` → shortest dependency path between two files
 //!   (`scopes`: only through these methods / actions of `to`).
 //! * `areas {file}` → how the policy classifies a file.
@@ -148,8 +153,15 @@ pub struct ImpactParams {
     pub format: Format,
     /// ANSI colours for `format: text`.
     pub color: bool,
-    /// Truncate the impacted file list (and tests) to this many entries.
+    /// Cut every list to at most this many entries (counts stay complete).
     pub limit: Option<usize>,
+    /// No list budget: every dependent, further file, test and mention.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+    /// Always include the policy section (risk, rules, owners, areas) with
+    /// full evidence (`check`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub policy: bool,
     /// Files listed by text/markdown output (default `ci.max_listed`).
     pub max_listed: Option<usize>,
     pub sync: bool,
@@ -180,6 +192,12 @@ pub struct FileParams {
     pub scopes: Vec<String>,
     pub depth: Option<u32>,
     pub min_confidence: Option<Confidence>,
+    /// `dependents` only: no list budget.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+    /// `dependents` only: cut every list to this many entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
     pub sync: bool,
     pub no_wait: bool,
     pub max_wait_ms: Option<u64>,

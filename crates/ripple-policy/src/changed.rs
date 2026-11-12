@@ -66,11 +66,248 @@ pub struct ChangedFile {
     /// conservative default), `Some(names)` = only these methods / actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
+    /// `def` lines the diff added or removed (Ruby), so the query side can
+    /// tell a body edit from a signature change, an added method and a
+    /// removed or renamed one. Empty when there is no diff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub def_lines: Vec<DefLine>,
+    /// What kind of change this is, filled in by the query side from the
+    /// hunks, `def_lines` and the file's scope ranges ([`classify_change`]).
+    /// Not part of the wire format.
+    #[serde(skip)]
+    pub change: Option<Change>,
+}
+
+/// A line opening a method definition that the diff added or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefLine {
+    /// On the old side (removed), else on the new side (added).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+    /// New-side line: the added line itself; for a removed line, the
+    /// new-side `start` of its hunk (which identifies the hunk).
+    pub line: u32,
+    /// The source line, trimmed.
+    pub text: String,
+}
+
+/// How a changed file changed, from the diff hunks and the file's method
+/// ranges. One `kind` (the most significant facet), plus every facet found.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    pub kind: ChangeKind,
+    /// Methods whose body changed (the `def` line itself did not).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// Methods whose `def` line changed (arguments, receiver, modifiers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_methods: Vec<String>,
+    /// Methods whose `def` was removed and that the file no longer defines
+    /// (removed or renamed; a method moved within the file is not here).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_methods: Vec<String>,
+    /// A line outside every method changed (constants, DSL, callbacks, includes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub class_body: bool,
+    /// Why the change is treated as whole-file (`kind: whole_file` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_file: Option<WholeFileReason>,
+}
+
+/// Ordered by significance: `kind` is the greatest facet present.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// Only lines inside method bodies changed.
+    Body,
+    MethodAdded,
+    /// Lines outside every method changed.
+    ClassBody,
+    /// A `def` line changed and the method kept its name.
+    Signature,
+    /// A method was removed or renamed.
+    MethodRemoved,
+    /// No finer information: see [`WholeFileReason`].
+    #[default]
+    WholeFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WholeFileReason {
+    Added,
+    Deleted,
+    Renamed,
+    /// No textual diff (explicit `--files`, binary, mode change).
+    NoDiff,
+    /// Not Ruby (JS/TS, templates, other files): no method ranges.
+    UnsupportedLanguage,
+}
+
+/// The method name a source line defines, if it opens a Ruby method:
+/// `def x`, `def self.x`, `def Foo.x`, `def x=(v)`, `def ==(o)`, `def x = 1`,
+/// and with leading modifiers (`private def x`, `memoize def x`).
+pub fn def_name(line: &str) -> Option<String> {
+    let mut rest = line.trim_start();
+    for _ in 0..3 {
+        if let Some(r) = rest.strip_prefix("def")
+            && (r.starts_with([' ', '\t', '(']))
+        {
+            let r = r.trim_start();
+            // A receiver (`self.`, `Foo.`, `Foo::Bar.`) before the name.
+            let r = match r.find('.') {
+                Some(i) if i > 0 && r[..i].chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':') => &r[i + 1..],
+                _ => r,
+            };
+            let end = r.find(|c: char| c == '(' || c == ';' || c.is_whitespace()).unwrap_or(r.len());
+            let name = &r[..end];
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+        // One lowercase modifier word (`private`, `protected`, `memoize`, ...).
+        let w = rest.find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')).unwrap_or(rest.len());
+        let after = &rest[w..];
+        if w == 0 || !after.starts_with([' ', '\t']) {
+            return None;
+        }
+        rest = after.trim_start();
+    }
+    None
+}
+
+/// Every method name `text` (a whole Ruby file) defines, sorted.
+pub fn def_names(text: &str) -> Vec<String> {
+    let mut v: Vec<String> = text.lines().filter_map(def_name).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Classifies a changed file (see [`Change`]).
+///
+/// * `ranges`: the new file's method ranges (`None` = none known).
+/// * `new_defs`: every method name the new file defines (sorted), when the
+///   caller could read it; otherwise the names in `ranges` and the added
+///   `def` lines stand in.
+pub fn classify_change(f: &ChangedFile, ranges: Option<&[ScopeRange]>, new_defs: Option<&[String]>) -> Change {
+    let mut c = Change::default();
+    let removed_names: Vec<(String, &str)> = f.def_lines.iter().filter(|d| d.removed).filter_map(|d| Some((def_name(&d.text)?, d.text.as_str()))).collect();
+    let added_names: Vec<(String, &str)> = f.def_lines.iter().filter(|d| !d.removed).filter_map(|d| Some((def_name(&d.text)?, d.text.as_str()))).collect();
+    let defined = |n: &str| -> bool {
+        match new_defs {
+            Some(d) => d.binary_search_by(|x| x.as_str().cmp(n)).is_ok(),
+            None => added_names.iter().any(|(a, _)| a == n) || ranges.is_some_and(|r| r.iter().any(|s| s.name == n)),
+        }
+    };
+    let push = |v: &mut Vec<String>, n: &str| {
+        if !v.iter().any(|x| x == n) {
+            v.push(n.to_string());
+        }
+    };
+    // Removed methods are reported whatever the status (a deleted file
+    // removes every method it had).
+    for (n, _) in &removed_names {
+        if f.status == FileStatus::Deleted || !defined(n) {
+            push(&mut c.removed_methods, n);
+        }
+    }
+    let finish = |mut c: Change| {
+        for v in [&mut c.methods, &mut c.signatures, &mut c.added_methods, &mut c.removed_methods] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        c
+    };
+    let whole = match f.status {
+        FileStatus::Added => Some(WholeFileReason::Added),
+        FileStatus::Deleted => Some(WholeFileReason::Deleted),
+        FileStatus::Renamed => Some(WholeFileReason::Renamed),
+        FileStatus::Modified => None,
+    };
+    if let Some(reason) = whole {
+        if f.status == FileStatus::Added {
+            for (n, _) in &added_names {
+                push(&mut c.added_methods, n);
+            }
+        }
+        c.kind = ChangeKind::WholeFile;
+        c.whole_file = Some(reason);
+        return finish(c);
+    }
+    let Some(hunks) = f.hunks.as_deref().filter(|h| !h.is_empty()) else {
+        // `--scope` without a diff: the caller says which methods changed.
+        if let Some(s) = f.scopes.as_ref().filter(|s| !s.is_empty()) {
+            c.kind = ChangeKind::Body;
+            c.methods = s.clone();
+            return finish(c);
+        }
+        c.kind = ChangeKind::WholeFile;
+        c.whole_file = Some(WholeFileReason::NoDiff);
+        return finish(c);
+    };
+    let ranges = ranges.unwrap_or(&[]);
+    if ranges.is_empty() && f.def_lines.is_empty() && crate::lang::Language::of(&f.path) != crate::lang::Language::Ruby {
+        c.kind = ChangeKind::WholeFile;
+        c.whole_file = Some(WholeFileReason::UnsupportedLanguage);
+        return finish(c);
+    }
+    for h in hunks {
+        let (a, b) = (h.start, h.start + h.count.max(1) - 1);
+        let added_here = h.count > 0 && f.def_lines.iter().any(|d| !d.removed && (a..=b).contains(&d.line));
+        let removed_here = h.removes_definition || f.def_lines.iter().any(|d| d.removed && d.line == h.start);
+        let def_line_here = h.count > 0 && ranges.iter().any(|m| (a..=b).contains(&m.start));
+        let inside: Vec<&ScopeRange> = hunk_scopes(h, ranges).collect();
+        for m in &inside {
+            push(&mut c.methods, &m.name);
+        }
+        if def_line_here && !added_here && !removed_here {
+            // A `def` line changed in a way `def_name` did not see (or the
+            // diff has no `def_lines`): its method's signature.
+            for m in ranges.iter().filter(|m| (a..=b).contains(&m.start)) {
+                push(&mut c.signatures, &m.name);
+            }
+        }
+        if inside.is_empty() && !added_here && !removed_here && !def_line_here {
+            c.class_body = true;
+        }
+    }
+    for (n, text) in &added_names {
+        let before: Vec<&str> = removed_names.iter().filter(|(r, _)| r == n).map(|(_, t)| *t).collect();
+        if before.is_empty() {
+            push(&mut c.added_methods, n);
+        } else if before.contains(text) {
+            // The same `def` line removed and added: moved or rewritten.
+            push(&mut c.methods, n);
+        } else {
+            push(&mut c.signatures, n);
+        }
+    }
+    for (n, _) in &removed_names {
+        // Removed here but still defined, with no added `def` of that name:
+        // e.g. one of two definitions dropped. The definition changed.
+        if defined(n) && !added_names.iter().any(|(a, _)| a == n) {
+            push(&mut c.signatures, n);
+        }
+    }
+    c.methods.retain(|m| !c.signatures.contains(m) && !c.added_methods.contains(m));
+    c.kind = if !c.removed_methods.is_empty() {
+        ChangeKind::MethodRemoved
+    } else if !c.signatures.is_empty() {
+        ChangeKind::Signature
+    } else if c.class_body {
+        ChangeKind::ClassBody
+    } else if !c.added_methods.is_empty() {
+        ChangeKind::MethodAdded
+    } else {
+        ChangeKind::Body
+    };
+    finish(c)
 }
 
 impl ChangedFile {
     pub fn new(path: impl Into<RelPath>, status: FileStatus) -> Self {
-        Self { path: path.into(), status, old_path: None, added: None, deleted: None, first_line: None, hunks: None, scopes: None }
+        Self { path: path.into(), status, old_path: None, added: None, deleted: None, first_line: None, hunks: None, scopes: None, def_lines: Vec::new(), change: None }
     }
     pub fn modified(path: impl Into<RelPath>) -> Self {
         Self::new(path, FileStatus::Modified)
@@ -253,5 +490,122 @@ mod tests {
         assert_eq!(scopes_for_hunks(FileStatus::Modified, Some(&[]), Some(&ranges())), None, "no hunks (mode change)");
         assert_eq!(scopes_for_hunks(FileStatus::Modified, Some(&h), None), None, "file has no scopes");
         assert_eq!(scopes_for_hunks(FileStatus::Modified, Some(&h), Some(&[])), None);
+    }
+
+    // ---- change classification -------------------------------------------
+
+    fn def(removed: bool, line: u32, text: &str) -> DefLine {
+        DefLine { removed, line, text: text.into() }
+    }
+
+    fn file(hunks: &[(u32, u32)], defs: Vec<DefLine>) -> ChangedFile {
+        let mut f = ChangedFile::modified("app/models/purchase.rb");
+        f.hunks = Some(hunks.iter().map(|&(s, c)| Hunk::new(s, c)).collect());
+        f.def_lines = defs;
+        f
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn def_names_cover_ruby_forms() {
+        assert_eq!(def_name("  def refund!(amount)").as_deref(), Some("refund!"));
+        assert_eq!(def_name("def self.find_by_token(t)").as_deref(), Some("find_by_token"));
+        assert_eq!(def_name("def Purchase.build").as_deref(), Some("build"));
+        assert_eq!(def_name("  private def helper").as_deref(), Some("helper"));
+        assert_eq!(def_name("protected def a = 1").as_deref(), Some("a"));
+        assert_eq!(def_name("def total=(v)").as_deref(), Some("total="));
+        assert_eq!(def_name("def ==(o)").as_deref(), Some("=="));
+        assert_eq!(def_name("define_method(:x)"), None);
+        assert_eq!(def_name("# def commented"), None);
+        assert_eq!(def_name("undef x"), None);
+        assert_eq!(def_names("def b\nend\ndef a\nend\ndef self.a; end\n"), strs(&["a", "b"]));
+    }
+
+    #[test]
+    fn body_change() {
+        let c = classify_change(&file(&[(5, 1), (10, 1)], vec![]), Some(&ranges()), None);
+        assert_eq!((c.kind, c.methods.clone(), c.class_body), (ChangeKind::Body, strs(&["charge!", "refund!"]), false));
+        assert!(c.removed_methods.is_empty() && c.signatures.is_empty() && c.whole_file.is_none());
+    }
+
+    #[test]
+    fn class_body_change() {
+        let c = classify_change(&file(&[(2, 1), (5, 1)], vec![]), Some(&ranges()), None);
+        assert_eq!((c.kind, c.methods.clone(), c.class_body), (ChangeKind::ClassBody, strs(&["refund!"]), true));
+    }
+
+    #[test]
+    fn signature_change() {
+        let f = file(&[(4, 1)], vec![def(true, 4, "def refund!(amount)"), def(false, 4, "def refund!(amount, reason)")]);
+        let c = classify_change(&f, Some(&ranges()), Some(&strs(&["charge!", "refund!"])));
+        assert_eq!((c.kind, c.signatures.clone()), (ChangeKind::Signature, strs(&["refund!"])));
+        assert!(c.removed_methods.is_empty() && c.methods.is_empty());
+        // A def line changed without def_lines (e.g. `--files` with ranges only) is a signature too.
+        let c = classify_change(&file(&[(4, 1)], vec![]), Some(&ranges()), None);
+        assert_eq!((c.kind, c.signatures.clone()), (ChangeKind::Signature, strs(&["refund!"])));
+    }
+
+    #[test]
+    fn rename_is_a_removed_method() {
+        let mut f = file(&[(4, 1)], vec![def(true, 4, "def refund!"), def(false, 4, "def refund_all!")]);
+        f.hunks.as_mut().unwrap()[0].removes_definition = true;
+        let new_ranges = vec![r("refund_all!", 4, 7), r("charge!", 9, 11)];
+        let c = classify_change(&f, Some(&new_ranges), Some(&strs(&["charge!", "refund_all!"])));
+        assert_eq!(c.kind, ChangeKind::MethodRemoved);
+        assert_eq!((c.removed_methods.clone(), c.added_methods.clone()), (strs(&["refund!"]), strs(&["refund_all!"])));
+        // Without the new file's text the added def and the ranges stand in.
+        let c = classify_change(&f, Some(&new_ranges), None);
+        assert_eq!(c.removed_methods, strs(&["refund!"]));
+    }
+
+    #[test]
+    fn moved_within_the_file_is_not_removed() {
+        // refund! (old lines 4-7) deleted, then re-added verbatim after charge!.
+        let f = file(&[(3, 0), (9, 4)], vec![def(true, 3, "def refund!"), def(false, 9, "def refund!")]);
+        let new_ranges = vec![r("charge!", 4, 6), r("refund!", 9, 12)];
+        let c = classify_change(&f, Some(&new_ranges), Some(&strs(&["charge!", "refund!"])));
+        assert_eq!((c.kind, c.methods.clone()), (ChangeKind::Body, strs(&["refund!"])));
+        assert!(c.removed_methods.is_empty() && c.added_methods.is_empty() && !c.class_body);
+    }
+
+    #[test]
+    fn class_methods_and_private_methods() {
+        // `def self.lookup` removed, `private def helper` removed; both gone from the file.
+        let f = file(&[(8, 0), (3, 0)], vec![def(true, 3, "def self.lookup(id)"), def(true, 8, "private def helper")]);
+        let c = classify_change(&f, Some(&ranges()), Some(&strs(&["charge!", "refund!"])));
+        assert_eq!((c.kind, c.removed_methods.clone()), (ChangeKind::MethodRemoved, strs(&["helper", "lookup"])));
+        // An added private method.
+        let f = file(&[(12, 3)], vec![def(false, 12, "private def audit")]);
+        let c = classify_change(&f, Some(&ranges()), Some(&strs(&["audit", "charge!", "refund!"])));
+        assert_eq!((c.kind, c.added_methods.clone()), (ChangeKind::MethodAdded, strs(&["audit"])));
+    }
+
+    #[test]
+    fn whole_file_changes() {
+        let mut f = file(&[], vec![def(true, 0, "def refund!"), def(true, 0, "def self.lookup")]);
+        f.status = FileStatus::Deleted;
+        f.hunks = None;
+        let c = classify_change(&f, None, None);
+        assert_eq!((c.kind, c.whole_file, c.removed_methods.clone()), (ChangeKind::WholeFile, Some(WholeFileReason::Deleted), strs(&["lookup", "refund!"])));
+
+        let mut f = file(&[(1, 5)], vec![def(false, 2, "def a")]);
+        f.status = FileStatus::Added;
+        let c = classify_change(&f, None, None);
+        assert_eq!((c.kind, c.whole_file, c.added_methods.clone()), (ChangeKind::WholeFile, Some(WholeFileReason::Added), strs(&["a"])));
+
+        let mut f = file(&[(5, 1)], vec![]);
+        f.path = "app/javascript/a.tsx".into();
+        assert_eq!(classify_change(&f, None, None).whole_file, Some(WholeFileReason::UnsupportedLanguage));
+
+        let mut f = file(&[], vec![]);
+        f.hunks = None;
+        assert_eq!(classify_change(&f, Some(&ranges()), None).whole_file, Some(WholeFileReason::NoDiff));
+        // `--scope` without a diff: the caller's scopes are the changed bodies.
+        let f = f.in_scopes(["charge!"]);
+        let c = classify_change(&f, Some(&ranges()), None);
+        assert_eq!((c.kind, c.methods.clone()), (ChangeKind::Body, strs(&["charge!"])));
     }
 }

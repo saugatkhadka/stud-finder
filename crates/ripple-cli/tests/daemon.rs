@@ -35,16 +35,20 @@ fn edges_of(engine_snap: &ripple_cli::engine::Snapshot) -> BTreeSet<(String, Str
 fn build_then_query() {
     let repo = chain();
     let d = Daemon::start(&repo.root);
-    let (r, g) = d.call("impact", json!({"files": ["lib/a.txt"]}));
+    let (r, g) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"]}));
     assert_eq!(g, 1);
-    assert_eq!(r["schema_version"], 1);
+    assert_eq!(r["schema_version"], 2);
+    assert_schema(&r);
     assert_eq!(impacted_of(&r), vec!["lib/b.txt", "lib/c.txt"]);
-    assert_eq!(r["tests_to_run"][0]["file"], "spec/a_spec.txt");
-    assert_eq!(r["tests_to_run"].as_array().unwrap().len(), 1);
+    assert_eq!(r["tests"][0]["file"], "spec/a_spec.txt");
+    assert_eq!(r["tests"].as_array().unwrap().len(), 1);
     // reaches critical area `core` at depth 2 -> medium (default rule), not high (that needs 1 hop).
-    assert_eq!(r["risk"], "medium");
+    assert_eq!(risk_of(&r), "medium");
     let (deps, _) = d.call("dependents", json!({"file": "lib/a.txt"}));
-    assert_eq!(files_of(&deps), vec!["lib/b.txt", "spec/a_spec.txt"]);
+    assert_schema(&deps);
+    let direct: Vec<&str> = deps["dependents"].as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap()).collect();
+    assert_eq!(direct, vec!["lib/b.txt"]);
+    assert_eq!(tests_of(&deps), vec!["spec/a_spec.txt"]);
     let (why, _) = d.call("why", json!({"from": "lib/c.txt", "to": "lib/a.txt"}));
     assert_eq!(why["found"], true);
     assert_eq!(why["path"].as_array().unwrap().len(), 3);
@@ -61,11 +65,11 @@ fn edit_then_query_reflects_edit() {
     let d = Daemon::start(&repo.root);
     // Let the initial index finish first: a write it already sees would not
     // need a second generation.
-    let (r, _) = d.call("impact", json!({"files": ["lib/a.txt"]}));
+    let (r, _) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"]}));
     assert_eq!(impacted_of(&r), vec!["lib/b.txt", "lib/c.txt"]);
     // d now depends on c: impact of a grows by one, without naming d in the request (sync drains the watcher).
     repo.write("app/d.txt", "use lib/c.txt\n");
-    let (r, g) = d.call("impact", json!({"files": ["lib/a.txt"], "sync": true}));
+    let (r, g) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"], "sync": true}));
     assert!(g >= 2, "generation {g}");
     assert_eq!(impacted_of(&r), vec!["app/d.txt", "lib/b.txt", "lib/c.txt"]);
     // Naming the edited file is enough even without sync.
@@ -78,7 +82,7 @@ fn edit_then_query_reflects_edit() {
     assert_eq!(files_of(&r), vec!["lib/a.txt"]);
     // Deleted file named in the request: reported, and its former dependents are kept (tombstone).
     repo.remove("lib/a.txt");
-    let (r, _) = d.call("impact", json!({"files": ["lib/a.txt"]}));
+    let (r, _) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"]}));
     let changed = &r["changed"][0];
     assert_eq!(changed["path"], "lib/a.txt");
     assert_eq!(changed["status"], "deleted");
@@ -120,7 +124,7 @@ fn freshness_loop_sync_unnamed() {
         repo.write("t/b.txt", if on { "use t/a.txt\n" } else { "\n" });
         let r = c.call("dependents", &json!({"file": "t/a.txt", "sync": true})).unwrap();
         let v: serde_json::Value = serde_json::from_str(&r.result.unwrap()).unwrap();
-        assert_eq!(v["count"], if on { 1 } else { 0 }, "iteration {i}");
+        assert_eq!(v["counts"]["dependents"], if on { 1 } else { 0 }, "iteration {i}");
     }
 }
 
@@ -158,7 +162,7 @@ fn concurrent_queries_during_rebuild() {
                 let mut stale = 0;
                 for _ in 0..25 {
                     let t = Instant::now();
-                    let r = c.call("impact", &json!({"files": ["lib/b.txt"], "max_wait_ms": 20})).unwrap();
+                    let r = c.call("impact", &json!({"all": true, "files": ["lib/b.txt"], "max_wait_ms": 20})).unwrap();
                     assert!(r.result.is_ok());
                     if r.fresh.stale {
                         assert!(r.fresh.pending.contains(&"app/d.txt".to_string()), "{:?}", r.fresh);
@@ -197,7 +201,7 @@ fn sync_waits_for_running_pass_on_unnamed_file() {
     repo.write("t/b.txt", "use t/a.txt\n");
     wait_indexing(&d);
     let (v, reply) = d.call_full("dependents", json!({"file": "t/a.txt", "sync": true}));
-    assert_eq!(v["count"], 1, "a sync answer missed an edit made before it");
+    assert_eq!(v["counts"]["dependents"], 1, "a sync answer missed an edit made before it");
     assert!(!reply.fresh.stale);
     d.delay.store(0, Ordering::SeqCst);
 }
@@ -222,7 +226,7 @@ fn bounded_wait_stale_flag_sync_and_no_wait() {
     assert!(reply.fresh.synced);
     assert_eq!(reply.fresh.pending, vec!["app/d.txt", "lib/new.txt"], "{:?}", reply.fresh);
     assert_eq!(reply.fresh.pending_count, 2);
-    assert_eq!(files_of(&v), vec!["lib/b.txt", "spec/a_spec.txt"], "answered from the previous snapshot");
+    assert_eq!(dependents_of(&v), vec!["lib/b.txt", "spec/a_spec.txt"], "answered from the previous snapshot");
     // no_wait: answers at once, also stale.
     let t = Instant::now();
     let (_, reply) = d.call_full("dependents", json!({"file": "lib/a.txt", "no_wait": true}));
@@ -231,7 +235,7 @@ fn bounded_wait_stale_flag_sync_and_no_wait() {
     // sync: waits, fresh, sees both edits.
     let (v, reply) = d.call_full("dependents", json!({"file": "lib/a.txt", "sync": true}));
     assert!(!reply.fresh.stale && reply.fresh.pending.is_empty() && reply.fresh.pending_count == 0, "{:?}", reply.fresh);
-    assert_eq!(files_of(&v), vec!["app/d.txt", "lib/b.txt", "lib/new.txt", "spec/a_spec.txt"]);
+    assert_eq!(dependents_of(&v), vec!["app/d.txt", "lib/b.txt", "lib/new.txt", "spec/a_spec.txt"]);
     // Impact reports the pending count in the report too.
     d.delay.store(0, Ordering::SeqCst);
     let (r, reply) = d.call_full("impact", json!({"files": ["lib/a.txt"]}));
@@ -241,7 +245,7 @@ fn bounded_wait_stale_flag_sync_and_no_wait() {
     repo.write("app/d.txt", "nothing\n");
     let (v, reply) = d.call_full("dependents", json!({"file": "lib/a.txt", "max_wait_ms": 5000}));
     assert!(!reply.fresh.stale);
-    assert_eq!(files_of(&v), vec!["lib/b.txt", "lib/new.txt", "spec/a_spec.txt"]);
+    assert_eq!(dependents_of(&v), vec!["lib/b.txt", "lib/new.txt", "spec/a_spec.txt"]);
 }
 
 /// A stale `impact` does not map hunks of a pending file (new contents) onto
@@ -299,7 +303,7 @@ fn edits_coalesce_into_one_pass() {
         .collect();
     handles.into_iter().for_each(|h| h.join().unwrap());
     let (v, _) = d.call("dependents", json!({"file": "lib/a.txt", "sync": true}));
-    assert_eq!(v["count"], 43, "{v}");
+    assert_eq!(v["counts"]["dependents"].as_u64().unwrap() + v["counts"]["tests_direct"].as_u64().unwrap(), 43, "{v}");
     let n = passes(&d) - p0;
     // The pass for d.txt, then one (rarely two, if it starts between edits) for the 40 files.
     assert!(n <= 3, "{n} passes for 41 edits");
@@ -372,7 +376,7 @@ fn incremental_matches_cold_build() {
 fn wrong_case_name_is_not_a_new_file() {
     let repo = chain();
     let d = Daemon::start(&repo.root);
-    let r = d.client().call("impact", &json!({"files": ["LIB/A.TXT", "lib/A.txt"]})).unwrap();
+    let r = d.client().call("impact", &json!({"all": true, "files": ["LIB/A.TXT", "lib/A.txt"]})).unwrap();
     assert!(r.result.is_ok());
     let (s, _) = d.call("stats", json!(null));
     assert_eq!(s["files"], 6, "{s}");

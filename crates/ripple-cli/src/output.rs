@@ -95,14 +95,13 @@ pub fn areas(v: &Value) -> String {
         o.push_str(&format!("  area {} ({}) {}\n", s(&a["area"]), s(&a["tier"]), owners.join(" ")));
     }
     o.push_str(&format!(
-        "  language {}  test {}  global {}  ignored {}  indexed {}  dependents {}  dependencies {}\n",
+        "  language {}  test {}  global {}  ignored {}  indexed {}  dependents {}\n",
         s(&v["language"]),
         v["is_test"],
         v["is_global"],
         v["is_ignored"],
         v["in_graph"],
-        v["dependents"],
-        v["dependencies"]
+        v["dependents"]
     ));
     o
 }

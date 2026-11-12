@@ -36,10 +36,12 @@ enum Cmd {
     Impact(ImpactArgs),
     /// CI entry point: impact of the branch vs a base ref; exits 1 at or above `--fail-on`.
     Check(CheckArgs),
-    /// Files that depend on FILE.
-    Dependents(NeighbourArgs),
+    /// What depends on FILE (or some of its methods): the `impact` report of FILE as if it changed.
+    Dependents(DependentsArgs),
     /// Files FILE depends on.
     Dependencies(NeighbourArgs),
+    /// Print the JSON Schema of the report (`impact`, `dependents`, `check --format json`).
+    Schema,
     /// Shortest dependency path between two files (FROM depends on TO, or the reverse).
     Why {
         from: String,
@@ -169,7 +171,11 @@ struct ImpactArgs {
     query: QueryArgs,
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
-    /// List at most N impacted files / tests (counts stay complete).
+    /// List every dependent, further file, test and mention (default: each
+    /// list is cut to a small budget and ends with "+N more").
+    #[arg(long, conflicts_with = "limit")]
+    all: bool,
+    /// List at most N entries per list (counts stay complete).
     #[arg(long)]
     limit: Option<usize>,
     /// Wait until every file change made before this command is indexed
@@ -214,11 +220,29 @@ struct CheckArgs {
 }
 
 #[derive(Args)]
-struct NeighbourArgs {
+struct DependentsArgs {
     file: String,
-    /// `dependents` only: start from this method / controller action of FILE (repeatable).
+    /// Start from this method / controller action of FILE (repeatable).
     #[arg(long = "scope", value_name = "NAME")]
     scopes: Vec<String>,
+    /// Maximum hops (0 = unlimited; default from ripple.yml).
+    #[arg(long)]
+    depth: Option<u32>,
+    #[arg(long, value_enum)]
+    min_confidence: Option<ConfArg>,
+    /// List everything (default: each list is cut to a small budget).
+    #[arg(long, conflicts_with = "limit")]
+    all: bool,
+    /// List at most N entries per list.
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long, value_enum, default_value_t = OutFormat::Text)]
+    format: OutFormat,
+}
+
+#[derive(Args)]
+struct NeighbourArgs {
+    file: String,
     /// Hops to follow (0 = unlimited).
     #[arg(long, default_value_t = 1)]
     depth: u32,
@@ -304,8 +328,12 @@ fn run(cli: Cli) -> Result<u8> {
     match cli.cmd {
         Cmd::Impact(a) => impact(&root, a, open(true)?),
         Cmd::Check(a) => check(&root, a, cli.no_daemon),
-        Cmd::Dependents(a) => neighbours(&root, a, false, open(true)?),
-        Cmd::Dependencies(a) => neighbours(&root, a, true, open(true)?),
+        Cmd::Dependents(a) => dependents(&root, a, open(true)?),
+        Cmd::Dependencies(a) => dependencies(&root, a, open(true)?),
+        Cmd::Schema => {
+            stdout_write(ripple_policy::schema::REPORT_SCHEMA)?;
+            Ok(0)
+        }
         Cmd::Why { from, to, scopes, format } => why(&root, &from, &to, &scopes, format, open(true)?),
         Cmd::Areas { file, format } => {
             let mut b = open(true)?;
@@ -388,8 +416,9 @@ fn impact(root: &Path, a: ImpactArgs, mut backend: Backend) -> Result<u8> {
     p.min_confidence = a.query.min_confidence.map(Into::into);
     p.file_level = a.query.file_level;
     p.format = a.format;
-    p.color = a.format == Format::Text && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    p.color = a.format == Format::Text && use_color();
     p.limit = a.limit;
+    p.all = a.all;
     p.sync = a.sync;
     p.no_wait = a.no_wait;
     let reply = call_impact(root, &mut backend, &mut p)?;
@@ -399,6 +428,10 @@ fn impact(root: &Path, a: ImpactArgs, mut backend: Backend) -> Result<u8> {
         Format::Text | Format::Markdown => stdout_write(&serde_json::from_str::<String>(&out)?)?,
     }
     Ok(0)
+}
+
+fn use_color() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
 fn check(root: &Path, a: CheckArgs, no_daemon: bool) -> Result<u8> {
@@ -428,9 +461,13 @@ fn check(root: &Path, a: CheckArgs, no_daemon: bool) -> Result<u8> {
     p.min_confidence = a.query.min_confidence.map(Into::into);
     p.file_level = a.query.file_level;
     p.format = Format::Json;
+    // CI sees everything: the full report and the policy section, always.
+    p.all = true;
+    p.policy = true;
     let raw = result_of(call_impact(root, &mut backend, &mut p)?)?;
     let report: Report = serde_json::from_str(&raw).context("decoding the impact report")?;
     let max_listed = loaded.config.ci.max_listed;
+    let risk = report.policy.as_ref().map_or(Risk::Low, |p| p.risk);
 
     if let Some(path) = &a.markdown_out {
         std::fs::write(path, render::markdown::render(&report, max_listed)).with_context(|| format!("writing {}", path.display()))?;
@@ -438,7 +475,7 @@ fn check(root: &Path, a: CheckArgs, no_daemon: bool) -> Result<u8> {
     if let Some(path) = &a.json_out {
         std::fs::write(path, &raw).with_context(|| format!("writing {}", path.display()))?;
     }
-    let failing = fail_on.is_some_and(|f| report.risk >= f);
+    let failing = fail_on.is_some_and(|f| risk >= f);
     match format {
         CheckFormat::Json => stdout_write(&raw)?,
         CheckFormat::Markdown => stdout_write(&render::markdown::render(&report, max_listed))?,
@@ -449,13 +486,13 @@ fn check(root: &Path, a: CheckArgs, no_daemon: bool) -> Result<u8> {
             let mut stdout = std::io::stdout().lock();
             render::github::emit(&report, max_listed, &mut stdout, summary.as_deref(), output.as_deref())?;
             if failing {
-                writeln!(stdout, "::error title=ripple::Change risk is {}, at or above the fail-on level {}", word(report.risk), word(fail_on.unwrap_or(Risk::Critical)))?;
+                writeln!(stdout, "::error title=ripple::Change risk is {}, at or above the fail-on level {}", word(risk), word(fail_on.unwrap_or(Risk::Critical)))?;
             }
         }
     }
     if failing {
         if format != CheckFormat::Github {
-            eprintln!("ripple: risk {} is at or above the fail-on level {}", word(report.risk), word(fail_on.unwrap_or(Risk::Critical)));
+            eprintln!("ripple: risk {} is at or above the fail-on level {}", word(risk), word(fail_on.unwrap_or(Risk::Critical)));
         }
         return Ok(1);
     }
@@ -466,12 +503,32 @@ fn word(r: Risk) -> String {
     format!("{r:?}").to_lowercase()
 }
 
-fn neighbours(root: &Path, a: NeighbourArgs, forward: bool, mut b: Backend) -> Result<u8> {
-    if forward && !a.scopes.is_empty() {
-        bail!("--scope applies to `dependents`, not `dependencies`");
+fn dependents(root: &Path, a: DependentsArgs, mut b: Backend) -> Result<u8> {
+    let params = crate::protocol::FileParams {
+        file: to_rel(root, &a.file),
+        scopes: a.scopes,
+        depth: a.depth,
+        min_confidence: a.min_confidence.map(Confidence::from),
+        all: a.all,
+        limit: a.limit,
+        sync: false,
+        no_wait: false,
+        max_wait_ms: None,
+    };
+    let out = result_of(b.call("dependents", &serde_json::to_value(&params)?)?)?;
+    match a.format {
+        OutFormat::Json => stdout_write(&out)?,
+        OutFormat::Text => {
+            let report: Report = serde_json::from_str(&out).context("decoding the report")?;
+            stdout_write(&render::text::render(&report, usize::MAX, use_color()))?;
+        }
     }
-    let params = json!({"file": to_rel(root, &a.file), "scopes": a.scopes, "depth": a.depth, "min_confidence": a.min_confidence.map(Confidence::from)});
-    let out = result_of(b.call(if forward { "dependencies" } else { "dependents" }, &params)?)?;
+    Ok(0)
+}
+
+fn dependencies(root: &Path, a: NeighbourArgs, mut b: Backend) -> Result<u8> {
+    let params = json!({"file": to_rel(root, &a.file), "depth": a.depth, "min_confidence": a.min_confidence.map(Confidence::from)});
+    let out = result_of(b.call("dependencies", &params)?)?;
     print_value(&out, a.format, crate::output::neighbours)
 }
 

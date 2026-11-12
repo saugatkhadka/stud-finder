@@ -20,7 +20,7 @@
 
 use crate::files::run_git;
 use anyhow::{Context, Result};
-use ripple_policy::{ChangedFile, FileStatus, Hunk};
+use ripple_policy::{ChangedFile, DefLine, FileStatus, Hunk, def_name};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -91,6 +91,11 @@ pub fn changed_files(root: &Path, spec: &DiffSpec) -> Result<Vec<ChangedFile>> {
 /// Adds first lines and hunks from a `-U0` patch to the files of a raw/numstat
 /// listing. Files in `unstaged` get no hunks (see the module docs).
 pub(crate) fn apply_patch(files: &mut BTreeMap<String, ChangedFile>, patch: &[u8], unstaged: &HashSet<String>) {
+    for (path, defs) in parse_def_lines(patch) {
+        if let Some(f) = files.get_mut(&path) {
+            f.def_lines = defs;
+        }
+    }
     for (path, hunks) in parse_hunks(patch) {
         if let Some(f) = files.get_mut(&path) {
             f.first_line = hunks.first().map(|h| h.start.max(1));
@@ -258,6 +263,65 @@ pub fn parse_hunks(patch: &[u8]) -> Vec<(String, Vec<Hunk>)> {
     out
 }
 
+/// The `def` lines each file's diff added or removed, from `git diff -U0`
+/// with `a/` / `b/` prefixes (see [`DefLine`]). Deleted files are keyed by
+/// their old path; every other file by its new path.
+pub fn parse_def_lines(patch: &[u8]) -> Vec<(String, Vec<DefLine>)> {
+    let text = String::from_utf8_lossy(patch);
+    let mut out: Vec<(String, Vec<DefLine>)> = Vec::new();
+    let (mut in_header, mut old_path, mut current) = (false, None::<String>, false);
+    let (mut hunk_start, mut new_line) = (0u32, 0u32);
+    for line in text.lines() {
+        if line.starts_with("diff --git ") {
+            (in_header, old_path, current) = (true, None, false);
+            continue;
+        }
+        if in_header {
+            if let Some(p) = line.strip_prefix("--- ") {
+                old_path = p.trim_matches('"').strip_prefix("a/").map(str::to_string);
+                continue;
+            }
+            if let Some(p) = line.strip_prefix("+++ ") {
+                let path = match p.trim_matches('"').strip_prefix("b/") {
+                    Some(new) => Some(new.to_string()),
+                    None => old_path.take(),
+                };
+                current = path.is_some();
+                if let Some(path) = path {
+                    out.push((path, Vec::new()));
+                }
+                continue;
+            }
+            if !line.starts_with("@@ ") {
+                continue;
+            }
+        }
+        if let Some(h) = line.strip_prefix("@@ ") {
+            in_header = false;
+            let plus = h.split_whitespace().find(|t| t.starts_with('+')).unwrap_or("+1");
+            hunk_start = plus[1..].split(',').next().and_then(|s| s.parse().ok()).unwrap_or(1);
+            new_line = hunk_start;
+            continue;
+        }
+        if !current {
+            continue;
+        }
+        let Some((_, defs)) = out.last_mut() else { continue };
+        if let Some(added) = line.strip_prefix('+') {
+            if def_name(added).is_some() {
+                defs.push(DefLine { removed: false, line: new_line, text: added.trim().to_string() });
+            }
+            new_line += 1;
+        } else if let Some(removed) = line.strip_prefix('-')
+            && def_name(removed).is_some()
+        {
+            defs.push(DefLine { removed: true, line: hunk_start, text: removed.trim().to_string() });
+        }
+    }
+    out.retain(|(_, d)| !d.is_empty());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +355,18 @@ mod tests {
             [("x.rb".to_string(), vec![x(4, 2, false), x(11, 1, false), x(22, 0, true)]), ("z.rb".to_string(), vec![x(1, 1, false)])]
         );
         assert!(opens_definition("  def self.x") && opens_definition("def(") && !opens_definition("  default = 1") && !opens_definition("# def x"));
+    }
+
+    #[test]
+    fn def_lines_per_file() {
+        let patch = b"diff --git a/x.rb b/x.rb\n--- a/x.rb\n+++ b/x.rb\n@@ -3,0 +4,2 @@\n+a\n+  def added(x)\n@@ -9 +11 @@\n-  def refund!\n+  def refund_all!\n@@ -20,2 +22,0 @@ def run\n-  private def gone\n-  end\ndiff --git a/y.rb b/y.rb\ndeleted file mode 100644\n--- a/y.rb\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-def self.x\n-end\ndiff --git a/z.rb b/z.rb\n--- a/z.rb\n+++ b/z.rb\n@@ -1,0 +1 @@\n+--- y\n";
+        let d = |removed, line, text: &str| DefLine { removed, line, text: text.to_string() };
+        assert_eq!(
+            parse_def_lines(patch),
+            [
+                ("x.rb".to_string(), vec![d(false, 5, "def added(x)"), d(true, 11, "def refund!"), d(false, 11, "def refund_all!"), d(true, 22, "private def gone")]),
+                ("y.rb".to_string(), vec![d(true, 0, "def self.x")]),
+            ]
+        );
     }
 }

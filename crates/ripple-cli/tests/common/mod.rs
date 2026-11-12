@@ -194,6 +194,49 @@ pub fn files_of(v: &Value) -> Vec<String> {
     f
 }
 
+/// Direct dependents of a `dependents` report, tests included.
+pub fn dependents_of(report: &Value) -> Vec<String> {
+    let list = |v: &Value| v.as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let mut f = list(&report["dependents"]);
+    f.extend(list(&report["tests"]));
+    f.sort();
+    f.dedup();
+    f
+}
+
+/// Every impacted non-test file of a report made with `all` (direct
+/// dependents and the files further away).
 pub fn impacted_of(report: &Value) -> Vec<String> {
-    files_of(&report["impacted"])
+    assert_eq!(report["query"]["all"], true, "impacted_of needs a report made with `all`: {report}");
+    let list = |v: &Value| v.as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let mut f = list(&report["dependents"]);
+    f.extend(report["inherit_only"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()));
+    f.extend(list(&report["further"]["files"]));
+    f.sort();
+    f.dedup();
+    assert_eq!(f.len() as u64, report["counts"]["impacted"].as_u64().unwrap(), "{report}");
+    f
+}
+
+/// The test files listed in a report.
+pub fn tests_of(report: &Value) -> Vec<String> {
+    let mut f: Vec<String> = report["tests"].as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap().to_string()).collect();
+    f.sort();
+    f
+}
+
+/// Validates a report against the published JSON Schema.
+pub fn assert_schema(report: &Value) {
+    let errors = ripple_policy::schema::validate_report(report);
+    assert!(errors.is_empty(), "{errors:#?}\n{report}");
+}
+
+/// The policy risk of a report; `low` when the policy section is absent
+/// (nothing configured fired). Also checks the report against the schema.
+pub fn risk_of(report: &Value) -> Value {
+    assert_schema(report);
+    match report.get("policy") {
+        Some(p) if !p.is_null() => p["risk"].clone(),
+        _ => Value::String("low".into()),
+    }
 }
