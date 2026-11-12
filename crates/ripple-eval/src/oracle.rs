@@ -233,11 +233,13 @@ pub struct Case {
     pub loose_only: usize,
     /// Non-source / ignored files whose removed lines mention the name (not in T).
     pub nonsource: usize,
+    /// Files that would be in T but define the same name themselves (not in T).
+    pub self_defined: usize,
     /// Files at the commit still mentioning the name outside the defining file.
     pub leftovers: usize,
     pub seed_in_graph: bool,
     pub truth_in_graph: usize,
-    /// "method" (method-scoped; whole-file for constants), "file", "grep", "grep_all", "same_dir".
+    /// "method" (method-scoped; whole-file for constants), "file", "grep", "grep_src", "same_dir".
     pub scores: BTreeMap<&'static str, Score>,
     /// Size of `grep -w` over every tracked file (not only graph nodes).
     pub grep_all_size: u32,
@@ -263,6 +265,8 @@ pub struct Scan {
     pub empty_truth: BTreeMap<&'static str, usize>,
     /// (name, kind, |T|, commit) of stoplisted symbols.
     pub stoplisted: Vec<(String, &'static str, usize, String)>,
+    /// Files dropped from T because they define the same name themselves.
+    pub self_defined: usize,
     /// Removed constants still defined in another file at the commit (skipped).
     pub constant_still_defined: usize,
     pub failed: Vec<String>,
@@ -286,6 +290,7 @@ fn interesting_removal(line: &str) -> bool {
 /// The symbols a commit removed and their ground truth (no index needed).
 fn find_cases(repo: &Path, sha: &str, parent: &str, subject: &str, patches: &[FilePatch], ignored: &dyn Fn(&str) -> bool, scan: &mut Scan) -> Vec<Case> {
     let mut cases = Vec::new();
+    let mut blobs: HashMap<String, String> = HashMap::new();
     for p in patches {
         let Some(old) = &p.old else { continue };
         if !old.ends_with(".rb") || !p.removed.iter().any(|(_, l)| interesting_removal(l)) {
@@ -313,7 +318,7 @@ fn find_cases(repo: &Path, sha: &str, parent: &str, subject: &str, patches: &[Fi
                 continue;
             }
             let mut truth = Vec::new();
-            let (mut loose_only, mut nonsource, mut moved) = (0, 0, false);
+            let (mut loose_only, mut nonsource, mut moved, mut self_defined) = (0, 0, false, 0);
             for g in patches {
                 if g.old.as_deref() == Some(old.as_str()) || g.new.as_deref() == p.new.as_deref() && p.new.is_some() {
                     continue;
@@ -341,6 +346,16 @@ fn find_cases(repo: &Path, sha: &str, parent: &str, subject: &str, patches: &[Fi
                     loose_only += 1;
                     continue;
                 }
+                // A file defining the same name itself (a sibling class losing
+                // its own copy, an override) references its own definition.
+                if gold.ends_with(".rb") {
+                    let src = blobs.entry(gold.clone()).or_insert_with(|| show(repo, parent, gold).unwrap_or_default());
+                    let own = if r.kind == SymbolKind::Constant { symbols::ruby_constants(src).iter().any(|c| c.0 == r.name) } else { symbols::ruby_defs(src).iter().any(|d| d.name == r.name) };
+                    if own {
+                        self_defined += 1;
+                        continue;
+                    }
+                }
                 let (line, text) = g.removed.iter().find(|(_, l)| symbols::reference_count(l, &r.name, r.kind) > 0).map(|(n, l)| (*n, l.trim().chars().take(140).collect())).unwrap_or_default();
                 truth.push(TruthFile { path: gold.clone(), test: is_test_path(gold), lang: language(gold), line, text, removed_mentions: rem, added_mentions: add });
             }
@@ -348,6 +363,7 @@ fn find_cases(repo: &Path, sha: &str, parent: &str, subject: &str, patches: &[Fi
                 scan.stoplisted.push((r.name.clone(), r.kind.as_str(), truth.len(), sha[..10].to_string()));
                 continue;
             }
+            scan.self_defined += self_defined;
             if truth.is_empty() {
                 *scan.empty_truth.entry(r.kind.as_str()).or_default() += 1;
                 continue;
@@ -373,6 +389,7 @@ fn find_cases(repo: &Path, sha: &str, parent: &str, subject: &str, patches: &[Fi
                 truth,
                 loose_only,
                 nonsource,
+                self_defined,
                 leftovers: 0,
                 seed_in_graph: false,
                 truth_in_graph: 0,
@@ -392,7 +409,7 @@ fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
-fn score(index: &Index, answer: &HashMap<NodeId, u32>, extra: &BTreeSet<String>, truth: &[TruthFile]) -> Score {
+fn score(index: &Index, answer: &HashMap<NodeId, u32>, truth: &[TruthFile]) -> Score {
     let mut s = Score::default();
     let bump = |arr: &mut [u32; D], d: u32| {
         for (k, slot) in arr.iter_mut().enumerate() {
@@ -407,14 +424,8 @@ fn score(index: &Index, answer: &HashMap<NodeId, u32>, extra: &BTreeSet<String>,
             bump(&mut s.size_tests, d);
         }
     }
-    for p in extra {
-        bump(&mut s.size, 1);
-        if is_test_path(p) {
-            bump(&mut s.size_tests, 1);
-        }
-    }
     for t in truth {
-        let d = index.node(&t.path).and_then(|n| answer.get(&n).copied()).or_else(|| extra.contains(&t.path).then_some(1));
+        let d = index.node(&t.path).and_then(|n| answer.get(&n).copied());
         if let Some(d) = d {
             bump(&mut s.hits, d);
             if t.test {
@@ -475,19 +486,18 @@ fn evaluate(repo: &Path, co: &Path, index: &Index, ignored: &dyn Fn(&str) -> boo
     let word = case.name.trim_end_matches('=').to_string();
     let grep: BTreeSet<String> = grep_files(co, &case.parent, &word)?.into_iter().filter(|p| *p != case.file && !ignored(p)).collect();
     let grep_nodes: HashMap<NodeId, u32> = grep.iter().filter_map(|p| index.node(p)).map(|n| (n, 1)).collect();
-    let grep_rest: BTreeSet<String> = grep.iter().filter(|p| index.node(p).is_none()).cloned().collect();
+    let grep_src: HashMap<NodeId, u32> = grep_nodes.iter().filter(|(n, _)| is_source(index.path(**n))).map(|(&n, &d)| (n, d)).collect();
     case.grep_all_size = grep.len() as u32;
     let mut left = grep_files(co, &case.sha, &word)?;
     left.remove(&case.file);
     case.leftovers = left.into_iter().filter(|p| !ignored(p)).count();
     let dir = dir_of(&case.file);
     let same: HashMap<NodeId, u32> = (0..index.node_count() as NodeId).filter(|&n| n != seed && dir_of(index.path(n)) == dir).map(|n| (n, 1)).collect();
-    let none = BTreeSet::new();
-    case.scores.insert("method", score(index, &method, &none, &case.truth));
-    case.scores.insert("file", score(index, &file, &none, &case.truth));
-    case.scores.insert("grep", score(index, &grep_nodes, &none, &case.truth));
-    case.scores.insert("grep_all", score(index, &grep_nodes, &grep_rest, &case.truth));
-    case.scores.insert("same_dir", score(index, &same, &none, &case.truth));
+    case.scores.insert("method", score(index, &method, &case.truth));
+    case.scores.insert("file", score(index, &file, &case.truth));
+    case.scores.insert("grep", score(index, &grep_nodes, &case.truth));
+    case.scores.insert("grep_src", score(index, &grep_src, &case.truth));
+    case.scores.insert("same_dir", score(index, &same, &case.truth));
     case.grep_missed = case.truth.iter().filter(|t| !index.node(&t.path).is_some_and(|n| grep_nodes.contains_key(&n))).map(|t| t.path.clone()).collect();
     let in1 = |m: &HashMap<NodeId, u32>, p: &str| index.node(p).and_then(|n| m.get(&n)).is_some_and(|&d| d == 1);
     let snapshot = case.clone();
@@ -513,8 +523,8 @@ fn pct(num: u64, den: u64) -> String {
 const PREDICTORS: [(&str, &str); 5] = [
     ("method", "ripple, method-scoped (`--scope name`)"),
     ("file", "ripple, whole file"),
-    ("grep", "`grep -w name` (graph files)"),
-    ("grep_all", "`grep -w name` (all files)"),
+    ("grep", "`grep -w name` (all indexed files)"),
+    ("grep_src", "`grep -w name`, Ruby/JS/templates only"),
     ("same_dir", "same directory"),
 ];
 
@@ -549,18 +559,20 @@ pub fn summary(scan: &Scan, all: &[Case]) -> String {
     let t_graph = sum(&cases, |c| c.truth_in_graph as u64);
     let _ = writeln!(
         s,
-        "T = other files of the commit, Ruby/JS/templates, whose removed lines mention the symbol more often than their added lines (word match; comments, hash keys and assignments excluded). |T| = {t_all} files ({t_graph} graph nodes at the parent; {} tests), median {} per case. Also seen: {} files with only balanced mentions (not in T), {} non-source/ignored files mentioning it; {} files at the commit still mention the name (U, median per case {}).\n",
+        "T = other files of the commit, Ruby/JS/templates, whose removed lines mention the symbol more often than their added lines (word match; comments, hash keys and assignments excluded). |T| = {t_all} files ({t_graph} graph nodes at the parent; {} tests), median {} per case. Not in T: {} files with only balanced mentions, {} non-source/ignored files, {} files defining the same name themselves (scan-wide, incl. symbols with empty T: {}); {} files at the commit still mention the name (U, median per case {}).\n",
         sum(&cases, |c| c.truth.iter().filter(|t| t.test).count() as u64),
         percentile(&cases.iter().map(|c| c.truth.len() as u32).collect::<Vec<_>>(), 50.0),
         sum(&cases, |c| c.loose_only as u64),
         sum(&cases, |c| c.nonsource as u64),
+        sum(&cases, |c| c.self_defined as u64),
+        scan.self_defined,
         sum(&cases, |c| c.leftovers as u64),
         percentile(&cases.iter().map(|c| c.leftovers as u32).collect::<Vec<_>>(), 50.0),
     );
 
     let _ = writeln!(s, "## All cases\n\nRecall = Σ|answer ∩ T| / Σ|T| (files). Precision = Σ|answer₁ ∩ T| / Σ|answer₁| at depth 1. Size = depth-1 answer, tests included. For constants the method-scoped row is the whole-file query.\n");
-    let _ = writeln!(s, "| answer | recall ≤1 | ≤2 | ≤3 | all of T ≤1 | size ≤1 p50 / p90 / max | empty ≤1 | precision ≤1 |");
-    let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(s, "| answer | recall ≤1 | ≤2 | ≤3 | all of T ≤1 | size ≤1 p50 / p90 / max | empty ≤1 | precision ≤1 | precision ≤1, case median |");
+    let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|---:|");
     for (key, label) in PREDICTORS {
         let sc = |c: &Case| c.scores.get(key).cloned().unwrap_or_default();
         let deep = matches!(key, "method" | "file");
@@ -568,9 +580,11 @@ pub fn summary(scan: &Scan, all: &[Case]) -> String {
         let full = cases.iter().filter(|c| sc(c).hits[0] as usize == c.truth.len()).count() as u64;
         let sizes: Vec<u32> = cases.iter().map(|c| sc(c).size[0]).collect();
         let empty = sizes.iter().filter(|&&x| x == 0).count() as u64;
+        // Per-case precision in 0.1% steps, cases with a non-empty answer.
+        let per: Vec<u32> = cases.iter().map(|c| sc(c)).filter(|x| x.size[0] > 0).map(|x| (1000 * x.hits[0] as u64 / x.size[0] as u64) as u32).collect();
         let _ = writeln!(
             s,
-            "| {label} | {} | {} | {} | {} | {} / {} / {} | {} | {} |",
+            "| {label} | {} | {} | {} | {} | {} / {} / {} | {} | {} | {:.1}% |",
             r(0),
             r(1),
             r(2),
@@ -580,6 +594,7 @@ pub fn summary(scan: &Scan, all: &[Case]) -> String {
             sizes.iter().max().copied().unwrap_or(0),
             pct(empty, cases.len() as u64),
             pct(sum(&cases, |c| sc(c).hits[0] as u64), sum(&cases, |c| sc(c).size[0] as u64)),
+            percentile(&per, 50.0) as f64 / 10.0,
         );
     }
 
