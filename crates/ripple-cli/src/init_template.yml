@@ -96,48 +96,85 @@ rules:
     risk: high
     require: [human_review]
 
+  # Global files and boundary crossings show up in a large share of ordinary
+  # commits, so they only add an action, not risk.
   - id: global-config
     when:
       touches_global: true        # a changed file matches global_files
+    risk: low
+    require: [run_full_suite]
+
+  - id: frontend-backend
+    when:
+      crosses_boundary: true      # a Ruby change reaches JS/TS or vice versa
+    risk: low
+
+  - id: huge-blast-radius
+    when:
+      impacted_files_over: 1500   # impacted non-test files, excluding the changed ones
     risk: high
     require: [run_full_suite]
 
   - id: wide-blast-radius
     when:
-      impacted_files_over: 200    # impacted non-test files, excluding the changed ones
-    risk: high
+      impacted_files_over: 200
+    risk: medium
 
   - id: big-diff
     when:
       changed_files_over: 40      # number of changed files
-      changed_lines_over: 1500    # added + deleted lines (only when a diff is available)
     risk: medium
 
-  - id: frontend-backend
+  # Rules on git history, complexity and coverage. A rule whose signal is not
+  # ready (history still building, no coverage report in coverage/) does not
+  # fire and adds one warning instead.
+  # The per-file conditions (churn_over, complexity_over,
+  # max_method_complexity_over, coverage_under, changed_lines_coverage_under,
+  # uncovered, hotspot, and next to them untested and changed_lines_over)
+  # must all hold on the same changed file. Pairing a metric with
+  # changed_lines_over keeps one-line edits to a big file from firing.
+  - id: complex-file
     when:
-      crosses_boundary: true      # a Ruby change reaches JS/TS or vice versa
+      complexity_over: 150        # file complexity (sum of methods + top level)...
+      changed_lines_over: 20      # ...and more than 20 lines of it changed
+    risk: high
+    require: [human_review]
+
+  - id: hot-and-churning
+    when:
+      hotspot: true               # in the top rank.hotspot_percent of `ripple rank`...
+      churn_over: 10              # ...and changed in more than 10 commits in the last 90 days
+    risk: high
+    require: [human_review]
+
+  - id: hotspot-change
+    when:
+      hotspot: true
+      changed_lines_over: 10
+    risk: high
+    require: [human_review]
+
+  - id: complex-method
+    when:
+      max_method_complexity_over: 25   # its most complex method
+      changed_lines_over: 10
     risk: medium
 
   - id: untested-change
     when:
-      untested: true              # a changed source file has no test among its dependents
+      untested: true              # a changed source file has no test among its dependents...
+      changed_lines_over: 50      # ...and more than 50 of its lines changed
     risk: medium
     require: [add_tests]
 
-  # Rules on git history, complexity and coverage. A rule whose signal is not
-  # ready (history still building, no coverage report in coverage/) does not
-  # fire and adds one warning instead. Uncomment to use.
-  # - id: hot-and-complex
-  #   when:
-  #     churn_over: 20                # changed in more than 20 commits in the last 90 days
-  #     complexity_over: 300          # file complexity (sum of methods + top level)
-  #   risk: high
-  #
-  # - id: gnarly-method
-  #   when:
-  #     max_method_complexity_over: 40   # its most complex method
-  #   risk: medium
-  #
+  - id: forgot-a-partner
+    when:
+      missing_cochange: true        # a file that usually changes with a changed one is not in the diff
+      cochange_min_confidence: 0.7  # ...in at least 70% of its commits (default 0.5)
+    risk: low
+    require: [check_cochange_partners]
+
+  # Coverage rules need a report under coverage/. Uncomment to use.
   # - id: poorly-covered
   #   when:
   #     touches_tier: high
@@ -154,19 +191,8 @@ rules:
   #   when:
   #     uncovered: true               # a changed file has 0% line coverage...
   #     uncovered_includes_unknown: false  # ...true also counts files in no report
+  #     changed_lines_over: 20
   #   risk: medium
-  #
-  # - id: hotspot
-  #   when:
-  #     hotspot: true                 # in the top rank.hotspot_percent of `ripple rank`
-  #   risk: high
-  #   require: [human_review]
-  #
-  # - id: forgot-a-partner
-  #   when:
-  #     missing_cochange: true        # a file that usually changes with a changed one is not in the diff
-  #     cochange_min_confidence: 0.6  # ...in at least 60% of its commits (default 0.5)
-  #   risk: low
 
 # `ripple rank`: files in the top this-many percent are hotspots, and the
 # weights of the score's factors (defaults shown).

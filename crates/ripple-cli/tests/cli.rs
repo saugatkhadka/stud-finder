@@ -378,7 +378,7 @@ fn scope_flag_and_file_level() {
     let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--scope", "charge!", "--format", "json", "--all"]);
     assert_eq!(impacted_of(&r), ["app/session.txt", "app/sub.txt"]);
     assert_eq!(r["tests"][0]["file"], "spec/purchase_spec.txt");
-    assert_eq!(risk_of(&r), "high", "reaches the critical auth area in one hop");
+    assert_eq!(risk_of(&r), "medium", "reaches the critical auth area in one hop");
 
     let r = env.json(&["--no-daemon", "impact", "--files", "app/purchase.txt", "--scope", "refund!", "--file-level", "--format", "json", "--all"]);
     assert_eq!(impacted_of(&r), ["app/caller.txt", "app/report.txt", "app/session.txt", "app/sub.txt", "app/svc.txt"]);

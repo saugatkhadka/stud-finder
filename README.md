@@ -201,12 +201,29 @@ rule's reason names the files and numbers, for example
 |---|---|---|---|
 | `default.touches_critical` | Touches an area of tier critical | critical | `human_review` |
 | `default.touches_high` | Touches an area of tier high or above | high | `human_review` |
-| `default.touches_global` | Touches a global file | high | `run_full_suite` |
-| `default.reaches_critical_direct` | Reaches a critical area within 1 hop | high | — |
-| `default.reaches_critical` | Reaches a critical area at any depth | medium | — |
-| `default.impacted_over_200` | More than 200 impacted files | high | — |
-| `default.impacted_over_50` | More than 50 impacted files | medium | — |
-| `default.crosses_boundary` | Crosses the Ruby/JS boundary | medium | — |
+| `default.complex_file` | One changed file: complexity over 150 and over 20 changed lines | high | `human_review` |
+| `default.hotspot_churning` | One changed file: hotspot and churn over 10 | high | `human_review` |
+| `default.hotspot_change` | One changed file: hotspot and over 10 changed lines | high | `human_review` |
+| `default.impacted_over_1500` | More than 1500 impacted files | high | `run_full_suite` |
+| `default.impacted_over_200` | More than 200 impacted files | medium | — |
+| `default.reaches_critical_direct` | Reaches a critical area within 1 hop | medium | — |
+| `default.complex_method` | One changed file: a method over 25 and over 10 changed lines | medium | — |
+| `default.untested_change` | One changed file: no test reaches it and over 50 changed lines | medium | `add_tests` |
+| `default.reaches_critical` | Reaches a critical area at any depth | low | — |
+| `default.touches_global` | Touches a global file | low | `run_full_suite` |
+| `default.missing_cochange` | A usual co-change partner (confidence 0.7+) is missing | low | `check_cochange_partners` |
+| `default.crosses_boundary` | Crosses the Ruby/JS boundary | low | — |
+
+The built-in metric rules skip quietly (no warning) until history and
+metrics are ready. The thresholds come from replaying about 300 recent
+commits each of two Rails apps (Gumroad, Mastodon) with these thresholds
+(and medium-risk area rules): they put 21% of Gumroad's and 5% of Mastodon's commits
+at high or above, and those commits were followed by a fix to the same
+files about three times as often as the rest (63% vs 22%, 40% vs 7%).
+Global files and boundary crossings fire on a large share of ordinary
+commits (5–70%), so on their own they only add their required action.
+No single generic set put both apps in a 10–15% band; tune
+`complexity_over` and `impacted_files_over` to your codebase.
 
 If no rule fires, the risk is low.
 

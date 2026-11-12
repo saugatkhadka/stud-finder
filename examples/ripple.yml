@@ -71,38 +71,41 @@ rules:
       reaches_tier: critical
       within: 1
       min_confidence: inferred
-    risk: high
+    risk: medium
     require: [human_review]
 
   - id: critical-transitive
     when: { reaches_tier: critical }
-    risk: medium
+    risk: low
 
   - id: high-tier-touched
     when: { touches_tier: high }
     risk: high
 
+  # Common in ordinary commits: an action, not risk.
   - id: global-config
     when: { touches_global: true }
+    risk: low
+    require: [run_full_suite]
+
+  - id: frontend-backend-contract
+    description: A Rails change reaches React code (or vice versa), e.g. an API response shape
+    when: { crosses_boundary: true }
+    risk: low
+    require: [frontend_review]
+
+  - id: huge-blast-radius
+    when: { impacted_files_over: 1500 }
     risk: high
     require: [run_full_suite]
 
   - id: wide-blast-radius
     when: { impacted_files_over: 200 }
-    risk: high
-    require: [run_full_suite]
+    risk: medium
 
   - id: large-change
-    when:
-      changed_files_over: 30
-      changed_lines_over: 1000
+    when: { changed_files_over: 30 }
     risk: medium
-
-  - id: frontend-backend-contract
-    description: A Rails change reaches React code (or vice versa), e.g. an API response shape
-    when: { crosses_boundary: true }
-    risk: medium
-    require: [frontend_review]
 
   - id: untested-billing-change
     when:
@@ -112,7 +115,9 @@ rules:
     require: [add_tests]
 
   # Signals from git history, complexity and existing coverage reports. A rule
-  # whose signal is not ready does not fire and adds a warning.
+  # whose signal is not ready does not fire and adds a warning. Per-file
+  # conditions (and changed_lines_over / untested next to them) must hold
+  # on the same changed file.
   - id: churning-complex-billing
     when:
       touches: [billing]
@@ -120,9 +125,25 @@ rules:
       complexity_over: 250
     risk: high
 
+  - id: complex-file
+    when:
+      complexity_over: 150
+      changed_lines_over: 20            # ...lines of that same file
+    risk: high
+    require: [human_review]
+
   - id: very-complex-method
-    when: { max_method_complexity_over: 50 }
+    when:
+      max_method_complexity_over: 25
+      changed_lines_over: 10
     risk: medium
+
+  - id: untested-change
+    when:
+      untested: true
+      changed_lines_over: 50
+    risk: medium
+    require: [add_tests]
 
   - id: billing-poorly-covered
     when:
@@ -136,18 +157,29 @@ rules:
     when:
       uncovered: true
       uncovered_includes_unknown: false
+      changed_lines_over: 20
     risk: medium
 
+  - id: hot-and-churning
+    when:
+      hotspot: true                     # top rank.hotspot_percent of `ripple rank`
+      churn_over: 10
+    risk: high
+    require: [human_review]
+
   - id: hotspot-change
-    when: { hotspot: true }             # top rank.hotspot_percent of `ripple rank`
+    when:
+      hotspot: true
+      changed_lines_over: 10
     risk: high
     require: [human_review]
 
   - id: missing-partner
     when:
       missing_cochange: true
-      cochange_min_confidence: 0.6
+      cochange_min_confidence: 0.7
     risk: low
+    require: [check_cochange_partners]
 
 rank:
   hotspot_percent: 1        # top 1% of `ripple rank` are hotspots

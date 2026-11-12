@@ -23,7 +23,8 @@
 //! * Signal conditions look at the changed, non-deleted, non-test source
 //!   files ("candidates") and need their signal ([`SignalInput`]) to be
 //!   ready; a rule using a signal that is not ready does not fire and adds a
-//!   `rule_signal_not_ready` warning instead. Thresholds are exclusive.
+//!   `rule_signal_not_ready` warning instead (built-in rules skip quietly).
+//!   Thresholds are exclusive.
 //!   **Per-file conditions** (`churn_over`, `complexity_over`,
 //!   `max_method_complexity_over`, `coverage_under`,
 //!   `changed_lines_coverage_under`, `uncovered: true`, `hotspot: true`,
@@ -235,7 +236,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     for r in &policy.rules {
         let blocked = ctx.blocked_signals(&r.rule.when);
         if !blocked.is_empty() {
-            if !ctx.changed.is_empty() {
+            // Built-in metric rules are opportunistic: without history or
+            // metrics they stay quiet (the `signals` block says why).
+            if !ctx.changed.is_empty() && !policy.uses_default_rules() {
                 let what: Vec<String> = blocked
                     .iter()
                     .map(|(name, st)| match &st.reason {

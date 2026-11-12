@@ -245,7 +245,7 @@ fn default_rules() {
     assert_eq!(pol(&r).require, ["human_review"]);
 
     let r = run(&p, &[m("config/initializers/stripe.rb")]);
-    assert_eq!((pol(&r).risk, ids(&r)), (Risk::High, vec!["default.touches_global".to_string()]));
+    assert_eq!((pol(&r).risk, ids(&r)), (Risk::Low, vec!["default.touches_global".to_string()]));
     assert_eq!(pol(&r).require, ["run_full_suite"]);
 
     // lib/token.rb is tier high; session.rb (critical) depends on it directly.
@@ -268,17 +268,24 @@ fn default_rules_reach_any_depth_and_blast_radius() {
     let g = Graph::build(&edges, []);
     let p = Policy::compile(parse_config("areas: {c: {paths: [app/crit.rb], tier: critical}}", "t").unwrap()).unwrap();
     let r = evaluate(&p, &g, &[m("app/hub.rb")]);
-    assert_eq!(pol(&r).risk, Risk::Medium);
-    assert_eq!(pol(&r).reasons[0].rule, "default.impacted_over_50");
+    assert!(r.policy.is_none(), "60 impacted files is ordinary: no rule fires");
     let r = evaluate(&p, &g, &[m("app/x.rb")]);
-    assert_eq!(pol(&r).risk, Risk::Medium);
+    assert_eq!(pol(&r).risk, Risk::Low);
     assert_eq!(pol(&r).reasons.iter().map(|x| x.rule.as_str()).collect::<Vec<_>>(), ["default.reaches_critical"]);
 
     let edges: Vec<Edge> = (0..201).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
     let g = Graph::build(&edges, []);
     let r = evaluate(&p, &g, &[m("app/hub.rb")]);
-    assert_eq!(pol(&r).risk, Risk::High);
+    assert_eq!(pol(&r).risk, Risk::Medium);
     assert_eq!(pol(&r).reasons[0].rule, "default.impacted_over_200");
+
+    let edges: Vec<Edge> = (0..1501).map(|i| Edge::new(format!("app/a{i}.rb"), "app/hub.rb", RubyConstant, Exact)).collect();
+    let g = Graph::build(&edges, []);
+    let r = evaluate(&p, &g, &[m("app/hub.rb")]);
+    assert_eq!(pol(&r).risk, Risk::High);
+    assert_eq!(pol(&r).reasons.iter().map(|x| x.rule.as_str()).collect::<Vec<_>>(), ["default.impacted_over_1500"], "lower rung dropped");
+    assert_eq!(pol(&r).require, ["run_full_suite"]);
+    assert!(r.warnings.iter().all(|w| w.code != "rule_signal_not_ready"), "built-in metric rules skip quietly");
 }
 
 #[test]
@@ -488,7 +495,7 @@ fn github_snapshot() {
     let lines: Vec<&str> = cmds.lines().collect();
     assert!(lines.iter().any(|l| l.starts_with("::warning file=app/models/invoice.rb,line=1,title=ripple%3A critical risk (default.touches_critical)::Changes `app/models/invoice.rb` in billing (critical) (also: ")), "{cmds}");
     assert_eq!(lines.iter().filter(|l| l.starts_with("::warning file=app/models/invoice.rb")).count(), 1, "one annotation per changed file");
-    assert!(lines.iter().any(|l| l.starts_with("::warning file=config/initializers/stripe.rb,line=7,title=ripple%3A high risk (default.touches_global)::")), "{cmds}");
+    assert!(lines.iter().any(|l| l.starts_with("::warning file=config/initializers/stripe.rb,line=7,title=ripple%3A low risk (default.touches_global)::")), "{cmds}");
     assert!(lines.iter().any(|l| l.starts_with("::notice file=config/initializers/stripe.rb,title=ripple: global file::global:")), "{cmds}");
     assert_eq!(*lines.last().unwrap(), format!("::notice title=ripple::{}", r.summary));
     assert_eq!(
