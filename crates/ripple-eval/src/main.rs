@@ -125,6 +125,7 @@ fn measure_commit(index: &Index, c: &Candidate, parent: &str, changes: &[FileCha
         targets: Vec::new(),
         scoped_targets: 0,
         tests: Vec::new(),
+        test_fixtures: Vec::new(),
         added: Vec::new(),
         deleted: Vec::new(),
         renamed: Vec::new(),
@@ -146,7 +147,10 @@ fn measure_commit(index: &Index, c: &Candidate, parent: &str, changes: &[FileCha
             r.non_nodes.push(pp.clone());
             continue;
         };
-        if index.is_test(node) {
+        if index.is_test(node) && !is_source(pp) {
+            // VCR cassettes, fixtures: under the test globs but nothing to run.
+            r.test_fixtures.push(pp.clone());
+        } else if index.is_test(node) {
             r.tests.push(pp.clone());
             truth.tests.push(node);
         } else {

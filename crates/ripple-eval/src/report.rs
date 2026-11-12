@@ -18,8 +18,10 @@ pub struct CommitResult {
     pub targets: Vec<String>,
     /// How many targets got a method-level seed (not the whole file).
     pub scoped_targets: usize,
-    /// Changed test files that are graph nodes at the parent.
+    /// Changed test files (Ruby / JS / templates) that are graph nodes at the parent.
     pub tests: Vec<String>,
+    /// Changed non-source files under the test globs (fixtures, VCR cassettes): ignored.
+    pub test_fixtures: Vec<String>,
     pub added: Vec<String>,
     pub deleted: Vec<String>,
     pub renamed: Vec<String>,
@@ -77,11 +79,12 @@ pub fn summary(sel: &Selection, commits: &[CommitResult]) -> String {
     );
     let _ = writeln!(
         s,
-        "Changed files: {} total, {} LOO targets (non-test graph nodes at the parent; {} with method-level seeds), {} test files in graph, {} added, {} deleted, {} renamed, {} not in graph. Median graph: {} nodes, {} edges.\n",
+        "Changed files: {} total, {} LOO targets (non-test graph nodes at the parent; {} with method-level seeds), {} test files in graph (+{} test fixtures ignored), {} added, {} deleted, {} renamed, {} not in graph. Median graph: {} nodes, {} edges.\n",
         sum(|c| c.changed),
         n_targets,
         sum(|c| c.scoped_targets),
         sum(|c| c.tests.len()),
+        sum(|c| c.test_fixtures.len()),
         sum(|c| c.added.len()),
         sum(|c| c.deleted.len()),
         sum(|c| c.renamed.len()),
@@ -162,7 +165,7 @@ pub fn summary(sel: &Selection, commits: &[CommitResult]) -> String {
     }
 
     // Tests.
-    let _ = writeln!(s, "\n## Changed tests vs. tests reaching the change\n\nCommits that change both non-test files in the graph and test files in the graph. Recall = changed test files that are among the tests reaching the changed sources.\n");
+    let _ = writeln!(s, "\n## Changed tests vs. tests reaching the change\n\nCommits that change both non-test files in the graph and test source files in the graph (fixtures excluded). Recall = changed test files that are among the tests reaching the changed sources.\n");
     let _ = writeln!(s, "| variant | commits | changed tests | recall ≤3 | recall any depth | tests reached ≤3 p50/p90 | any depth p50/p90 |");
     let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|---:|");
     for name in &names {
