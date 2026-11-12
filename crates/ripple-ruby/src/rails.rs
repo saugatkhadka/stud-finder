@@ -46,6 +46,9 @@ pub struct InferredRef {
     /// Tried last: `Recv.const_get("X")` also finds top-level `X`, because
     /// `const_get` with `inherit = true` searches `Object` for modules.
     pub top_level_fallback: Option<String>,
+    /// Only a model counts (`app/models/`, any `models/` directory): the
+    /// naming-convention guess of a serializer's model.
+    pub model_only: bool,
     pub line: u32,
     /// Byte offset of the call, to find the enclosing method.
     pub offset: u32,
@@ -116,10 +119,13 @@ pub struct Want {
     pub controller: bool,
     /// The file is a test: collect the HTTP requests it makes.
     pub requests: bool,
+    /// The file is under a `serializers/` directory: `class XSerializer < ..`
+    /// infers the model `X` (ActiveModel::Serializer's naming convention).
+    pub serializer: bool,
 }
 
 pub fn collect(source: &str, want: Want) -> RubyFacts {
-    if !want.controller && !want.requests && !TRIGGERS.iter().any(|t| source.contains(t)) {
+    if !want.controller && !want.requests && !want.serializer && !TRIGGERS.iter().any(|t| source.contains(t)) {
         return RubyFacts::default();
     }
     let result = ruby_prism::parse(source.as_bytes());
@@ -135,8 +141,9 @@ pub fn collect_root(root: &Node, source: &str, want: Want) -> RubyFacts {
         facts: RubyFacts::default(),
         offset: 0,
         requests,
+        serializer: want.serializer,
     };
-    if controller || requests || TRIGGERS.iter().any(|t| source.contains(t)) {
+    if controller || requests || want.serializer || TRIGGERS.iter().any(|t| source.contains(t)) {
         v.visit(root);
     }
     if controller {
@@ -152,6 +159,8 @@ struct Visitor {
     offset: u32,
     /// Collect [`HttpRequest`]s.
     requests: bool,
+    /// Infer serializers' models.
+    serializer: bool,
 }
 
 impl Visitor {
@@ -183,8 +192,42 @@ impl Visitor {
             scope,
             absolute,
             top_level_fallback: None,
+            model_only: false,
             line,
             offset: self.offset,
+        });
+    }
+
+    /// `class REST::AccountSerializer < ActiveModel::Serializer` (or any
+    /// superclass): the model `Account`, looked up from the class's namespace
+    /// outwards (`REST::Account`, `Account`). Nested serializers
+    /// (`StatusSerializer::TagSerializer`) work the same way.
+    fn infer_serialized_model(&mut self, node: &ClassNode) {
+        if node.superclass().is_none() {
+            return;
+        }
+        let Some(name) = const_name(&node.constant_path()) else { return };
+        let (ns, last) = match name.rsplit_once("::") {
+            Some((ns, last)) => (Some(ns), last),
+            None => (None, name.as_str()),
+        };
+        let Some(model) = last.strip_suffix("Serializer").filter(|m| !m.is_empty()) else { return };
+        let scope = match ns {
+            Some(ns) if ns.starts_with("::") => ns[2..].to_string(),
+            Some(ns) => match self.nesting.last() {
+                Some(outer) => format!("{outer}::{ns}"),
+                None => ns.to_string(),
+            },
+            None => self.scope(),
+        };
+        self.facts.inferred.push(InferredRef {
+            name: ClassName::Literal(model.to_string()),
+            scope,
+            absolute: false,
+            top_level_fallback: None,
+            model_only: true,
+            line: line_of(&node.location()),
+            offset: node.location().start(),
         });
     }
 
@@ -343,6 +386,9 @@ impl Visitor {
 
 impl<'pr> Visit<'pr> for Visitor {
     fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
+        if self.serializer {
+            self.infer_serialized_model(node);
+        }
         self.enter(const_name(&node.constant_path()));
         ruby_prism::visit_class_node(self, node);
         self.nesting.pop();
@@ -517,7 +563,7 @@ describe "x" do
   it { page.visit root_path }
 end
 "##;
-        let want = Want { controller: false, requests: true };
+        let want = Want { requests: true, ..Want::default() };
         let got: Vec<_> = collect(src, want).requests.iter().map(|r| (r.callee.clone(), r.verb.clone(), r.url.clone(), r.helper, r.line)).collect();
         let s = |x: &str| x.to_string();
         assert_eq!(

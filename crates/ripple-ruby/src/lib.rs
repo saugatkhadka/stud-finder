@@ -179,6 +179,7 @@ impl State {
             es.namespace_no_canonical,
         );
         put("ruby_inferred_unresolved", es.inferred_unresolved);
+        put("ruby_serializer_model_unresolved", es.serializer_model_unresolved);
         put(
             "ruby_assoc_polymorphic_skipped",
             self.files

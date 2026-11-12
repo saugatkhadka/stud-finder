@@ -38,6 +38,8 @@ pub struct EdgeStats {
     pub namespace_no_canonical: u64,
     pub refs_to_namespace_without_canonical: u64,
     pub inferred_unresolved: u64,
+    /// `XSerializer` classes with no model `X`.
+    pub serializer_model_unresolved: u64,
     pub requires_unresolved: u64,
     pub renders_unresolved: u64,
     pub template_consts_unresolved: u64,
@@ -439,6 +441,19 @@ impl<'a> EdgeBuilder<'a> {
                 candidates.push(name.clone());
             }
             candidates.extend(inf.top_level_fallback.iter().cloned());
+            if inf.model_only {
+                // A naming-convention guess: only a model in the repo counts.
+                let is_model = |f: &str| f.split('/').rev().skip(1).any(|s| s == "models");
+                match candidates.iter().filter_map(|c| self.lookup_name(c)).find(|t| t.files.iter().any(|f| is_model(f))) {
+                    Some(t) => {
+                        for &to in t.files.iter().filter(|f| is_model(f)) {
+                            self.push_ref(from, to, EdgeKind::RailsInferred, Confidence::Inferred, inf.line, t.name, false);
+                        }
+                    }
+                    None => self.stats.serializer_model_unresolved += 1,
+                }
+                continue;
+            }
             // Like Rails, the first candidate that exists wins, even if it is defined outside the repo.
             match candidates.iter().find_map(|c| self.lookup_name(c)) {
                 Some(t) => {

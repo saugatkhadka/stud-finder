@@ -82,7 +82,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
     let mut local_graph = None;
     match kind {
         SourceKind::Ruby => {
-            let want = rails::Want { controller: paths::is_scoped_controller(rel), requests: paths::is_test_path(rel) };
+            let want = rails::Want { controller: paths::is_scoped_controller(rel), requests: paths::is_test_path(rel), serializer: rel.split('/').any(|s| s == "serializers") && !paths::is_test_path(rel) };
             let controller = want.controller;
             entry.zeitwerk_keys = paths::zeitwerk_keys(rel, extra_roots);
             match catch_unwind(AssertUnwindSafe(|| {

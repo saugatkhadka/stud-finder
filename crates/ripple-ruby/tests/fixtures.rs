@@ -146,6 +146,8 @@ const EXPECTED: &[&str] = &[
     "app/models/status.rb -> app/models/account.rb [RailsInferred Inferred L3] Account",
     "app/models/status.rb -> app/models/application_record.rb [RubyConstant Exact L1] ApplicationRecord",
     "app/models/status.rb -> app/models/media_attachment.rb [RailsInferred Inferred L4] MediaAttachment",
+    "app/serializers/rest/account_serializer.rb -> app/models/account.rb [RailsInferred Inferred L1] Account",
+    "app/serializers/rest/account_serializer.rb -> app/models/status.rb [RailsInferred Inferred L2] Status",
     "app/serializers/status_serializer.rb -> app/models/media_attachment.rb [RailsInferred Inferred L2] MediaAttachment",
     "app/views/accounts/_card.html.haml -> app/models/account.rb [RailsView Inferred L2] Account",
     "app/views/accounts/_card.html.haml -> app/views/shared/_nav.html.erb [RailsView Inferred L3] shared/nav",
@@ -203,6 +205,7 @@ fn rails_app_stats_and_warnings() {
     assert_eq!(s["ruby_namespaces_over_limit_no_canonical"], 1, "Reopened");
     assert_eq!(s["ruby_refs_to_namespace_without_canonical"], 1);
     assert_eq!(s["ruby_renders_unresolved"], 2);
+    assert_eq!(s["ruby_serializer_model_unresolved"], 2, "Widget, TagParser (not a model)");
     assert!(s["ruby_refs_namespace_skipped"] >= 3);
     for k in [
         "ruby_time_analyse_us",
