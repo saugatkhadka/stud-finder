@@ -10,6 +10,15 @@
 //! > (a method of another file can become (un)mentioned), so a fast path
 //! > must recompute those (`scoped::compute`, no Rubydex resolve).
 //!
+//! Result (Nov 2026, last 200 commits): Gumroad 403 local of 592 edits,
+//! Mastodon 375 of 441, with one violation each, so the rule is *not*
+//! sound on output facts alone: a body edit that adds a constant
+//! (`Collection::NAME_LENGTH_HARD_LIMIT`, Mastodon 3091e2e) changes how
+//! other files resolve, and `config/routes.rb` (Gumroad 3717ad9) feeds the
+//! Rails linkers. A fast path must fingerprint the extractor's *inputs*
+//! (all definitions including constants, references, requires, routes /
+//! Rails facts) instead. Violations are printed, not asserted.
+//!
 //! Each edit (parent -> commit version of one modified file) is applied on
 //! top of HEAD with the real pipeline, compared with the index before it,
 //! and the file is restored. Modifies the repo while it runs (restores every
@@ -161,5 +170,4 @@ fn replay_body_only_edits() {
     eprintln!("full update pass for local edits: p50 {} us, p90 {} us", p(0.5), p(0.9));
     let n = local.max(1) as u64;
     eprintln!("mean ruby phases over local edits (us): {:?}", ruby_breakdown.iter().map(|(k, v)| (k.trim_start_matches("ruby_time_"), v / n)).collect::<Vec<_>>());
-    assert_eq!(violations, 0, "an edit with unchanged own facts changed the rest of the index");
 }
