@@ -50,9 +50,11 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 
 | Command | What it does |
 |---|---|
-| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--limit N` (cap the listed files; counts stay exact), `--sync` (also wait for unrelated pending edits), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
+| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--all` (list everything), `--limit N` (cap every list; counts stay exact), `--sync` (also wait for unrelated pending edits), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
 | `check --base REF` | CI entry point. `--format github\|markdown\|json\|text` (github is the default under `GITHUB_ACTIONS`), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`, `--file-level`. Never starts a daemon, but uses one that is already running. |
-| `dependents FILE` / `dependencies FILE` | Direct neighbours by default; `--depth N` (0 = all). `dependents --scope NAME`: only what depends on that method / action. |
+| `dependents FILE` | The `impact` report of FILE as if it had changed (same sections and budgets). `--scope NAME` (repeatable): as if only that method / action changed. `--depth N`, `--all`, `--limit N`, `--format text\|json`. |
+| `dependencies FILE` | Direct dependencies; `--depth N` (0 = all). |
+| `schema` | Print the JSON Schema of the report (`schema_version` 2). |
 | `why FROM TO` | Shortest dependency path between two files, in either direction. `--scope NAME`: only paths into that method / action of TO (says so when only a file-level path exists). |
 | `areas FILE` | How `ripple.yml` classifies a file: areas, test, global, language. |
 | `stats` | Index size, scope ranges (`files_with_scopes`, `scopes`), per-phase timings, extractor counters, warnings, daemon info. |
@@ -225,50 +227,151 @@ subset of file-level ones:
   file-level fan-in.
 - `--file-level` turns all of this off (seeds, edge scopes and the mention
   filter). The report
-  always carries `impacted.file_level_total`, and the markdown headline reads
+  always carries `counts.impacted_file_level`, and the markdown headline reads
   e.g. "**212** impacted files (method-level; 1,362 if whole files are assumed
   changed)". The footer states which mode was used.
 
-## JSON report (`--format json`, `schema_version: 1`)
+## Output (`schema_version: 2`)
 
-The report is deterministic: the same index and inputs give byte-identical
-output, apart from `timing`. All lists are sorted. Abridged:
+`impact`, `dependents` and `check --format json` all emit one report model.
+`ripple schema` prints its JSON Schema (draft 2020-12). The report is
+deterministic, apart from `timing`. Every list is cut to a small budget
+(see below) and its exact size is in `counts`. `--all` lists everything, and
+`--limit N` caps every list at N.
+
+### JSON shape
+
+Abridged, from `dependents app/helpers/currency_helper.rb --scope string_to_price_cents` on Gumroad:
 
 ```jsonc
 {
-  "schema_version": 1,
-  "risk": "critical",                       // low | medium | high | critical
-  "summary": "CRITICAL risk: 1 changed file, 5 impacted files (up to 4 hops), 1 test to run, 5 rules fired",
-  "reasons": [{
-    "rule": "billing-touched", "risk": "critical", "message": "Touches area billing: `app/models/billing/invoice.rb`",
-    "description": "…", "require": ["human_review"], "builtin": false,
-    "evidence": {
-      "changed": ["app/models/billing/invoice.rb"],
-      "impacted": [{ "file": "…", "depth": 1, "path": [{ "file": "…", "kind": "ruby_constant", "confidence": "exact", "line": 4, "detail": "Billing::Invoice" }, { "file": "…" }] }],
-      "impacted_matching": 1
-    }
-  }],
-  "require": ["human_review", "payments_review"],
-  "changed": [{ "path": "…", "status": "modified|added|deleted|renamed", "old_path": "…", "added": 5, "deleted": 1, "first_line": 4,
-                "scopes": ["refund!"],              // only these methods changed; absent = the whole file
-                "language": "ruby|js|template|other", "areas": ["billing"], "dependents": 2, "in_graph": true, "is_test": false, "is_global": false }],
-  "impacted": {
-    "total": 5, "file_level_total": 9, "tests": 1, "max_depth": 4,  // file_level_total: impacted if whole files had changed
-    "by_depth": { "1": 1, "2": 1 }, "by_language": { "ruby": 2 }, "by_edge_kind": { "ruby_constant": 2 }, "by_min_confidence": { "exact": 3, "inferred": 2 },
-    "files": [{ "file": "…", "depth": 1, "via": "…", "root": "<changed file it traces to>", "kind": "ruby_constant", "confidence": "exact",
-                "path_confidence": "<weakest edge on the path>", "line": 4, "detail": "Billing::Invoice", "language": "ruby", "areas": ["billing"],
-                "from_scope": "run", "to_scope": "refund!" }],   // methods the first edge sits in / uses, when known (never `@body`)
-    "truncated": false                     // true when --limit cut `files` / `tests_to_run`
-  },
-  "tests_to_run": [ /* same shape as impacted.files; changed test files have depth 0 */ ],
-  "areas_reached": [{ "area": "billing", "tier": "critical", "owners": ["@acme/payments"], "touched": true, "files": 2, "min_depth": 0, "example": { /* path */ } }],
-  "owners": ["@acme/payments"],
-  "warnings": [{ "code": "global_file_changed", "message": "global: static impact is not reliable for this file …", "file": "config/initializers/money.rb" }],
-  "query": { "max_depth": 0, "min_confidence": "heuristic", "file_level": false },
-  "timing": { "refresh_us": 6, "query_us": 5, "evaluate_us": 9 },
-  "index": { "generation": 1, "nodes": 61037, "edges": 397567, "pending_changes": 0 }
+  "schema_version": 2,
+  "summary": "1 changed file; 4 direct dependents (+55 only inherit/include); 1 more mention the name with no edge; 1197 more at hops 2-3; 1457 tests reach it; method-level (1300 if whole files changed); HIGH risk",
+  "counts": { "changed": 1, "dependents": 59, "inherit_only": 55, "also_mentioned": 1, "relies_on": 0,
+              "further": 1197, "further_notable": 182, "impacted": 1256, "impacted_file_level": 1300,
+              "tests": 1457, "tests_direct": 1, "removed_methods": 0 },
+  "truncated": true,                          // some list is shorter than its count (use --all)
+  "changed": [{ "path": "app/helpers/currency_helper.rb", "status": "modified",
+                "scopes": ["string_to_price_cents"],             // absent = the whole file
+                "change": { "kind": "body", "methods": ["string_to_price_cents"] },
+                "language": "ruby", "areas": [], "dependents": 62, "in_graph": true, "is_test": false, "is_global": false }],
+  "removed_methods": [{ "file": "…", "method": "formatted_disputed_amount", "mentions_total": 11, "other_definitions": 0,
+                        "mentions": [{ "file": "app/mailers/admin_mailer.rb", "line": 16, "how": "by_name" }] }],
+  "dependents": [{ "file": "app/models/purchase.rb", "line": 7, "kind": "ruby_constant", "detail": "CurrencyHelper",
+                   "confidence": "exact", "of": "app/helpers/currency_helper.rb", "inherit": true,
+                   "uses_methods": ["string_to_price_cents"], "mention_line": 3415,   // the call, not the constant
+                   "calls_on_constant": [96, 103],   // `Const.name(` call lines, when any (e.g. Link.fetch)
+                   "from_scope": "…", "to_scope": "…", "crosses_boundary": true,   // when known / true
+                   "language": "ruby", "areas": ["payments"] }],
+  "inherit_only": ["app/models/charge.rb"],   // heirs / includers that never mention the changed methods
+  "also_mentioned": [{ "name": "string_to_price_cents", "of": "…", "definitions": 1, "total": 1,
+                       "singleton": true,     // only when the changed method is `def self.x`
+                       "files": [{ "file": "app/modules/base_price/shared.rb", "line": 14, "how": "by_name" }] }],
+  "relies_on": [{ "file": "…", "of": "…", "line": 3, "kind": "ruby_constant", "detail": "…", "confidence": "exact" }],
+  "further": { "by_depth": { "2": 626, "3": 571 }, "by_language": { "ruby": 1041, "js": 142, "template": 14 },
+               "by_area": { "payments": 28 }, "by_tier": { "critical": 30 },
+               "files": [{ "file": "…", "depth": 2, "via": "…", "of": "…", "kind": "ruby_constant", "confidence": "exact",
+                           "language": "ruby", "areas": ["payments"], "notable": ["high_tier"] }] },
+  "tests": [{ "file": "spec/helpers/currency_helper_spec.rb", "depth": 1, "of": "…", "kind": "ruby_constant",
+              "line": 5, "detail": "CurrencyHelper", "mention_line": 41 }],
+  "incomplete": [{ "reason": "dynamic_dispatch", "file": "app/models/link.rb", "message": "…" }],
+  "blind_spots": ["methods matched by name; receivers untyped", "JS/TS and send/try not checked", "also run: rg -w string_to_price_cents"],
+  "policy": { "risk": "high", "reasons": [{ "rule": "…", "risk": "high", "message": "…", "require": [], "builtin": true, "evidence": { … } }],
+              "require": [], "owners": ["@payments"], "areas": [{ "area": "payments", "tier": "critical", "files": 38, "min_depth": 1, … }] },
+  "warnings": [{ "code": "global_file_changed", "message": "…", "file": "config/initializers/money.rb" }],
+  "query": { "max_depth": 3, "min_confidence": "heuristic", "file_level": false, "all": false },
+  "index": { "generation": 1, "nodes": 10150, "edges": 17783, "pending_changes": 0 },
+  "timing": { "refresh_us": 0, "query_us": 203, "evaluate_us": 1236 }
 }
 ```
+
+What each section means:
+
+- **`changed[].change.kind`**: `body` (only method bodies changed),
+  `method_added`, `signature` (a `def` line changed), `method_removed`,
+  `class_body` (code outside every method), or `whole_file` with a reason
+  (`added`, `deleted`, `renamed`, `no_diff`, `unsupported_language`).
+- **`removed_methods`**: methods that were deleted or renamed and are still
+  mentioned. The lookup covers the same file, the direct dependents, and every
+  file in the workspace that mentions the name. Files found only by name are
+  listed when the name is rare: fewer than 3 other files define it.
+  `other_definitions` says how common the name is. This appears in daemon and
+  one-shot mode alike.
+- **`dependents`**: hop 1 only, with one evidence line each. Order: files that
+  call the changed method on the constant itself (`Link.fetch`), then files
+  that mention the method, then files across the Ruby/JS boundary, then the
+  rest. A `config/routes.rb` dependent shows the route line of the changed
+  action. When there is no single action, `detail` reads `routes (N actions)`.
+- **`inherit_only`**: subclasses and includers that never mention the changed
+  methods. They stay in the impact (Ruby could dispatch to them), but are
+  kept apart from callers.
+- **`also_mentioned`**: files that mention the changed method's name but have
+  no dependency edge, because the receiver's type is unknown
+  (`purchase.charge.formatted_disputed_amount`, templates, mailers). This
+  only applies to method-scoped changes. Files already listed are excluded.
+  The files are listed only when the name is rare (`definitions` ≤ 2,
+  counting the changed file) and the method is not a singleton. Otherwise only
+  the count is given.
+- **`relies_on`**: what the changed code itself uses (hop 1 forward). For a
+  method-scoped change, only the edges inside those methods.
+- **`further`**: hops 2–3 as counts by depth, language, area and tier, plus
+  up to 10 notable files (high tier, crossing the boundary, inferred).
+- **`tests`**: tests at hop 1 are listed, with the line that mentions the
+  method. Tests further away are only counted (`counts.tests`).
+- **`incomplete`**: why the answer may be missing files. Reasons:
+  `global_file`, `not_in_graph`, `dynamic_dispatch`,
+  `unresolved_references`, `stale_index`.
+- **`blind_spots`**: present for method-scoped answers. It ends with the
+  `rg -w` command that covers what static analysis cannot.
+- **`policy`**: present only when `ripple.yml` defines rules or areas and a
+  rule fired, or always for `check`. Rule semantics and CI exit codes are as
+  described under Configuration.
+- **`usually_changes_with`**: reserved for co-change history. It is absent.
+
+Changing `ripple.yml` itself does not count as a change to analyse. It gives
+one `ripple_config_changed` warning.
+
+### Budgets
+
+| List | Default size |
+|---|---|
+| `changed` | 30 |
+| `dependents` | 30 |
+| `inherit_only` | 10 |
+| `also_mentioned[].files`, `removed_methods[].mentions` | 15 |
+| `removed_methods` | 10 |
+| `relies_on` | 10 |
+| `further.files` | 10 |
+| `tests` | 10 |
+| `warnings` / `incomplete` per code | 5 |
+| `policy.reasons[].evidence.impacted` | 1 |
+
+The text format ends each cut list with `+N more (--all)`.
+
+### Text
+
+```
+1 changed file; 0 direct dependents (+2 only inherit/include); 11 more mention the name with no edge; 801 more at hops 2-3; 629 tests reach it; method-level (821 if whole files changed); HIGH risk
+changed M app/models/concerns/charge/disputable.rb  ruby  body formatted_disputed_amount  3 file dependents
+inherits/includes, does not call it 2: app/models/charge.rb app/models/purchase.rb
+also mentions `formatted_disputed_amount` (no dependency edge; receiver type unknown) 11 files, defined only here:
+  app/mailers/admin_mailer.rb:16
+  app/views/admin_mailer/chargeback_notify.html.erb:1
+  …
+further 801 files  hops 2:197 3:604  ruby:774 js:18 template:9  areas auth:4 payments:34 payouts:6  notable 63
+  app/models/user.rb  hop 2 via app/models/purchase.rb  high_tier  [auth]
+  +791 more (--all)
+tests (static reach) 629: 1 direct
+  spec/models/concerns/charge/disputable_spec.rb:216
+  +628 more (--all)
+risk HIGH  rules impacted_over_200, reaches_critical_direct, crosses_boundary  owners @payments @security
+blind spots: methods matched by name; receivers untyped; JS/TS and send/try not checked; also run: rg -w formatted_disputed_amount
+```
+
+The order is: summary, removed methods, incomplete, changed, dependents,
+inherit-only, also-mentions, relies-on, further, tests, the one-line policy,
+warnings, and blind spots. The markdown format (for `check`) carries the same
+sections.
 
 Warning codes include:
 
@@ -280,6 +383,7 @@ Warning codes include:
 - `scope_unknown` (`--scope` names a method missing from the file's scope ranges)
 - `deleted_file_still_imported` (cold index only: JS/TS files whose imports of
   a deleted file no longer resolve)
+- `ripple_config_changed`
 - `config_invalid`
 - extractor warnings about the changed files themselves
 
