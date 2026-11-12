@@ -1,0 +1,8 @@
+<h1><%= @account.name %></h1>
+<%= render "card" %>
+<%= render partial: "flash" %>
+<% Status::VISIBILITY.each do |v| %>
+  <%= v %>
+<% end %>
+<%# Comment: MediaAttachment is not code %>
+<%= render "nowhere" %>
