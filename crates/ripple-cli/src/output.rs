@@ -277,6 +277,11 @@ pub fn rank(v: &Value) -> String {
     let mut o = String::new();
     let rows: Vec<&Value> = v["rows"].as_array().into_iter().flatten().collect();
     let by = s(&v["by"]);
+    if v["ready"] == Value::Bool(false) {
+        o += &format!("{}\n", s(&v["not_ready"]));
+        o += &signals_line(&v["signals"]);
+        return o;
+    }
     o += &format!(
         "{} of {} ranked files{}; hotspots: top {}% (rank <= {})\n",
         rows.len(),

@@ -57,8 +57,8 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 | `schema` | Print the JSON Schema of the report (`schema_version` 2). |
 | `why FROM TO` | Shortest dependency path between two files, in either direction. `--scope NAME`: only paths into that method / action of TO (says so when only a file-level path exists). |
 | `areas FILE` | How `ripple.yml` classifies a file: areas, test, global, language. |
-| `file FILE` | One file's profile in at most ~40 lines: language, areas / tier / owners, test and global flags, size and complexity, the 5 most complex methods with line ranges (and their coverage), churn, coverage and uncovered methods, dependents (count and the most depended-on few), dependencies, direct tests, co-change partners, hotspot rank and the state of every signal. `--format text\|json`. |
-| `rank` | Riskiest files first (see [Hotspot ranking](#hotspot-ranking)). `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`, `--format text\|json`. Each row says why it ranks where it does. |
+| `file FILE` | One file's profile in at most ~40 lines: language, areas / tier / owners, test and global flags, size and complexity, the 5 most complex methods with line ranges (and their coverage), churn, coverage and uncovered methods, dependents (count and the most depended-on few), dependencies, direct tests, co-change partners, hotspot rank and the state of every signal. `--format text\|json`. On a freshly started daemon it waits up to 5 s for git history, coverage and the ranking (`--no-wait`: answer at once); what is still not ready is named on a `not ready:` line. |
+| `rank` | Riskiest files first (see [Hotspot ranking](#hotspot-ranking)). `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`, `--format text\|json`. Each row says why it ranks where it does. Waits up to 5 s for git history and coverage to load (`--no-wait`: answer at once); with no ranking yet it says `ranking not ready: …` and exits 4. |
 | `stats` | Index size, scope ranges (`files_with_scopes`, `scopes`), per-phase timings, extractor counters, warnings, daemon info. |
 | `init [--force]`, `config check` | Starter config; validation plus how many files each area matches. |
 | `daemon status\|start\|stop`, `serve [--foreground]` | Manage the daemon. |
@@ -78,6 +78,7 @@ They are normalised to paths relative to the repository root.
 | 1 | `check` found a risk at or above the fail-on level |
 | 2 | Usage error, configuration error, bad git ref, file not in the index, or internal error |
 | 3 | `daemon status` found no daemon running |
+| 4 | `rank` has no ranking yet: git history or coverage was still loading after the wait (or at once with `--no-wait`); it prints `ranking not ready: …` (JSON: `"ready": false`, `"not_ready"`) instead of an empty list |
 
 ### What `--base` compares
 

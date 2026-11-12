@@ -195,3 +195,19 @@ fn one_shot_uses_the_sidecar_only() {
     assert_eq!((h.state.as_str(), h.behind_head), ("ready", true));
     assert_eq!(h.churn["lib/a.txt"].commits, 1);
 }
+
+#[test]
+fn rank_says_not_ready_while_history_builds() {
+    let repo = Repo::new(&[("app/models/a.rb", "class A\n  def x\n    1 if true\n  end\nend\n"), ("app/models/b.rb", "class B\n  def y\n    A.new.x\n  end\nend\n")]);
+    let d = Daemon::start_with(&repo.root, ServeOptions { history_hold: Duration::from_secs(3), ..Default::default() });
+    let (r, _) = d.call("rank", json!({}));
+    assert_eq!(r["ready"], false, "{r:#}");
+    assert!(r["not_ready"].as_str().unwrap().contains("git history"), "{r:#}");
+    assert_eq!(r["signals"]["hotspot"]["state"], "building");
+    let text = ripple_cli::output::rank(&r);
+    assert!(text.starts_with("ranking not ready: waiting for git history") && !text.contains("null"), "{text}");
+    wait_history(&d, "ready", |h| h["state"] == "ready");
+    let (r, _) = d.call("rank", json!({}));
+    // (The test pipeline computes no metrics, so nothing is ranked.)
+    assert_eq!((r["ready"].as_bool(), r["files"].as_u64()), (Some(true), Some(0)), "{r:#}");
+}

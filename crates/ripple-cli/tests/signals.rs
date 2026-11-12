@@ -237,3 +237,17 @@ fn rank_weights_come_from_ripple_yml_and_dependents_exclude_tests() {
     assert!(rows[0]["reason"].as_str().unwrap().contains("1 non-test dependents"), "{}", rows[0]);
     assert_eq!(r["hotspot_percent"], 1.0);
 }
+
+#[test]
+fn rank_and_file_on_a_fresh_daemon_wait_for_signals() {
+    let env = Env::new();
+    // The first command starts the daemon; history builds in the background.
+    let o = env.run(&["rank", "--format", "json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    let r: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!((r["ready"].as_bool(), r["files"].as_u64()), (Some(true), Some(3)), "{r:#}");
+    assert!(!r["rows"].as_array().unwrap().is_empty());
+    let f = env.json(&["file", "app/models/order.rb", "--format", "json"]);
+    assert_eq!(f["signals"]["churn"]["state"], "ready", "{}", f["signals"]);
+    assert!(f["metrics"]["hotspot"]["rank"].as_u64().is_some(), "{}", f["metrics"]);
+}
