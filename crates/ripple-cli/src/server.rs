@@ -29,7 +29,9 @@
 //! after the write, `FSEventsGetCurrentEventId()` is still below the
 //! cookie's event id: fseventsd has not seen it yet), and adding 15+ cheap
 //! events after the cookie removes the mode. So [`cookie_sync`] follows the
-//! cookie with [`KICK_EVENTS`] `fchmod`s of it.
+//! cookie with [`KICK_EVENTS`] `fchmod`s of it. Kicked, an edit's event can
+//! arrive just after a later cookie's, so it does [`COOKIE_ROUNDS`] round
+//! trips (see there).
 
 use crate::engine::{Engine, Pipeline, Snapshot};
 use crate::gitd::GitTracker;
@@ -61,6 +63,15 @@ const COOKIE_PREFIX: &str = "ripple-cookie-";
 /// `fseventsd` at once (see the module docs). Measured threshold: 15.
 #[cfg(target_os = "macos")]
 const KICK_EVENTS: usize = 24;
+/// Cookie round trips per sync. With the kick, FSEvents can (rarely) hand
+/// over an edit's event a fraction of a millisecond *after* a cookie
+/// created later (measured: 27 of 4,000 edits, each 0.24-0.43 ms late); a
+/// second round trip, started once the first cookie is seen, has caught all
+/// of them (0 of 6,000). inotify keeps one queue in order: one round.
+#[cfg(target_os = "macos")]
+const COOKIE_ROUNDS: usize = 2;
+#[cfg(not(target_os = "macos"))]
+const COOKIE_ROUNDS: usize = 1;
 /// Cookie round-trip times kept for `stats`.
 const COOKIE_SAMPLES: usize = 1024;
 /// Distinguishes the cookies of daemons in one process (tests).
@@ -486,6 +497,28 @@ fn kick(_: &std::fs::File) {}
 /// delivered. `Ok(false)` when the deadline passed first.
 fn cookie_sync(shared: &Shared, deadline: Instant) -> Result<bool, ErrorBody> {
     let t = Instant::now();
+    let mut ok = true;
+    for _ in 0..COOKIE_ROUNDS {
+        ok = cookie_round(shared, deadline)?;
+        if !ok {
+            break;
+        }
+    }
+    let mut st = shared.lock();
+    if ok {
+        let c = &mut st.counters.cookie_us;
+        if c.len() >= COOKIE_SAMPLES {
+            c.pop_front();
+        }
+        c.push_back(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
+    } else {
+        st.counters.cookie_timeouts += 1;
+    }
+    Ok(ok)
+}
+
+/// One cookie round trip: create the cookie, kick, wait until it is seen.
+fn cookie_round(shared: &Shared, deadline: Instant) -> Result<bool, ErrorBody> {
     let n = shared.cookie_seq.fetch_add(1, Ordering::Relaxed);
     let name = format!("{}{n}", shared.cookie_stem);
     let path = shared.cookie_dir.join(&name);
@@ -509,15 +542,6 @@ fn cookie_sync(shared: &Shared, deadline: Instant) -> Result<bool, ErrorBody> {
         st = shared.cv.wait_timeout(st, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
     };
     st.cookies.remove(&name);
-    if ok {
-        let c = &mut st.counters.cookie_us;
-        if c.len() >= COOKIE_SAMPLES {
-            c.pop_front();
-        }
-        c.push_back(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
-    } else {
-        st.counters.cookie_timeouts += 1;
-    }
     drop(st);
     let _ = std::fs::remove_file(&path);
     Ok(ok)
