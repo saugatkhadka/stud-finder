@@ -126,8 +126,8 @@ fn parse_text(rel: &str, text: &str, cfg: &CallSiteConfig) -> Parsed {
     } else if let Some(st) = parse::source_type_for(rel) {
         error = parse::parse_block(text, st, 0, rel, cfg, &mut collected);
     }
-    let metrics = Some(collected.complexity.file(lines + collected.lines));
-    Parsed { hash: 0, refs: collected.refs, calls: collected.calls, unclassified: collected.unclassified, error, unreadable: false, metrics }
+    let metrics = collected.complexity.file(lines + collected.lines);
+    Parsed { hash: 0, refs: collected.refs, calls: collected.calls, unclassified: collected.unclassified, error, unreadable: false, metrics, has_metrics: true }
 }
 
 impl State {
@@ -173,7 +173,7 @@ impl State {
         put("js_globs", counts.globs);
         put("js_glob_matches", counts.glob_matches);
         let t = Instant::now();
-        let table = ripple_core::MetricsTable::build(self.parsed.iter().filter_map(|(f, p)| Some((f.as_str(), p.metrics?, &[][..]))), false);
+        let table = ripple_core::MetricsTable::build(self.parsed.iter().filter(|(_, p)| p.has_metrics).map(|(f, p)| (f.as_str(), p.metrics, &[][..])), false);
         out.facts.metrics.push(Arc::new(table));
         put("js_us_metrics", micros(t) as u64);
         put("js_call_sites", out.facts.js_call_sites.len() as u64);
@@ -358,7 +358,9 @@ mod metrics_tests {
 
     fn metrics(rel: &str, src: &str) -> FileMetrics {
         let cfg = CallSiteConfig { callees: Vec::new(), prefixes: Vec::new() };
-        parse_text(rel, src, &cfg).metrics.expect("metrics")
+        let p = parse_text(rel, src, &cfg);
+        assert!(p.has_metrics);
+        p.metrics
     }
 
     /// One function per case; expected values worked out by hand from
