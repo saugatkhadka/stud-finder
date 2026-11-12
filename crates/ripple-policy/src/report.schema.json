@@ -116,7 +116,7 @@
     "removed_method": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["file", "method", "mentions", "mentions_total"],
+      "required": ["file", "method", "mentions", "mentions_total", "other_definitions"],
       "properties": {
         "file": { "$ref": "#/$defs/path" },
         "method": { "type": "string" },
@@ -124,7 +124,8 @@
           "type": "array",
           "items": { "$ref": "#/$defs/mention" }
         },
-        "mentions_total": { "$ref": "#/$defs/count" }
+        "mentions_total": { "$ref": "#/$defs/count" },
+        "other_definitions": { "$ref": "#/$defs/count" }
       }
     },
     "dependent": {

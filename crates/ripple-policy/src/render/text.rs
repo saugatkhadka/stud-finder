@@ -89,7 +89,8 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
 
     // 1. Removed methods that are still mentioned: what will break.
     for m in r.removed_methods.iter().take(cap) {
-        let _ = writeln!(o, "REMOVED {}#{} still mentioned in {} file{}:", m.file, m.method, m.mentions_total, plural(m.mentions_total));
+        let common = if m.other_definitions > 0 { format!(" (name defined in {} other file{})", m.other_definitions, plural(m.other_definitions)) } else { String::new() };
+        let _ = writeln!(o, "REMOVED {}#{} still mentioned in {} file{}{common}:", m.file, m.method, m.mentions_total, plural(m.mentions_total));
         for x in &m.mentions {
             let at = x.line.map(|l| format!(":{l}")).unwrap_or_default();
             let how = match x.how {
@@ -198,7 +199,11 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
             continue;
         }
         let single = if a.singleton { "; singleton method, so calls without the constant are likely other methods" } else { "" };
-        let _ = writeln!(o, "also mentions `{}` (no dependency edge; receiver type unknown) {} file{}, {defs}{single}:", a.name, a.total, plural(a.total));
+        let colon = if a.files.is_empty() { " (--all lists them)" } else { ":" };
+        let _ = writeln!(o, "also mentions `{}` (no dependency edge; receiver type unknown) {} file{}, {defs}{single}{colon}", a.name, a.total, plural(a.total));
+        if a.files.is_empty() {
+            continue;
+        }
         for x in a.files.iter().take(cap) {
             let at = x.line.map(|l| format!(":{l}")).unwrap_or_default();
             let _ = writeln!(o, "  {}{at}", x.file);

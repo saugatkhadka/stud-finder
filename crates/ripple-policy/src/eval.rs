@@ -331,6 +331,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
         .map(|c| TestFile { file: c.file.path.clone(), depth: 0, of: None, via: None, kind: None, line: None, detail: None, mention_line: None })
         .collect();
     counts.tests = tests.len();
+    tests.truncate(opts.cap(budget::TESTS));
     counts.tests_direct = tests.len();
     let test_cap = opts.cap(budget::TESTS);
     let mut test_hits: Vec<usize> = Vec::new();
@@ -632,7 +633,14 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     let (removed_methods, removed_total) = crate::findings::removed_methods(&ctx, opts);
     counts.removed_methods = removed_total;
     truncated |= removed_methods.len() < removed_total || removed_methods.iter().any(|r| r.mentions.len() < r.mentions_total);
-    let incomplete = crate::findings::incomplete(&ctx);
+    let mut incomplete = crate::findings::incomplete(&ctx);
+    if !opts.all {
+        incomplete = group_capped(incomplete, |i| i.reason.clone(), |reason, n| Incomplete {
+            reason,
+            file: None,
+            message: format!("+{n} more files like this (--all)"),
+        });
+    }
 
     // Areas reached: changed files first (depth 0), then impacted non-test files in BFS order.
     let full = opts.policy || opts.all;
@@ -672,6 +680,9 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
 
     warnings.sort_by(|a, b| (&a.code, &a.file, &a.message).cmp(&(&b.code, &b.file, &b.message)));
     warnings.dedup();
+    if !opts.all {
+        warnings = group_capped(warnings, |w| w.code.clone(), |code, n| Warning::new(&code, format!("+{n} more files like this (--all)")));
+    }
 
     let configured = !policy.uses_default_rules() || !policy.areas().is_empty();
     let show_policy = opts.policy || (configured && !reasons.is_empty());
@@ -707,6 +718,26 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     report.summary = summary_line(&report);
     report.timing.evaluate_us = (started.elapsed().as_micros() as u64).saturating_sub(query_us);
     report
+}
+
+/// Keeps at most [`budget::PER_KIND`] entries per key (in order) and
+/// replaces the rest of each key with one summary entry.
+fn group_capped<T>(items: Vec<T>, key: impl Fn(&T) -> String, summary: impl Fn(String, usize) -> T) -> Vec<T> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut out = Vec::new();
+    for it in items {
+        let n = seen.entry(key(&it)).or_default();
+        *n += 1;
+        if *n <= budget::PER_KIND {
+            out.push(it);
+        }
+    }
+    for (k, n) in seen {
+        if n > budget::PER_KIND {
+            out.push(summary(k, n - budget::PER_KIND));
+        }
+    }
+    out
 }
 
 /// `crosses_boundary`, `high_tier`, `global`: why a far file is worth a look.

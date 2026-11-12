@@ -119,9 +119,16 @@ pub(crate) fn removed_methods(ctx: &Ctx, opts: &EvalOptions) -> (Vec<RemovedMeth
                 .filter(|&n| g.mentions(n).is_some_and(|m| m.mentions_any(&id)))
                 .collect();
             total += others.len();
+            // Another class defining the name makes by-name matches doubtful:
+            // past a few definitions they are counted, not listed.
+            let other_definitions = (0..g.node_count() as NodeId)
+                .filter(|n| !nodes.contains(n))
+                .filter(|&n| g.mentions(n).is_some_and(|m| m.defs.contains(&id[0])))
+                .count();
+            let common = !opts.all && other_definitions >= budget::COMMON_NAME_DEFINITIONS;
             // Nearest first: same directory tree, then path.
             others.sort_by_cached_key(|&n| (std::cmp::Reverse(shared_dirs(g.path(n), &c.file.path)), g.path(n).to_string()));
-            {
+            if !common {
                 for n in others {
                     if mentions.len() >= per_name {
                         break;
@@ -138,7 +145,7 @@ pub(crate) fn removed_methods(ctx: &Ctx, opts: &EvalOptions) -> (Vec<RemovedMeth
                 }
             }
             if total > 0 {
-                out.push(RemovedMethod { file: c.file.path.clone(), method: name.clone(), mentions, mentions_total: total });
+                out.push(RemovedMethod { file: c.file.path.clone(), method: name.clone(), mentions, mentions_total: total, other_definitions });
             }
         }
     }
@@ -260,8 +267,12 @@ pub(crate) fn also_mentioned(ctx: &Ctx, opts: &EvalOptions, of: &[NamesOf], excl
     let cap = if opts.all { usize::MAX } else { opts.limit.unwrap_or(budget::ALSO_MENTIONED) };
     // One pass over the workspace for every (changed file, name) pair:
     // about 3 ms on GitLab's 61k files.
-    let queries: Vec<(&NamesOf, &String, u32)> =
+    // One entry per name: the exclusion set is shared, so a name changed
+    // in two files has the same candidates.
+    let mut queries: Vec<(&NamesOf, &String, u32)> =
         of.iter().filter(|o| g.mentions(o.node).is_some()).flat_map(|o| o.names.iter().map(move |n| (o, n, name_id(n)))).collect();
+    let mut seen_names = std::collections::HashSet::new();
+    queries.retain(|(_, n, _)| seen_names.insert(n.as_str()));
     let mut definitions = vec![0usize; queries.len()];
     let mut cands: Vec<Vec<NodeId>> = vec![Vec::new(); queries.len()];
     if !queries.is_empty() {
@@ -285,8 +296,12 @@ pub(crate) fn also_mentioned(ctx: &Ctx, opts: &EvalOptions, of: &[NamesOf], excl
         cands.sort_by_cached_key(|&n| (std::cmp::Reverse(shared_dirs(g.path(n), &o.file)), g.path(n).to_string()));
         let mut total = cands.len();
         let mut files = Vec::new();
+        // A common name (several definitions) or a singleton method: the
+        // mentions are mostly other methods, so only the count is given.
+        let singleton = o.singleton.contains(name);
+        let list_cap = if opts.all { cap } else if definitions[q] + 1 > budget::COMMON_NAME_DEFINITIONS || singleton { 0 } else { cap };
         for n in cands {
-            if files.len() >= cap {
+            if files.len() >= list_cap {
                 break;
             }
             let path = g.path(n);
@@ -304,7 +319,7 @@ pub(crate) fn also_mentioned(ctx: &Ctx, opts: &EvalOptions, of: &[NamesOf], excl
             of: o.file.clone(),
             definitions: definitions[q] + 1,
             total,
-            singleton: o.singleton.contains(name),
+            singleton,
             files,
         });
     }

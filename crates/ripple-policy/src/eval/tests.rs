@@ -1038,15 +1038,23 @@ fn callers_first_heirs_apart_and_call_lines() {
     // lib/cache.rb mentions some `fetch` with no edge; two files define one.
     let a = &r.also_mentioned[0];
     assert_eq!((a.name.as_str(), a.definitions, a.total, a.singleton), ("fetch", 2, 1, true));
-    assert_eq!((a.files[0].file.as_str(), a.files[0].line), ("lib/cache.rb", Some(1)));
+    assert!(a.files.is_empty(), "a singleton's by-name mentions are counted, not listed");
     let t = crate::render::text::render(&r, 30, false);
     assert!(t.starts_with("1 changed file; 2 direct dependents (+1 only inherit/include); 1 more mention the name with no edge;"), "{t}");
     assert!(t.contains("\n  app/controllers/a_controller.rb:3  ruby_constant Link  calls fetch on the constant at 3,5\n  app/models/b.rb:4  ruby_constant Link  calls fetch\n"), "{t}");
     assert!(t.contains("\ninherits/includes, does not call it 1: app/models/heir.rb\n"), "{t}");
-    assert!(t.contains("\nalso mentions `fetch` (no dependency edge; receiver type unknown) 1 file, name is common: 2 definitions; singleton method"), "{t}");
+    assert!(t.contains("\nalso mentions `fetch` (no dependency edge; receiver type unknown) 1 file, name is common: 2 definitions; singleton method, so calls without the constant are likely other methods (--all lists them)\n"), "{t}");
     assert!(t.contains("\n  spec/models/link_spec.rb:2\n"), "{t}");
     assert!(t.ends_with("also run: rg -w fetch\n"), "{t}");
     assert!(crate::schema::validate_report(&serde_json::to_value(&r).unwrap()).is_empty());
+    // With --all they are listed, confirmed in the text.
+    let (root, g) = names_world();
+    let p = policy("");
+    let opts = EvalOptions { root: Some(root.clone()), all: true, ..Default::default() };
+    let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &[m("app/models/link.rb").in_scopes(["fetch"])], &opts);
+    let _ = std::fs::remove_dir_all(root);
+    let a = &r.also_mentioned[0];
+    assert_eq!((a.files[0].file.as_str(), a.files[0].line), ("lib/cache.rb", Some(1)));
 }
 
 #[test]
@@ -1077,4 +1085,20 @@ fn ripple_config_is_not_a_change() {
     let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &[m("ripple.yml"), m("app/models/heir.rb")], &EvalOptions::default());
     assert_eq!(r.counts.changed, 1);
     assert!(r.warnings.iter().any(|w| w.code == "ripple_config_changed"));
+}
+
+#[test]
+fn many_deleted_fixtures_do_not_flood_the_report() {
+    let g = Graph::build(&[], ["app/a.rb"]);
+    let p = policy("");
+    let changed: Vec<ChangedFile> = (0..40).map(|i| ChangedFile::new(format!("spec/fixtures/cassette_{i:02}.yml"), FileStatus::Deleted)).collect();
+    let r = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &changed, &EvalOptions::default());
+    let not_indexed: Vec<&Warning> = r.warnings.iter().filter(|w| w.code == "deleted_file_not_indexed").collect();
+    assert_eq!(not_indexed.len(), budget::PER_KIND + 1, "{:#?}", r.warnings);
+    assert_eq!(not_indexed.last().unwrap().message, format!("+{} more files like this (--all)", 40 - budget::PER_KIND));
+    assert!(r.incomplete.len() <= budget::PER_KIND + 1, "{:#?}", r.incomplete);
+    assert!(r.tests.len() <= budget::TESTS && r.counts.tests == 40, "changed tests are cut to the budget too");
+    let all = evaluate_with(&p, &g, &PolicyIndex::build(&p, &g), &changed, &EvalOptions { all: true, ..Default::default() });
+    assert_eq!(all.warnings.iter().filter(|w| w.code == "deleted_file_not_indexed").count(), 40);
+    assert_eq!(all.tests.len(), 40);
 }

@@ -22,7 +22,7 @@ pub mod budget {
     /// `dependents` entries.
     pub const DEPENDENTS: usize = 30;
     /// `relies_on` entries.
-    pub const RELIES_ON: usize = 15;
+    pub const RELIES_ON: usize = 10;
     /// `further.files` entries (notable files only).
     pub const FURTHER: usize = 10;
     /// `tests` entries (changed tests and tests at hop 1).
@@ -32,8 +32,14 @@ pub mod budget {
     pub const MENTIONS: usize = 15;
     /// `also_mentioned` files per name.
     pub const ALSO_MENTIONED: usize = 15;
+    /// A name with more definitions than this is common: `also_mentioned`
+    /// gives its count only (`all` lists the files).
+    pub const COMMON_NAME_DEFINITIONS: usize = 3;
     /// `inherit_only` entries.
     pub const INHERIT_ONLY: usize = 10;
+    /// `incomplete` and `warnings` entries per reason / code; the rest are
+    /// summarised in one entry each.
+    pub const PER_KIND: usize = 5;
     /// Explanation paths per policy reason in the compact policy section.
     pub const EVIDENCE: usize = 1;
 }
@@ -137,6 +143,10 @@ pub struct RemovedMethod {
     /// Mentions before the budget (by-name matches are counted from the
     /// index; listed ones are confirmed in the file text when it can be read).
     pub mentions_total: usize,
+    /// Other files that define a method of this name. From
+    /// [`budget::COMMON_NAME_DEFINITIONS`] on, by-name matches are counted in
+    /// `mentions_total` but not listed (unless `all`).
+    pub other_definitions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -157,6 +167,7 @@ pub struct AlsoMentioned {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub singleton: bool,
     /// Nearest first (same directory tree, then path); `how` is `by_name`.
+    /// Empty by default for a common name or a singleton method.
     pub files: Vec<Mention>,
 }
 
