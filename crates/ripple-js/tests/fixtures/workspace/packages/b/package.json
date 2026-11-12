@@ -1,0 +1,1 @@
+{ "name": "@acme/b", "exports": { ".": { "types": "./src/missing.d.ts", "import": "./src/main.ts" }, "./feature": "./src/feature/index.ts", "./utils/*": "./src/utils/*.ts" } }
