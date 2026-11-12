@@ -18,3 +18,4 @@ pub mod protocol;
 pub mod query;
 pub mod server;
 pub mod signals;
+pub mod snapfile;

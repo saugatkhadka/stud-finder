@@ -11,7 +11,6 @@
 use anyhow::{Context, Result, bail};
 use ripple_cli::engine::{Engine, Pipeline, Snapshot};
 pub use ripple_core::Confidence;
-use ripple_core::model::ScopeRange;
 use ripple_core::{Graph, QueryOpts};
 use ripple_policy::{FileStatus, Hunk, Language, Policy, scopes_for_hunks};
 use std::collections::BTreeMap;
@@ -34,7 +33,7 @@ pub struct Query {
 enum Source {
     Snapshot(Arc<Snapshot>),
     #[cfg_attr(not(test), allow(dead_code))]
-    Synthetic(Graph),
+    Synthetic(Box<Graph>),
 }
 
 /// One index generation (the repository at one commit) plus the policy's
@@ -42,7 +41,7 @@ enum Source {
 pub struct Index {
     source: Source,
     tests: Vec<bool>,
-    scopes: Arc<BTreeMap<String, Vec<ScopeRange>>>,
+    scopes: ripple_cli::engine::ScopeMap,
     pub build_ms: u64,
 }
 
@@ -57,11 +56,11 @@ impl Index {
 
     /// A hand-made graph with default config (for tests).
     #[cfg(test)]
-    pub fn synthetic(edges: &[ripple_core::Edge], extra_nodes: &[&str], scopes: BTreeMap<String, Vec<ScopeRange>>) -> Self {
+    pub fn synthetic(edges: &[ripple_core::Edge], extra_nodes: &[&str], scopes: BTreeMap<String, Vec<ripple_core::model::ScopeRange>>) -> Self {
         let graph = Graph::build(edges, extra_nodes.iter().copied());
         let policy = Policy::compile(ripple_core::Config::default()).expect("defaults compile");
         let tests = graph.paths().map(|p| policy.is_test(p)).collect();
-        Self { source: Source::Synthetic(graph), tests, scopes: Arc::new(scopes), build_ms: 0 }
+        Self { source: Source::Synthetic(Box::new(graph)), tests, scopes: ripple_cli::engine::ScopeMap::Map(Arc::new(scopes)), build_ms: 0 }
     }
 
     fn graph(&self) -> &Graph {
@@ -97,7 +96,7 @@ impl Index {
             Status::Modified => FileStatus::Modified,
             _ => return None,
         };
-        scopes_for_hunks(status, hunks, self.scopes.get(path).map(Vec::as_slice).filter(|v| !v.is_empty()))
+        scopes_for_hunks(status, hunks, self.scopes.get(path).as_deref().filter(|v| !v.is_empty()))
     }
 
     /// Reverse reachability (dependents), seeds excluded, as `(node, depth)`.

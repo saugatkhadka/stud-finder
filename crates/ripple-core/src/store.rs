@@ -319,7 +319,7 @@ impl SectionWriter {
     }
 
     pub fn put_bytes(&mut self, id: u32, bytes: &[u8]) {
-        while self.data.len() % 8 != 0 {
+        while !self.data.len().is_multiple_of(8) {
             self.data.push(0);
         }
         self.sections.push((id, self.data.len() as u64, bytes.len() as u64));

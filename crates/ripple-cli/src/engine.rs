@@ -9,8 +9,10 @@ use crate::edgefile::EdgeFileExtractor;
 use crate::files::{self, Listing};
 use anyhow::Result;
 use ripple_core::model::ScopeRange;
+use ripple_core::store::{SectionFile, SectionWriter, Slab, StrTable};
 use ripple_core::{ChangeSet, Edge, ExtractOutput, Extractor, Facts, Graph, Linker, RelPath, Warning, Workspace};
 use ripple_policy::{Policy, PolicyIndex};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -45,6 +47,172 @@ impl Pipeline {
 /// engine and all its snapshots; written only after a pass is published).
 pub type Seen = Arc<RwLock<HashMap<RelPath, SystemTime>>>;
 
+/// Workspace membership of a snapshot: the engine's set, or (a snapshot
+/// loaded from disk) one bit per graph node over the graph's path table.
+#[derive(Clone)]
+pub enum FileSet {
+    Set(Arc<HashSet<RelPath>>),
+    Nodes { paths: Arc<StrTable>, bits: Slab<u64>, len: usize },
+}
+
+impl Default for FileSet {
+    fn default() -> Self {
+        FileSet::Set(Arc::default())
+    }
+}
+
+impl FileSet {
+    pub fn contains(&self, p: &str) -> bool {
+        match self {
+            FileSet::Set(s) => s.contains(p),
+            FileSet::Nodes { paths, bits, .. } => paths.binary_search(p).is_ok_and(|i| bits[i / 64] >> (i % 64) & 1 == 1),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            FileSet::Set(s) => s.len(),
+            FileSet::Nodes { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every member (unordered for `Set`, sorted for `Nodes`).
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            FileSet::Set(s) => Box::new(s.iter().map(String::as_str)),
+            FileSet::Nodes { paths, bits, .. } => Box::new((0..paths.len()).filter(move |&i| bits[i / 64] >> (i % 64) & 1 == 1).map(move |i| paths.get(i))),
+        }
+    }
+
+    /// The members as bits over `paths` (sorted); `None` if one is not in it.
+    pub fn to_bits(&self, paths: &StrTable) -> Option<Vec<u64>> {
+        let mut bits = vec![0u64; paths.len().div_ceil(64)];
+        for f in self.iter() {
+            let i = paths.binary_search(f).ok()?;
+            bits[i / 64] |= 1 << (i % 64);
+        }
+        Some(bits)
+    }
+
+    /// Checks `bits` against `paths` (see [`FileSet::Nodes`]).
+    pub fn from_bits(paths: Arc<StrTable>, bits: Slab<u64>) -> Result<Self, String> {
+        let n = paths.len();
+        if bits.len() != n.div_ceil(64) || (!n.is_multiple_of(64) && bits.last().is_some_and(|w| w >> (n % 64) != 0)) {
+            return Err("file set does not match the node table".into());
+        }
+        let len = bits.iter().map(|w| w.count_ones() as usize).sum();
+        Ok(FileSet::Nodes { paths, bits, len })
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            FileSet::Set(s) => s.capacity() * (std::mem::size_of::<RelPath>() + 1) + s.iter().map(|p| p.capacity()).sum::<usize>(),
+            FileSet::Nodes { bits, .. } => bits.heap_bytes(),
+        }
+    }
+}
+
+/// Scope ranges per file: the engine's map, or (loaded from disk) columns.
+#[derive(Clone)]
+pub enum ScopeMap {
+    Map(Arc<BTreeMap<RelPath, Vec<ScopeRange>>>),
+    /// `files` sorted; file `i` has ranges `offs[i]..offs[i+1]` of
+    /// `lines` (`[start, end]`) and `names`.
+    Stored { files: StrTable, offs: Slab<u32>, lines: Slab<[u32; 2]>, names: StrTable },
+}
+
+impl Default for ScopeMap {
+    fn default() -> Self {
+        ScopeMap::Map(Arc::default())
+    }
+}
+
+impl ScopeMap {
+    pub fn get(&self, file: &str) -> Option<Cow<'_, [ScopeRange]>> {
+        match self {
+            ScopeMap::Map(m) => m.get(file).map(|v| Cow::Borrowed(v.as_slice())),
+            ScopeMap::Stored { files, .. } => files.binary_search(file).ok().map(|i| self.stored_at(i)),
+        }
+    }
+
+    fn stored_at(&self, i: usize) -> Cow<'_, [ScopeRange]> {
+        let ScopeMap::Stored { offs, lines, names, .. } = self else { unreachable!() };
+        let r = offs[i] as usize..offs[i + 1] as usize;
+        Cow::Owned(r.map(|k| ScopeRange { name: names.get(k).to_string(), start: lines[k][0], end: lines[k][1] }).collect())
+    }
+
+    /// Files with an entry (possibly empty).
+    pub fn len(&self) -> usize {
+        match self {
+            ScopeMap::Map(m) => m.len(),
+            ScopeMap::Stored { files, .. } => files.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Ranges over all files.
+    pub fn total(&self) -> usize {
+        match self {
+            ScopeMap::Map(m) => m.values().map(Vec::len).sum(),
+            ScopeMap::Stored { lines, .. } => lines.len(),
+        }
+    }
+
+    /// Every entry in path order.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (&str, Cow<'_, [ScopeRange]>)> + '_> {
+        match self {
+            ScopeMap::Map(m) => Box::new(m.iter().map(|(k, v)| (k.as_str(), Cow::Borrowed(v.as_slice())))),
+            ScopeMap::Stored { files, .. } => Box::new((0..files.len()).map(move |i| (files.get(i), self.stored_at(i)))),
+        }
+    }
+
+    pub fn save(&self, w: &mut SectionWriter, base: u32) {
+        let mut offs = vec![0u32];
+        let mut lines: Vec<[u32; 2]> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for (f, v) in self.iter() {
+            keys.push(f.to_string());
+            for r in v.iter() {
+                lines.push([r.start, r.end]);
+                names.push(r.name.clone());
+            }
+            offs.push(lines.len() as u32);
+        }
+        StrTable::from_strs(keys.iter().map(String::as_str)).save(w, base, base + 1);
+        w.put(base + 2, &offs);
+        w.put(base + 3, &lines);
+        StrTable::from_strs(names.iter().map(String::as_str)).save(w, base + 4, base + 5);
+    }
+
+    pub fn load(f: &SectionFile, base: u32) -> Result<Self, String> {
+        let files = StrTable::load(f, base, base + 1)?;
+        let offs: Slab<u32> = f.slab(base + 2)?;
+        let lines: Slab<[u32; 2]> = f.slab(base + 3)?;
+        let names = StrTable::load(f, base + 4, base + 5)?;
+        let sorted = (1..files.len()).all(|i| files.get(i - 1) < files.get(i));
+        let offs_ok = offs.len() == files.len() + 1 && offs[0] == 0 && offs.windows(2).all(|w| w[0] <= w[1]) && offs[files.len()] as usize == lines.len();
+        if !sorted || !offs_ok || names.len() != lines.len() {
+            return Err("scope table is inconsistent".into());
+        }
+        Ok(ScopeMap::Stored { files, offs, lines, names })
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            ScopeMap::Map(m) => m.iter().map(|(k, v)| k.capacity() + 48 + v.capacity() * std::mem::size_of::<ScopeRange>() + v.iter().map(|r| r.name.capacity()).sum::<usize>()).sum(),
+            ScopeMap::Stored { files, offs, lines, names } => files.heap_bytes() + offs.heap_bytes() + lines.heap_bytes() + names.heap_bytes(),
+        }
+    }
+}
+
 /// One immutable index generation.
 pub struct Snapshot {
     pub generation: u64,
@@ -60,7 +228,7 @@ pub struct Snapshot {
     /// Microseconds per phase of the pass that produced this generation.
     pub timings: BTreeMap<String, u64>,
     /// Workspace membership.
-    pub files: Arc<HashSet<RelPath>>,
+    pub files: FileSet,
     /// When each path was last looked at by an incremental pass; paths not
     /// present were last looked at by the full build at `base_time`.
     pub seen: Seen,
@@ -73,14 +241,14 @@ pub struct Snapshot {
     /// file, merged from every extractor's [`Facts::scopes`]. Lets a diff be
     /// turned into method-level seeds. Shared between generations until an
     /// extractor reports different ranges.
-    pub scopes: Arc<BTreeMap<RelPath, Vec<ScopeRange>>>,
+    pub scopes: ScopeMap,
 }
 
 impl Snapshot {
     /// Scope ranges of `file`, sorted by start line; `None` when the
     /// extractors report none (the file then always counts as wholly changed).
-    pub fn scopes_of(&self, file: &str) -> Option<&[ScopeRange]> {
-        self.scopes.get(file).map(Vec::as_slice).filter(|v| !v.is_empty())
+    pub fn scopes_of(&self, file: &str) -> Option<Cow<'_, [ScopeRange]>> {
+        self.scopes.get(file).filter(|v| !v.is_empty())
     }
 }
 
@@ -110,6 +278,43 @@ impl Snapshot {
             };
             if stale {
                 out.push(p.clone());
+            }
+        }
+        out
+    }
+}
+
+impl Snapshot {
+    /// Paths that may differ on disk from this snapshot without a watcher
+    /// having said so, assuming every change before `since` was reported:
+    /// workspace files written at or after `since` (or their own last-seen
+    /// time, if earlier) or gone, and the directories holding workspace files
+    /// whose entries changed since then (a created file). One `stat` per file
+    /// and directory. Used to cover the time no watcher ran (sleep, restart).
+    pub fn sweep(&self, since: SystemTime) -> Vec<RelPath> {
+        let seen = self.seen.read().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        let mut dirs: BTreeSet<&str> = BTreeSet::new();
+        dirs.insert("");
+        for f in self.files.iter() {
+            let at = seen.get(f).copied().unwrap_or(self.base_time).min(since);
+            // (A listed path can be a directory: a submodule or nested repository.)
+            let changed = std::fs::metadata(self.root.join(f)).and_then(|m| m.modified()).map_or(true, |t| t >= at);
+            if changed {
+                out.push(f.to_string());
+            }
+            let mut d = f;
+            while let Some(i) = d.rfind('/') {
+                d = &d[..i];
+                if !dirs.insert(d) {
+                    break;
+                }
+            }
+        }
+        for d in dirs {
+            let changed = std::fs::metadata(self.root.join(d)).and_then(|m| m.modified()).map_or(true, |t| t >= since);
+            if changed {
+                out.push(d.to_string());
             }
         }
         out
@@ -214,7 +419,7 @@ fn splice(old: Vec<Edge>, files: &[RelPath], rows: Vec<Edge>) -> Vec<Edge> {
     out
 }
 
-fn load_policy(root: &Path) -> (Policy, Option<Warning>) {
+pub(crate) fn load_policy(root: &Path) -> (Policy, Option<Warning>) {
     match Policy::load(root) {
         Ok(p) => (p, None),
         Err(e) => {
@@ -224,6 +429,59 @@ fn load_policy(root: &Path) -> (Policy, Option<Warning>) {
     }
 }
 
+/// Turns raw paths reported by a watcher or a freshness check into a
+/// [`ChangeSet`] by looking at the file system: existing files are
+/// modified/added (unless ignored), missing ones removed; directories are
+/// expanded. `known` is the indexed workspace. Returns whether `ripple.yml`
+/// was among them.
+pub fn resolve_paths(root: &Path, known: &FileSet, policy: &Policy, paths: &BTreeSet<RelPath>) -> (ChangeSet, bool) {
+    let mut modified = BTreeSet::new();
+    let mut removed = BTreeSet::new();
+    let mut candidates = Vec::new();
+    let mut config = false;
+    let mut case = files::ExactCase::new(root);
+    for p in paths {
+        if ripple_policy::is_config_file(root, p.as_str()) {
+            config = true;
+        }
+        let abs = root.join(p);
+        // On case-insensitive file systems `stat("Version")` finds `VERSION`;
+        // only the exact spelling counts as the file existing.
+        let meta = std::fs::metadata(&abs).ok().filter(|_| case.exists(p));
+        match meta {
+            Some(m) if m.is_file() => {
+                if known.contains(p) {
+                    modified.insert(p.clone());
+                } else {
+                    candidates.push(p.clone());
+                }
+            }
+            Some(m) if m.is_dir() => {
+                for f in files::walk_under(root, &abs) {
+                    if !known.contains(&f) {
+                        candidates.push(f);
+                    }
+                }
+                let prefix = format!("{p}/");
+                removed.extend(known.iter().filter(|f| f.starts_with(&prefix) && !case.exists(f)).map(str::to_string));
+            }
+            _ => {
+                if known.contains(p) {
+                    removed.insert(p.clone());
+                } else {
+                    // Possibly a deleted directory.
+                    let prefix = format!("{p}/");
+                    removed.extend(known.iter().filter(|f| f.starts_with(&prefix) && !case.exists(f)).map(str::to_string));
+                }
+            }
+        }
+    }
+    candidates.retain(|c| !policy.is_ignored(c) && !c.starts_with(".git/"));
+    let ignored = files::git_ignored(root, &candidates);
+    modified.extend(candidates.into_iter().filter(|c| !ignored.contains(c)));
+    (ChangeSet { modified: modified.into_iter().collect(), removed: removed.into_iter().collect() }, config)
+}
+
 fn us(t: Instant) -> u64 {
     t.elapsed().as_micros() as u64
 }
@@ -231,6 +489,12 @@ fn us(t: Instant) -> u64 {
 impl Engine {
     /// Cold start: lists files and runs every extractor and linker.
     pub fn open(root: &Path, pipeline: Pipeline) -> Result<(Self, Arc<Snapshot>)> {
+        Self::open_after(root, pipeline, 0)
+    }
+
+    /// [`Engine::open`], numbering generations after `generation` (a
+    /// daemon waking from sleep keeps its generations increasing).
+    pub fn open_after(root: &Path, pipeline: Pipeline, generation: u64) -> Result<(Self, Arc<Snapshot>)> {
         let root = root.to_path_buf();
         let (policy, config_warning) = load_policy(&root);
         let n_ex = pipeline.extractors.len();
@@ -248,7 +512,7 @@ impl Engine {
             tombstones: BTreeMap::new(),
             policy: Arc::new(policy),
             config_warning,
-            generation: 0,
+            generation,
             listing: Listing::Git,
             current: None,
             scopes: Arc::default(),
@@ -260,6 +524,11 @@ impl Engine {
 
     pub fn current(&self) -> Option<Arc<Snapshot>> {
         self.current.clone()
+    }
+
+    /// Drops all indexing state, keeping the extractors and linkers.
+    pub fn into_pipeline(self) -> Pipeline {
+        self.pipeline
     }
 
     pub fn root(&self) -> &Path {
@@ -310,56 +579,9 @@ impl Engine {
         Ok(snap)
     }
 
-    /// Turns raw paths reported by a watcher or a freshness check into a
-    /// [`ChangeSet`] by looking at the file system: existing files are
-    /// modified/added (unless ignored), missing ones removed; directories are
-    /// expanded. Returns whether `ripple.yml` was among them.
+    /// See [`resolve_paths`].
     pub fn resolve_paths(&self, paths: &BTreeSet<RelPath>) -> (ChangeSet, bool) {
-        let mut modified = BTreeSet::new();
-        let mut removed = BTreeSet::new();
-        let mut candidates = Vec::new();
-        let mut config = false;
-        let mut case = files::ExactCase::new(&self.root);
-        for p in paths {
-            if ripple_policy::is_config_file(&self.root, p.as_str()) {
-                config = true;
-            }
-            let abs = self.root.join(p);
-            // On case-insensitive file systems `stat("Version")` finds `VERSION`;
-            // only the exact spelling counts as the file existing.
-            let meta = std::fs::metadata(&abs).ok().filter(|_| case.exists(p));
-            match meta {
-                Some(m) if m.is_file() => {
-                    if self.files.contains(p) {
-                        modified.insert(p.clone());
-                    } else {
-                        candidates.push(p.clone());
-                    }
-                }
-                Some(m) if m.is_dir() => {
-                    for f in files::walk_under(&self.root, &abs) {
-                        if !self.files.contains(&f) {
-                            candidates.push(f);
-                        }
-                    }
-                    let prefix = format!("{p}/");
-                    removed.extend(self.files.iter().filter(|f| f.starts_with(&prefix) && !case.exists(f)).cloned());
-                }
-                _ => {
-                    if self.files.contains(p) {
-                        removed.insert(p.clone());
-                    } else {
-                        // Possibly a deleted directory.
-                        let prefix = format!("{p}/");
-                        removed.extend(self.files.iter().filter(|f| f.starts_with(&prefix) && !case.exists(f)).cloned());
-                    }
-                }
-            }
-        }
-        candidates.retain(|c| !self.policy.is_ignored(c) && !c.starts_with(".git/"));
-        let ignored = files::git_ignored(&self.root, &candidates);
-        modified.extend(candidates.into_iter().filter(|c| !ignored.contains(c)));
-        (ChangeSet { modified: modified.into_iter().collect(), removed: removed.into_iter().collect() }, config)
+        resolve_paths(&self.root, &FileSet::Set(self.files.clone()), &self.policy, paths)
     }
 
     /// Applies raw paths (see [`Self::resolve_paths`]). Returns the new
@@ -642,13 +864,13 @@ impl Engine {
             warnings,
             stats,
             timings,
-            files: self.files.clone(),
+            files: FileSet::Set(self.files.clone()),
             seen: self.seen.clone(),
             base_time: self.base_time,
             listing: self.listing.as_str(),
             tombstones: self.tombstones.len(),
             built_at: SystemTime::now(),
-            scopes: self.scopes.clone(),
+            scopes: ScopeMap::Map(self.scopes.clone()),
         });
         self.current = Some(snap.clone());
         snap

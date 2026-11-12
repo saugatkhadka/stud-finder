@@ -173,7 +173,7 @@ impl MentionStore {
                 None => index.push(u32::MAX),
                 Some(m) => {
                     index.push(words.len() as u32);
-                    words.push(u32::from(m.opaque) * M_OPAQUE | u32::from(m.controller) * M_CONTROLLER);
+                    words.push((u32::from(m.opaque) * M_OPAQUE) | (u32::from(m.controller) * M_CONTROLLER));
                     words.extend([m.pairs.len() as u32, m.defs.len() as u32, m.implicit.len() as u32, m.self_dynamic.len() as u32]);
                     for &(a, b) in m.pairs {
                         words.extend([a, b]);
@@ -861,6 +861,10 @@ impl Graph {
     /// Every node's path, in node id order (sorted).
     pub fn paths(&self) -> impl ExactSizeIterator<Item = &str> + Clone + '_ {
         self.paths.iter()
+    }
+    /// The node path table itself (shared, so node-indexed sets can outlive a borrow).
+    pub fn path_table(&self) -> &Arc<StrTable> {
+        &self.paths
     }
     pub fn edge(&self, edge: u32) -> (NodeId, NodeId, EdgeData) {
         let [f, t] = self.endpoints[edge as usize];

@@ -20,6 +20,11 @@
 //!   cargo test --release -p ripple-cli --test replay_equality -- --ignored --nocapture
 //! ```
 //!
+//! Each compared snapshot is also written to disk and mapped back
+//! ([`ripple_cli::snapfile`], what a sleeping daemon serves from); the mapped
+//! one must answer every query exactly like the heap one (per-node queries
+//! on about 2000 nodes).
+//!
 //! `RIPPLE_REPLAY_EVERY=k` compares with a fresh open only every k-th pass
 //! (passes are still applied one commit at a time); use it on big repos.
 //!
@@ -28,10 +33,12 @@
 //! references, batches of 20), restoring each file afterwards.
 
 use ripple_cli::engine::{Engine, Pipeline, Snapshot};
+use ripple_cli::snapfile;
 use ripple_core::Graph;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
@@ -138,10 +145,24 @@ impl Tally {
         self.total_us.push(s.timings.get("total_us").copied().unwrap_or(0));
     }
 
-    fn check(&mut self, label: &str, s: &Snapshot, eng: &Engine, root: &Path) {
+    fn check(&mut self, label: &str, s: &Arc<Snapshot>, eng: &Engine, root: &Path) {
         let inc = digest(s, &s.graph, eng);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.snap");
+        let t = Instant::now();
+        let size = snapfile::save(s, &path).unwrap();
+        let saved = t.elapsed();
+        let loaded = Arc::new(snapfile::load(&path, root).unwrap());
+        let diff = snapfile::differences(s, &loaded, (s.graph.node_count() / 2000).max(1));
+        eprintln!("  {label} snapshot {:.1} MB, saved in {} ms, {} differences", size as f64 / 1e6, saved.as_millis(), diff.len());
+        for d in diff.iter().take(12) {
+            eprintln!("  {label} snapshot differs: {d}");
+        }
+        if !diff.is_empty() {
+            self.failures.push(format!("{label}: mapped snapshot differs"));
+        }
         let (fresh_eng, fresh) = Engine::open(root, Pipeline::standard()).unwrap();
-        let mut files: Vec<&str> = fresh.files.iter().map(String::as_str).collect();
+        let mut files: Vec<&str> = fresh.files.iter().collect();
         files.sort_unstable();
         let mut reference = Graph::build(fresh_eng.output_edges().chain(eng.tombstone_edges()), files);
         if let Some(m) = fresh_eng.mention_table() {
@@ -285,7 +306,7 @@ fn random_edits(root: &Path, n: usize) {
     // Edited files are restored after each step; this covers a panic.
     let _restore = Restore { root: root.to_path_buf(), to: "HEAD".into() };
     let (mut eng, snap) = Engine::open(root, Pipeline::standard()).unwrap();
-    let mut rb: Vec<String> = snap.files.iter().filter(|f| f.ends_with(".rb") && (f.starts_with("app/") || f.starts_with("lib/") || f.starts_with("spec/"))).cloned().collect();
+    let mut rb: Vec<String> = snap.files.iter().filter(|f| f.ends_with(".rb") && (f.starts_with("app/") || f.starts_with("lib/") || f.starts_with("spec/"))).map(String::from).collect();
     rb.sort();
     let models: Vec<&String> = rb.iter().filter(|f| f.starts_with("app/models/") && !f.contains("concerns")).collect();
     let konst = |rng: &mut Rng| -> String {
