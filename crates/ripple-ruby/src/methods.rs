@@ -436,11 +436,16 @@ impl Collector<'_> {
             let name = name.as_slice();
             self.csend_seen.retain(|n| n.as_slice() != name);
         }
+        let d = decisions(node);
+        let safe_nav = matches!(node, Node::CallNode { .. }) && node.as_call_node().is_some_and(|c| c.is_safe_navigation());
+        if d == 0 && !safe_nav {
+            return;
+        }
         let at = node.location().start();
         if self.cur != NONE && at >= self.params.0 && at < self.params.1 {
             return;
         }
-        let n = decisions(node) + self.csend(node);
+        let n = d + if safe_nav { self.csend(node) } else { 0 };
         self.add_decisions(n);
     }
 }
