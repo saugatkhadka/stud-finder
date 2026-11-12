@@ -269,7 +269,7 @@ fn query(root: &Path, file: &str, runs: usize, limit: Option<usize>) -> Result<u
     let mut bytes = 0;
     for _ in 0..runs {
         let t = Instant::now();
-        let imp = snap.graph.impact(&[node], QueryOpts { max_depth: 0, min_confidence: Confidence::Heuristic });
+        let imp = snap.graph.impact(&[node], QueryOpts { max_depth: 0, min_confidence: Confidence::Heuristic, file_level: false });
         bfs.push(t.elapsed().as_micros() as u64);
         hits = imp.hits.len();
         let changed = vec![ripple_policy::ChangedFile::modified(file)];

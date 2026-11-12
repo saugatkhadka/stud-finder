@@ -143,6 +143,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     let eff = QueryOpts {
         max_depth: opts.max_depth.unwrap_or(cfg.max_depth),
         min_confidence: opts.min_confidence.unwrap_or(cfg.min_confidence),
+        file_level: false,
     };
     let mut ctx = Ctx { policy, graph, index, changed, seeds, eff, reaches: Vec::new(), has_lines };
 
@@ -423,7 +424,7 @@ impl Ctx<'_> {
         if let Some(i) = self.reaches.iter().position(|r| r.conf == conf && covers(r.depth, depth)) {
             return i;
         }
-        let impact = self.graph.impact(&self.seeds, QueryOpts { max_depth: depth, min_confidence: conf });
+        let impact = self.graph.impact(&self.seeds, QueryOpts { max_depth: depth, min_confidence: conf, file_level: false });
         let mut root = Vec::with_capacity(impact.hits.len());
         let mut minc = Vec::with_capacity(impact.hits.len());
         // Hits are in BFS order, so a hit's `via` always precedes it.

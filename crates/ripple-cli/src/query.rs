@@ -119,7 +119,7 @@ fn not_found(snap: &Snapshot, file: &str) -> ErrorBody {
 fn neighbours(snap: &Snapshot, p: &FileParams, forward: bool) -> QueryResult {
     let file = clean(&p.file);
     let node = snap.graph.id(&file).ok_or_else(|| not_found(snap, &file))?;
-    let opts = QueryOpts { max_depth: p.depth.unwrap_or(1), min_confidence: p.min_confidence.unwrap_or(Confidence::Heuristic) };
+    let opts = QueryOpts { max_depth: p.depth.unwrap_or(1), min_confidence: p.min_confidence.unwrap_or(Confidence::Heuristic), file_level: false };
     let imp = if forward { snap.graph.dependencies_closure(&[node], opts) } else { snap.graph.impact(&[node], opts) };
     let files: Vec<Neighbour> = imp
         .impacted()

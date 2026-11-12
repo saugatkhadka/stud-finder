@@ -83,11 +83,14 @@ pub struct QueryOpts {
     /// 0 = unlimited.
     pub max_depth: u32,
     pub min_confidence: Confidence,
+    /// Treat every file as one unit: ignore method/action scopes on edges and
+    /// seeds. Gives the coarser file-level answer, a superset of the scoped one.
+    pub file_level: bool,
 }
 
 impl Default for QueryOpts {
     fn default() -> Self {
-        Self { max_depth: 0, min_confidence: Confidence::Heuristic }
+        Self { max_depth: 0, min_confidence: Confidence::Heuristic, file_level: false }
     }
 }
 
@@ -356,7 +359,7 @@ impl Graph {
 
         let mut merged: std::collections::BTreeMap<NodeId, Option<Vec<u32>>> = std::collections::BTreeMap::new();
         for (node, scopes) in seeds {
-            let ids = scopes.as_ref().and_then(|names| {
+            let ids = scopes.as_ref().filter(|_| !opts.file_level).and_then(|names| {
                 names.iter().map(|n| if n == crate::model::SCOPE_BODY { None } else { Some(self.scope_index.get(n).copied().unwrap_or(NOWHERE)) }).collect::<Option<Vec<u32>>>()
             });
             match (merged.entry(*node).or_insert_with(|| Some(Vec::new())), ids) {
@@ -397,7 +400,9 @@ impl Graph {
                 if d.confidence < opts.min_confidence || whole[next as usize] {
                     continue;
                 }
-                let scope = if d.inherit {
+                let scope = if opts.file_level {
+                    ALL
+                } else if d.inherit {
                     cur.scope
                 } else if d.to_scope != ALL && cur.scope != ALL && d.to_scope != cur.scope {
                     continue;
@@ -524,7 +529,7 @@ mod tests {
     fn depth_and_confidence_limits() {
         let g = g();
         let a = g.id("a").unwrap();
-        let imp = g.impact(&[a], QueryOpts { max_depth: 1, min_confidence: Inferred });
+        let imp = g.impact(&[a], QueryOpts { max_depth: 1, min_confidence: Inferred, file_level: false });
         assert_eq!(names(&g, &imp), [("a", 0), ("b", 1)].map(|(s, d)| (s.to_string(), d)));
     }
 
@@ -607,6 +612,8 @@ mod tests {
         // A method nobody mentions, and "no method changed" (comment-only diff), reach nothing.
         assert_eq!(run(Some(&["unknown"]), 0), "");
         assert_eq!(run(Some(&[]), 0), "");
+        let imp = g.impact_scoped(&[(id("model"), Some(vec![]))], QueryOpts { file_level: true, ..Default::default() });
+        assert_eq!(imp.hits.len(), 8, "file-level mode ignores scopes");
         // Same-file hops are not listed in the explanation.
         let imp = g.impact_scoped(&[(id("model"), Some(vec!["charge!".into()]))], QueryOpts::default());
         let path: Vec<&str> = imp.path(id("caller")).iter().map(|&(n, _)| g.path(n)).collect();
