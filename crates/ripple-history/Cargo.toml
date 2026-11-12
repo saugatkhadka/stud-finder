@@ -1,0 +1,14 @@
+[package]
+name = "ripple-history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Co-change statistics from git history: files that usually change together"
+
+[dependencies]
+ripple-core.workspace = true
+ripple-policy.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
