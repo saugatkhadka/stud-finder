@@ -526,3 +526,37 @@ fn autostart_after_idle_exit() {
     assert_eq!(risk_of(&r), "critical");
     assert!(env.paths().recorded_pid().is_some_and(|p| p as u32 != std::process::id()), "a new daemon process answered");
 }
+
+#[test]
+fn config_flag_selects_another_file_and_its_own_daemon() {
+    let env = billing();
+    let dir = tempfile::tempdir().unwrap();
+    let alt = dir.path().join("alt.yml");
+    std::fs::write(&alt, "version: 1\nareas:\n  billing:\n    tier: low\n    paths: [billing/**]\nrules:\n  - id: alt-rule\n    when: { touches: [billing] }\n    risk: medium\n").unwrap();
+    let alt = alt.to_str().unwrap();
+    let rules = |r: &Value| r["policy"]["reasons"].as_array().map(|a| a.iter().map(|x| x["rule"].as_str().unwrap().to_string()).collect::<Vec<_>>()).unwrap_or_default();
+    let q = ["impact", "--files", "billing/invoice.txt", "--format", "json"];
+    for no_daemon in [true, false] {
+        let with = |cfg: Option<&str>| {
+            let mut a: Vec<&str> = Vec::new();
+            if no_daemon {
+                a.push("--no-daemon");
+            }
+            if let Some(c) = cfg {
+                a.extend(["--config", c]);
+            }
+            a.extend(q);
+            env.json(&a)
+        };
+        let r = with(Some(alt));
+        assert_eq!((risk_of(&r).as_str(), rules(&r)), (Some("medium"), vec!["alt-rule".to_string()]), "no_daemon {no_daemon}");
+        // Without the flag: the repo's ripple.yml (from a different daemon).
+        let r = with(None);
+        assert_eq!(risk_of(&r), "critical", "no_daemon {no_daemon}");
+    }
+    let o = env.run(&["--config", alt, "config", "check"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("alt.yml"), "{}", String::from_utf8_lossy(&o.stdout));
+    let o = env.run(&["--config", "nope.yml", "impact"]);
+    assert_eq!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = env.run(&["--config", alt, "daemon", "stop"]);
+}

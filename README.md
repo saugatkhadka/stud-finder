@@ -65,7 +65,9 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 | `history build`, `history status` | Build or update the git-history sidecar now (one-shot mode only reads it); show its state, size, and whether co-change is on. See [Git history in the daemon](#git-history-in-the-daemon). |
 
 Global flags: `--root DIR` (or `RIPPLE_ROOT`; default is the enclosing git
-work tree) and `--no-daemon` (index in this process).
+work tree), `--config PATH` (or `RIPPLE_CONFIG`; use this file instead of
+`<root>/ripple.yml`; the file must exist, and a separate daemon, keyed by
+root and config path, serves it) and `--no-daemon` (index in this process).
 
 Paths can be given relative to the current directory or as absolute paths.
 They are normalised to paths relative to the repository root.
@@ -468,7 +470,7 @@ Warning codes include:
   - The socket, lock file and log live in `$RIPPLE_SOCKET_DIR`, else
     `$XDG_RUNTIME_DIR/ripple`, else `/tmp/ripple-$UID`. The directory has mode
     0700 and must be owned by you. The files are named
-    `<fnv1a64(canonical root)>.sock|.lock|.log`. Socket paths are limited to
+    `<fnv1a64(canonical root [+ NUL + --config path])>.sock|.lock|.log`. Socket paths are limited to
     100 bytes; if the path would be longer, ripple says so and runs
     in-process.
   - An exclusive `flock` on the `.lock` file makes the daemon a singleton.
@@ -765,6 +767,7 @@ per-extractor counters.
 | Variable | Effect |
 |---|---|
 | `RIPPLE_ROOT` | Repository root, the same as `--root`. |
+| `RIPPLE_CONFIG` | Config file, the same as `--config`. |
 | `RIPPLE_NO_DAEMON=1` | Disables daemon autostart. `CI` and `GITHUB_ACTIONS` do the same. |
 | `RIPPLE_SOCKET_DIR` | Directory for the socket, lock and log files. |
 | `NO_COLOR` | Plain text output. |

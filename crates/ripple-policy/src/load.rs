@@ -15,13 +15,38 @@ pub struct LoadedConfig {
     pub path: Option<PathBuf>,
 }
 
+/// The conventional config file at `root` (ignores `--config`; used to
+/// find the repository root).
 pub fn find_config(root: &Path) -> Option<PathBuf> {
     CONFIG_FILE_NAMES.iter().map(|n| root.join(n)).find(|p| p.is_file())
 }
 
-/// Loads and validates the config at `root`. A missing file yields defaults.
+static CONFIG_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `--config PATH` (absolute): this process loads its config from `path`
+/// instead of `<root>/ripple.yml`. Set once, before any config is loaded.
+pub fn set_config_override(path: PathBuf) {
+    let _ = CONFIG_OVERRIDE.set(path);
+}
+
+/// The `--config` path, if one was given.
+pub fn config_override() -> Option<&'static Path> {
+    CONFIG_OVERRIDE.get().map(PathBuf::as_path)
+}
+
+/// Is `rel` (relative to `root`) this process's config file?
+pub fn is_config_file(root: &Path, rel: &str) -> bool {
+    match config_override() {
+        Some(p) => p == root.join(rel),
+        None => CONFIG_FILE_NAMES.contains(&rel),
+    }
+}
+
+/// Loads and validates the config: the `--config` file if one was given
+/// (it must exist), otherwise the one at `root`. A missing file at `root`
+/// yields defaults.
 pub fn load_config(root: &Path) -> Result<LoadedConfig, PolicyError> {
-    let Some(path) = find_config(root) else {
+    let Some(path) = config_override().map(Path::to_path_buf).or_else(|| find_config(root)) else {
         return Ok(LoadedConfig { config: Config::default(), path: None });
     };
     let src = std::fs::read_to_string(&path).map_err(|source| PolicyError::Io { path: path.clone(), source })?;

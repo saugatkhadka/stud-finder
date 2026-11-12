@@ -26,6 +26,9 @@ pub struct Cli {
     /// Index in this process instead of using (or starting) the daemon.
     #[arg(long, global = true)]
     no_daemon: bool,
+    /// Use this config file instead of `<root>/ripple.yml` (a separate daemon serves it).
+    #[arg(long, global = true, env = "RIPPLE_CONFIG", value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -386,6 +389,13 @@ fn result_of(reply: Reply) -> Result<String> {
 
 fn run(cli: Cli) -> Result<u8> {
     let root = resolve_root(cli.root.as_deref())?;
+    if let Some(p) = &cli.config {
+        let abs = std::fs::canonicalize(p).with_context(|| format!("--config {}", p.display()))?;
+        if !abs.is_file() {
+            bail!("--config {}: not a file", p.display());
+        }
+        ripple_policy::set_config_override(abs);
+    }
     let open = |autostart: bool| Backend::open(&root, cli.no_daemon, autostart);
     match cli.cmd {
         Cmd::Impact(a) => impact(&root, a, open(true)?),
