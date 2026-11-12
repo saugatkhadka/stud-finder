@@ -41,9 +41,6 @@ pub struct FileEntry {
     pub template: TemplateFacts,
     /// Methods defined and mentioned (Ruby files and templates).
     pub methods: MethodFacts,
-    /// Size and complexity (per-method complexity is in `methods.defs`);
-    /// `None` without `ruby.method_level` or when the prism pass failed.
-    pub metrics: Option<FileMetrics>,
     /// What the file defines and mentions, for the mention filter (taken out
     /// of `methods`); `None` when unknown (method facts off or failed).
     pub mentions: Option<std::sync::Arc<ripple_core::FileMentions>>,
@@ -151,7 +148,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
                     entry.facts = f;
                     if method_level {
                         entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
-                        entry.metrics = Some(file_metrics(lines, &m));
+                        m.lines = lines;
                     }
                     entry.methods = m;
                 }
@@ -177,8 +174,8 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             if method_level {
                 let mut m = methods::from_template(&entry.template);
                 entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
+                m.lines = cx::nonblank_lines(source.as_bytes());
                 entry.methods = m;
-                entry.metrics = Some(FileMetrics { lines: cx::nonblank_lines(source.as_bytes()), ..FileMetrics::default() });
             }
         }
     }
@@ -190,10 +187,19 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
 }
 
 /// A Ruby file's metrics from its code lines and method facts.
-fn file_metrics(lines: u32, m: &MethodFacts) -> FileMetrics {
+impl FileEntry {
+    /// Size and complexity; `None` when method facts were not computed
+    /// (`ruby.method_level` off, or the prism pass failed), which is exactly
+    /// when `mentions` is `None`. Templates have no defs: lines only.
+    pub fn metrics(&self) -> Option<FileMetrics> {
+        self.mentions.is_some().then(|| file_metrics(&self.methods))
+    }
+}
+
+fn file_metrics(m: &MethodFacts) -> FileMetrics {
     let defs = m.defs.iter().map(|d| u32::from(d.complexity));
     FileMetrics {
-        lines,
+        lines: m.lines,
         complexity: m.top_decisions + defs.clone().sum::<u32>(),
         methods: cx::sat16(m.defs.len() as u32),
         max_method: cx::sat16(defs.max().unwrap_or(0)),

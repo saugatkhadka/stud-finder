@@ -148,6 +148,10 @@ pub struct MethodFacts {
     pub mentions: FileMentions,
     /// Decisions outside every def (class bodies, DSL blocks, top level).
     pub top_decisions: u32,
+    /// Code lines of the file, set by the caller (`analyse`); with `defs`
+    /// and `top_decisions` it gives the file's metrics. Sits in what was
+    /// padding after `top_decisions`, so it costs nothing per entry.
+    pub lines: u32,
 }
 
 /// Calls that run `initialize` on a new instance of the receiver.
@@ -227,7 +231,7 @@ pub fn from_template(t: &crate::templates::TemplateFacts) -> MethodFacts {
     pairs.sort_unstable();
     pairs.dedup();
     let mentions = FileMentions { pairs: pairs.into(), opaque: t.dynamic, ..FileMentions::default() };
-    MethodFacts { names, defs: Vec::new(), counts, inherit_ranges: Vec::new(), own: Vec::new(), mentions, top_decisions: 0 }
+    MethodFacts { names, defs: Vec::new(), counts, inherit_ranges: Vec::new(), own: Vec::new(), mentions, top_decisions: 0, lines: 0 }
 }
 
 /// Identifier-like: `foo`, `foo?`, `foo!`, `foo=`, `_x1`. Used for strings.
@@ -340,7 +344,7 @@ impl Collector<'_> {
         let mut own: Vec<u32> = self.defs.iter().map(|d| d.name).collect();
         own.sort_unstable();
         own.dedup();
-        MethodFacts { names: self.names, defs: self.defs, counts, inherit_ranges: self.inherit_ranges, own, mentions, top_decisions: self.top_decisions }
+        MethodFacts { names: self.names, defs: self.defs, counts, inherit_ranges: self.inherit_ranges, own, mentions, top_decisions: self.top_decisions, lines: 0 }
     }
 }
 

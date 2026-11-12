@@ -276,7 +276,7 @@ impl State {
         let mut methods: Vec<MethodMetric> = Vec::new();
         let mut rows: Vec<(&str, ripple_core::FileMetrics, usize, usize)> = Vec::with_capacity(self.files.len());
         for (path, e) in &self.files {
-            let Some(m) = e.metrics else { continue };
+            let Some(m) = e.metrics() else { continue };
             let from = methods.len();
             methods.extend(e.methods.defs.iter().map(|d| MethodMetric {
                 start: d.start,
