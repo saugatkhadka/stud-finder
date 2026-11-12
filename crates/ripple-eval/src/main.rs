@@ -9,8 +9,10 @@
 
 mod adapter;
 mod metrics;
+mod oracle;
 mod predict;
 mod report;
+mod symbols;
 
 use adapter::{Classifier, FileChange, Index, Status, commit_changes, git, is_source};
 use anyhow::{Context, Result, bail};
@@ -257,7 +259,8 @@ fn run(a: Args) -> Result<()> {
 }
 
 fn main() {
-    let result = parse_args().and_then(run);
+    // `ripple-eval breaks <repo>`: see `oracle.rs`.
+    let result = if std::env::args().nth(1).as_deref() == Some("breaks") { oracle::run_cli(std::env::args().skip(2)) } else { parse_args().and_then(run) };
     if let Err(e) = result {
         eprintln!("ripple-eval: {e:#}");
         std::process::exit(2);

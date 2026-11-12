@@ -70,6 +70,10 @@ impl Index {
             Source::Synthetic(g) => g,
         }
     }
+    /// The underlying graph, for the `breaks` oracle's miss classification.
+    pub fn core_graph(&self) -> &Graph {
+        self.graph()
+    }
     pub fn node_count(&self) -> usize {
         self.graph().node_count()
     }
