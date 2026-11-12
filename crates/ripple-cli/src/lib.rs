@@ -10,6 +10,7 @@ pub mod edgefile;
 pub mod engine;
 pub mod files;
 pub mod git;
+pub mod gitd;
 pub mod output;
 pub mod paths;
 pub mod protocol;

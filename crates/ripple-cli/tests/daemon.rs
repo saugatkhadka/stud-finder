@@ -172,7 +172,7 @@ fn concurrent_queries_during_rebuild() {
 fn singleton_lock_in_process() {
     let repo = chain();
     let d = Daemon::start(&repo.root);
-    let err = ripple_cli::server::serve(&repo.root, pipeline(Arc::new(AtomicU64::new(0))), d.paths.clone(), ripple_cli::server::ServeOptions { signals: false }).unwrap_err();
+    let err = ripple_cli::server::serve(&repo.root, pipeline(Arc::new(AtomicU64::new(0))), d.paths.clone(), ripple_cli::server::ServeOptions { signals: false, ..Default::default() }).unwrap_err();
     assert!(err.to_string().contains("already serving"), "{err}");
     // The first daemon still answers.
     let (r, _) = d.call("stats", json!(null));
@@ -224,4 +224,69 @@ fn wrong_case_name_is_not_a_new_file() {
     assert_eq!(s["count"], 0);
     let (s, _) = d.call("stats", json!({"sync": true}));
     assert_eq!(s["files"], 6, "{s}");
+}
+
+/// Starts a daemon with a short idle timeout on a thread; returns the thread.
+fn idle_daemon(repo: &Repo, sock: &std::path::Path, timeout: Duration) -> (ripple_cli::paths::DaemonPaths, std::thread::JoinHandle<anyhow::Result<()>>) {
+    let paths = paths_in(sock, &repo.root);
+    let (r, p) = (repo.root.clone(), paths.clone());
+    let opts = ripple_cli::server::ServeOptions { signals: false, idle_timeout: Some(timeout) };
+    let t = std::thread::spawn(move || ripple_cli::server::serve(&r, pipeline(Arc::new(AtomicU64::new(0))), p, opts));
+    ripple_cli::client::wait_for_daemon(&paths, Duration::from_secs(10)).expect("daemon up");
+    (paths, t)
+}
+
+#[test]
+fn idle_timeout_stops_daemon_and_allows_restart() {
+    let repo = chain();
+    let sock = socket_dir();
+    let (paths, t) = idle_daemon(&repo, sock.path(), Duration::from_millis(400));
+    // Requests keep it alive well past the timeout.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(1200) {
+        let mut c = ripple_cli::client::Client::connect(&paths).expect("still serving");
+        assert!(c.call("stats", &json!(null)).unwrap().result.is_ok());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!t.is_finished(), "exited while requests were arriving");
+    // Without requests it exits, removing its socket and releasing the lock.
+    let idle_from = Instant::now();
+    t.join().unwrap().unwrap();
+    let waited = idle_from.elapsed();
+    assert!(waited >= Duration::from_millis(250) && waited < Duration::from_secs(3), "{waited:?}");
+    assert!(!paths.socket.exists());
+    // A new daemon can take over the same root.
+    let (paths, t) = idle_daemon(&repo, sock.path(), Duration::ZERO);
+    let mut c = ripple_cli::client::Client::connect(&paths).unwrap();
+    assert!(c.call("stats", &json!(null)).unwrap().result.is_ok());
+    let _ = c.call("shutdown", &json!(null));
+    t.join().unwrap().unwrap();
+}
+
+/// More concurrent clients than connection slots: all are answered, and
+/// open connections never exceed the cap.
+#[test]
+fn connection_cap_queues_extra_clients() {
+    let repo = chain();
+    let d = Daemon::start(&repo.root);
+    // Extra clients wait in the listen backlog (128 on macOS), so stay below cap + backlog.
+    let n = ripple_cli::server::MAX_CONNECTIONS + 72;
+    let barrier = Arc::new(std::sync::Barrier::new(n));
+    let handles: Vec<_> = (0..n)
+        .map(|_| {
+            let (p, b) = (d.paths.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                // Open every connection first, then send: the daemon sees all at once.
+                let mut c = ripple_cli::client::Client::connect(&p).expect("connect");
+                b.wait();
+                let r = c.call("stats", &json!(null)).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&r.result.unwrap()).unwrap();
+                v["daemon"]["connections"].as_u64().unwrap()
+            })
+        })
+        .collect();
+    let peak = handles.into_iter().map(|h| h.join().unwrap()).max().unwrap();
+    assert!(peak as usize <= ripple_cli::server::MAX_CONNECTIONS, "{peak}");
+    let (s, _) = d.call("stats", json!(null));
+    assert_eq!(s["edges"], 3);
 }
