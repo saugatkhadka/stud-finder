@@ -68,7 +68,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { max_commits: 5000, since: None, max_files_per_commit: 30, min_together: 2, keep_per_file: 48, ignore: ripple_core::Config::default().ignore }
+        Self { max_commits: 20000, since: None, max_files_per_commit: 30, min_together: 2, keep_per_file: 48, ignore: ripple_core::Config::default().ignore }
     }
 }
 

@@ -280,6 +280,6 @@ pub struct HistoryConfig {
 
 impl Default for HistoryConfig {
     fn default() -> Self {
-        Self { enabled: true, max_commits: 5000, max_age_days: None, max_files_per_commit: 30, min_together: 3, min_confidence: 0.3, min_lift: 2.0, limit: 5 }
+        Self { enabled: true, max_commits: 20000, max_age_days: None, max_files_per_commit: 30, min_together: 3, min_confidence: 0.3, min_lift: 2.0, limit: 5 }
     }
 }

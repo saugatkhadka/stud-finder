@@ -21,6 +21,13 @@ fn main() -> anyhow::Result<()> {
     let t = Instant::now();
     let h = History::build(&repo, "HEAD", &opts, &no)?;
     let build_ms = t.elapsed().as_secs_f64() * 1e3;
+    let rss = |label: &str| {
+        let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
+        if let Ok(o) = out {
+            println!("{label}: process RSS {:.1} MB (git subprocess excluded)", String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0);
+        }
+    };
+    rss("after build");
     let t = Instant::now();
     h.save(&sidecar)?;
     let save_ms = t.elapsed().as_secs_f64() * 1e3;

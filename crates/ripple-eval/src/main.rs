@@ -127,18 +127,19 @@ fn ensure_config(root: &Path, config: Option<&Path>) -> Result<()> {
 /// standard `cochange@K` rows use.
 fn history_plan(explore: bool, ignore: &[String]) -> (Vec<(String, ripple_history::Options)>, Vec<metrics::GainConfig>) {
     use ripple_history::{Options, PartnerQuery, Score};
-    let base = Options { max_commits: 5000, since: None, max_files_per_commit: 30, min_together: 1, keep_per_file: 48, ignore: ignore.to_vec() };
-    let mut builds = vec![("w5000/f30".to_string(), base.clone())];
+    let base = Options { max_commits: 20000, since: None, max_files_per_commit: 30, min_together: 1, keep_per_file: 48, ignore: ignore.to_vec() };
+    let mut builds = vec![("w20000/f30".to_string(), base.clone())];
     let dq = predict::default_query();
-    let mut gains = vec![metrics::GainConfig { name: "default (t≥3, conf≥0.3, lift≥2) w5000/f30".into(), history: 0, query: dq }];
+    let mut gains = vec![metrics::GainConfig { name: "default (t≥3, conf≥0.3, lift≥2) w20000/f30".into(), history: 0, query: dq }];
     if explore {
         for (name, o) in [
             ("w1000/f30", Options { max_commits: 1000, ..base.clone() }),
-            ("w20000/f30", Options { max_commits: 20000, ..base.clone() }),
-            ("w5000/f15", Options { max_files_per_commit: 15, ..base.clone() }),
-            ("w5000/f45", Options { max_files_per_commit: 45, ..base.clone() }),
-            ("w5000/f60", Options { max_files_per_commit: 60, ..base.clone() }),
-            ("w5000/f100", Options { max_files_per_commit: 100, ..base.clone() }),
+            ("w5000/f30", Options { max_commits: 5000, ..base.clone() }),
+            ("all/f30", Options { max_commits: 0, ..base.clone() }),
+            ("w20000/f15", Options { max_files_per_commit: 15, ..base.clone() }),
+            ("w20000/f45", Options { max_files_per_commit: 45, ..base.clone() }),
+            ("w20000/f60", Options { max_files_per_commit: 60, ..base.clone() }),
+            ("w20000/f100", Options { max_files_per_commit: 100, ..base.clone() }),
         ] {
             gains.push(metrics::GainConfig { name: format!("default {name}"), history: builds.len(), query: dq });
             builds.push((name.to_string(), o));
@@ -162,7 +163,7 @@ fn history_plan(explore: bool, ignore: &[String]) -> (Vec<(String, ripple_histor
             ("t≥2 unfiltered, shrunk", PartnerQuery { score: Score::Shrunk, ..q(2, 0.0, 0.0) }),
             ("default, noisy-or", PartnerQuery { noisy_or: true, ..dq }),
         ] {
-            gains.push(metrics::GainConfig { name: format!("{name} w5000/f30"), history: 0, query });
+            gains.push(metrics::GainConfig { name: format!("{name} w20000/f30"), history: 0, query });
         }
     }
     (builds, gains)
