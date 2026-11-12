@@ -20,6 +20,7 @@ mod paths;
 mod rails;
 mod scoped;
 mod shadow;
+mod slim;
 mod templates;
 mod views;
 #[cfg(feature = "mem-profile")]

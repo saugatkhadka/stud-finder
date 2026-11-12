@@ -112,7 +112,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
                             .file(rel),
                         );
                     }
-                    local_graph = Some(lg);
+                    local_graph = Some(crate::slim::without_unused_parts(lg));
                 }
                 Err(_) => entry.warnings.push(
                     Warning::new(
