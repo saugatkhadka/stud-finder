@@ -50,7 +50,7 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 
 | Command | What it does |
 |---|---|
-| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--limit N` (cap the listed files; counts stay exact), `--sync` (also wait for unrelated pending edits), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
+| `impact [FILES] [--base REF \| --staged \| --files A,B]` | Impact report. `--format text\|json\|markdown`, `--depth N` (0 = unlimited), `--min-confidence exact\|inferred\|heuristic`, `--limit N` (cap the listed files; counts stay exact), `--sync` (wait until every earlier edit is indexed, however long that takes), `--no-wait` (answer from the current index at once; may be marked stale), `--file-level` (see [Method-level analysis](#method-level-analysis)), `--scope NAME` (repeatable; with exactly one file: only these methods / controller actions changed). |
 | `check --base REF` | CI entry point. `--format github\|markdown\|json\|text` (github is the default under `GITHUB_ACTIONS`), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`, `--file-level`. Never starts a daemon, but uses one that is already running. |
 | `dependents FILE` / `dependencies FILE` | Direct neighbours by default; `--depth N` (0 = all). `dependents --scope NAME`: only what depends on that method / action. |
 | `why FROM TO` | Shortest dependency path between two files, in either direction. `--scope NAME`: only paths into that method / action of TO (says so when only a file-level path exists). |
@@ -118,6 +118,7 @@ ripple: ripple.yml: invalid configuration:
 | `ci.fail_on` | none | `check` exits 1 at or above this risk. |
 | `ci.github` | `true` | Write `$GITHUB_STEP_SUMMARY` under Actions. |
 | `ci.max_listed` | `50` | Files listed in the markdown and text output; it ends with "…and N more". |
+| `daemon.max_wait_ms` | `150` | How long a daemon query waits for pending edits to be indexed before it answers from the current index, marked stale (see [Daemon and freshness](#daemon-and-freshness)). `--sync` waits without a limit. |
 | `daemon.idle_timeout_minutes` | `30` | The daemon exits after this many minutes without a request; `0` = never. The next command starts a new one. |
 | `ruby`, `js`, `boundary` | — | Extractor settings: `enabled`, autoload roots, tsconfig/aliases, route files, HTTP callees and URL bases. Changing one of these makes the daemon rebuild from scratch. Changing other keys only reloads the policy. |
 
@@ -310,23 +311,43 @@ Warning codes include:
     event. Each batch goes through the extractors' incremental `update`.
   - When `ripple.yml` changes, the policy is reloaded. If an extractor
     setting changed, everything is rebuilt.
-- **Freshness contract.** Before the daemon answers a request, it:
-  1. folds in every file event already delivered;
+- **Freshness contract.** Every answer reflects every file edit that
+  completed before the request was sent, or says which ones it does not.
+  Before the daemon answers a query, it:
+  1. writes a cookie file in `.git/` and waits for the watcher to report it,
+     so every earlier file event has been delivered (skipped with
+     `--no-wait`);
   2. re-stats the files named in the request, using mtime against the time
      each file was last examined;
-  3. waits until both are indexed. The request is moved to the front of the
-     debounce queue.
+  3. moves the pending batch to the front of the debounce queue and waits for
+     it to be indexed, for at most `daemon.max_wait_ms` (default 150 ms). If
+     the pass that would include the edits is predicted, from the last
+     pass's duration, to end after that, it does not wait at all.
 
-  As a result, a query that names a file always sees that file's current
-  contents. This is tested with a 200-iteration edit-then-query loop that
-  has no sleeps. `--sync` (`"sync": true`) also writes a cookie file in
-  `.git/` and waits for the watcher to report it. That covers edits to files
-  the request does not name. Freshness is not just about the named files:
-  editing another file can add an edge to the named one.
+  If the index has not caught up, the daemon answers from the current
+  snapshot and marks the response `"stale": true`, with `"pending"` (up to 50
+  paths, sorted) and `"pending_count"`. In a stale `impact` answer, a changed
+  file that is itself pending is treated as wholly changed: its diff hunks
+  are not mapped onto method ranges indexed from older contents. `--sync`
+  (`"sync": true`) waits without a time limit and is never stale.
+  `--no-wait` (`"no_wait": true`) never waits. `stats` never waits.
+
+  Edits are coalesced: each pass indexes every path delivered so far, so
+  many editors cost one pass per indexer cycle, not one per edit. A query
+  that names a file always sees that file's current contents once its answer
+  is not stale; this is tested with a 200-iteration edit-then-query loop
+  that has no sleeps.
+- **Watcher latency on macOS.** The kernel hands file events to `fseventsd`
+  at once only when about 16 or more are queued, otherwise after a 10 ms
+  timer, so a lone cookie took about 11 ms to come back. The daemon follows
+  each cookie with 24 `fchmod`s of it, which brings a round trip to about
+  0.4 ms (p50). Kicked this way, an edit's event occasionally arrives just
+  after a later cookie's, so the daemon does two round trips per sync. `ripple daemon stats` reports cookie round-trip percentiles
+  and how many answers were fresh, waited or stale.
 - **Diffs are computed in the daemon.** For `impact --base`, `--staged` and
   the default work-tree diff, the client sends the diff spec (`"diff"`) and
-  the daemon answers it from a cache. It first writes a cookie (as for
-  `--sync`), so every file event before the request is seen. Then it re-runs
+  the daemon answers it from a cache. It always writes a cookie first (even
+  with `--no-wait`), so every file event before the request is seen. Then it re-runs
   git only for the paths that changed since the last answer: the watcher
   reports work-tree paths, and the daemon reads `.git/index` itself to find
   staged changes. Commits, checkouts, resets, stash and ref updates are
@@ -337,11 +358,9 @@ Warning codes include:
   client-side `git diff`, which one-shot mode (`--no-daemon`, CI) still uses.
   The daemon runs git with `GIT_OPTIONAL_LOCKS=0`, so it never rewrites the
   index.
-- **Requests never wait for unrelated work.** Each connection has its own
-  thread (at most 128 at once; more clients wait in the listen queue). A
-  connection that sends nothing for 10 minutes is closed. If a re-index is already running and none of the request's files
-  are pending, the daemon answers from the current snapshot at once and
-  reports `index.pending_changes`.
+- **Connections.** Each connection has its own thread (at most 128 at
+  once; more clients wait in the listen queue). A connection that sends
+  nothing for 10 minutes is closed.
 - **Deletions and renames.** While the daemon is running, a deleted file
   keeps the edges from its former dependents (their `detail` is prefixed
   `deleted:`). Its impact therefore still lists the files whose references
@@ -359,7 +378,7 @@ gets one response line, in order, per connection:
 
 ```
 → {"id": 1, "method": "impact", "params": {"files": ["app/models/user.rb"], "format": "json", "limit": 50}}
-← {"id": 1, "ok": true, "generation": 7, "server_us": 41, "result": { …report… }}
+← {"id": 1, "ok": true, "generation": 7, "server_us": 41, "stale": false, "synced": true, "pending_count": 0, "result": { …report… }}
 ← {"id": 2, "ok": false, "generation": 7, "server_us": 12, "error": {"code": "not_in_graph", "message": "…"}}
 ```
 
@@ -367,10 +386,10 @@ Methods:
 
 | Method | Params |
 |---|---|
-| `impact` | `files`, `changed` (entries may carry `hunks`: `[{start, count, removes_definition?}]`), `diff` (`{"base": "REF"}`, `{"staged": true}` or `{}` for the work tree; not combined with `files`/`changed`), `scopes`, `file_level`, `max_depth`, `min_confidence`, `format`, `color`, `limit`, `max_listed`, `sync` |
-| `dependents`, `dependencies` | `file`, `scopes` (dependents only), `depth`, `min_confidence` |
-| `why` | `from`, `to`, `scopes` |
-| `areas` | `file` |
+| `impact` | `files`, `changed` (entries may carry `hunks`: `[{start, count, removes_definition?}]`), `diff` (`{"base": "REF"}`, `{"staged": true}` or `{}` for the work tree; not combined with `files`/`changed`), `scopes`, `file_level`, `max_depth`, `min_confidence`, `format`, `color`, `limit`, `max_listed`, `sync`, `no_wait`, `max_wait_ms` |
+| `dependents`, `dependencies` | `file`, `scopes` (dependents only), `depth`, `min_confidence`, `sync`, `no_wait`, `max_wait_ms` |
+| `why` | `from`, `to`, `scopes`, `sync`, `no_wait`, `max_wait_ms` |
+| `areas` | `file`, `sync`, `no_wait`, `max_wait_ms` |
 | `stats` | — |
 | `reload` | — |
 | `shutdown` | — |
