@@ -56,7 +56,7 @@ impl Drop for Restore {
 /// to describe (the snapshot's, or a reference built with tombstones).
 fn digest(s: &Snapshot, g: &Graph, eng: &Engine) -> BTreeMap<&'static str, Vec<String>> {
     let mut d: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-    d.insert("nodes", g.paths().to_vec());
+    d.insert("nodes", g.paths().map(String::from).collect::<Vec<_>>());
     d.insert(
         "edges",
         g.edges_for_test()

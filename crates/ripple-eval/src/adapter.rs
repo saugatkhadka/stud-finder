@@ -60,7 +60,7 @@ impl Index {
     pub fn synthetic(edges: &[ripple_core::Edge], extra_nodes: &[&str], scopes: BTreeMap<String, Vec<ScopeRange>>) -> Self {
         let graph = Graph::build(edges, extra_nodes.iter().copied());
         let policy = Policy::compile(ripple_core::Config::default()).expect("defaults compile");
-        let tests = graph.paths().iter().map(|p| policy.is_test(p)).collect();
+        let tests = graph.paths().map(|p| policy.is_test(p)).collect();
         Self { source: Source::Synthetic(graph), tests, scopes: Arc::new(scopes), build_ms: 0 }
     }
 

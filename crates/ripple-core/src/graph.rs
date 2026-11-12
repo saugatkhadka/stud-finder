@@ -1,10 +1,14 @@
 //! Immutable dependency graph in compressed-sparse-row form, plus the impact
 //! query (reverse breadth-first search). Built once per index generation;
 //! queries are allocation-light and run in microseconds to low milliseconds.
+//!
+//! Every array is a [`Slab`]: owned when built in memory, or a window into
+//! a mapped file when loaded with [`Graph::load`] (see [`crate::store`]).
 
-use crate::mentions::{FileMentions, MentionTable, NO_DEF, name_id};
+use crate::mentions::{FileMentions, MentionTable, Mentions, NO_DEF, name_id};
 use crate::metrics::{FileMetrics, MethodMetric, MetricsTable};
-use crate::model::{Confidence, Edge, EdgeKind, RelPath};
+use crate::model::{Confidence, Edge, EdgeKind};
+use crate::store::{Pod, SectionFile, SectionWriter, Slab, StrTable};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -16,20 +20,74 @@ pub struct EdgeData {
     pub kind: EdgeKind,
     pub confidence: Confidence,
     pub line: u32,
-    /// Index into `Graph::detail_ends`, or `u32::MAX` for none.
+    pub inherit: bool,
+}
+
+/// Every [`EdgeKind`], indexed by its discriminant (the stored byte).
+const KINDS: [EdgeKind; 11] = [
+    EdgeKind::RubyConstant,
+    EdgeKind::RubyRequire,
+    EdgeKind::RailsInferred,
+    EdgeKind::RailsView,
+    EdgeKind::RailsRoute,
+    EdgeKind::JsImport,
+    EdgeKind::JsDynamicImport,
+    EdgeKind::ApiCall,
+    EdgeKind::ViewMount,
+    EdgeKind::GraphQl,
+    EdgeKind::Asset,
+];
+const CONFIDENCES: [Confidence; 3] = [Confidence::Heuristic, Confidence::Inferred, Confidence::Exact];
+
+/// The stored form of an edge's payload: plain integers, so it can live in
+/// a mapped file. `kind`/`confidence` are enum discriminants (validated on
+/// load), `inherit` is 0/1.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RawEdge {
+    kind: u8,
+    confidence: u8,
+    inherit: u8,
+    _pad: u8,
+    line: u32,
+    /// Index into `Graph::details`, or `u32::MAX` for none.
     detail: u32,
     /// Interned `Edge::from_scope` / `Edge::to_scope`, or `u32::MAX` for none.
     from_scope: u32,
     to_scope: u32,
-    inherit: bool,
 }
 
-#[derive(Debug, Default)]
+// SAFETY: integers only, no padding (4 x u8 + 4 x u32, align 4).
+unsafe impl Pod for RawEdge {}
+const _: () = assert!(std::mem::size_of::<RawEdge>() == 20);
+
+impl RawEdge {
+    fn new(e: &Edge, detail: u32, from_scope: u32, to_scope: u32, inherit: bool) -> Self {
+        Self { kind: e.kind as u8, confidence: e.confidence as u8, inherit: inherit as u8, _pad: 0, line: e.line, detail, from_scope, to_scope }
+    }
+    #[inline]
+    fn kind(&self) -> EdgeKind {
+        KINDS[self.kind as usize]
+    }
+    #[inline]
+    fn confidence(&self) -> Confidence {
+        CONFIDENCES[self.confidence as usize]
+    }
+    #[inline]
+    fn inherit(&self) -> bool {
+        self.inherit != 0
+    }
+    fn data(&self) -> EdgeData {
+        EdgeData { kind: self.kind(), confidence: self.confidence(), line: self.line, inherit: self.inherit() }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 struct Csr {
     /// `offsets[n]..offsets[n+1]` indexes `targets`/`edge_ids` for node `n`.
-    offsets: Vec<u32>,
-    targets: Vec<NodeId>,
-    edge_ids: Vec<u32>,
+    offsets: Slab<u32>,
+    targets: Slab<NodeId>,
+    edge_ids: Slab<u32>,
 }
 
 impl Csr {
@@ -51,7 +109,7 @@ impl Csr {
             edge_ids[slot] = edge_id as u32;
             cursor[src as usize] += 1;
         }
-        Self { offsets, targets, edge_ids }
+        Self { offsets: offsets.into(), targets: targets.into(), edge_ids: edge_ids.into() }
     }
 
     #[inline]
@@ -59,40 +117,152 @@ impl Csr {
         let (a, b) = (self.offsets[n as usize] as usize, self.offsets[n as usize + 1] as usize);
         self.targets[a..b].iter().copied().zip(self.edge_ids[a..b].iter().copied())
     }
+
+    fn degree(&self, n: NodeId) -> u32 {
+        self.offsets[n as usize + 1] - self.offsets[n as usize]
+    }
+
+    /// Checks what `neighbours` relies on for `n` nodes and `m` edges.
+    fn check(&self, n: usize, m: usize) -> Result<(), String> {
+        let o = &self.offsets;
+        if o.len() != n + 1 || o[0] != 0 || o[n] as usize != m || self.targets.len() != m || self.edge_ids.len() != m {
+            return Err("adjacency arrays have the wrong size".into());
+        }
+        if o.windows(2).any(|w| w[0] > w[1]) || self.targets.iter().any(|&t| t as usize >= n) || self.edge_ids.iter().any(|&e| e as usize >= m) {
+            return Err("adjacency out of range".into());
+        }
+        Ok(())
+    }
+}
+
+/// Per-node method facts: owned tables, or the stored form (see
+/// [`Graph::save`]): `index[n]` is the start of node `n`'s record in
+/// `words`, or `u32::MAX` for unknown; a record is
+/// `[flags, pairs, defs, implicit, self_dynamic, pair words.., defs.., implicit.., self_dynamic..]`.
+#[derive(Debug, Clone)]
+enum MentionStore {
+    Owned(Vec<Option<Arc<FileMentions>>>),
+    Stored { index: Slab<u32>, words: Slab<u32> },
+}
+
+impl Default for MentionStore {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+const M_OPAQUE: u32 = 1;
+const M_CONTROLLER: u32 = 2;
+
+impl MentionStore {
+    fn get(&self, node: NodeId) -> Option<Mentions<'_>> {
+        match self {
+            Self::Owned(v) => v.get(node as usize).and_then(|m| m.as_deref()).map(FileMentions::view),
+            Self::Stored { index, words } => {
+                let at = *index.get(node as usize)?;
+                (at != u32::MAX).then(|| record(words, at as usize))
+            }
+        }
+    }
+
+    fn encode(&self, n: usize) -> (Vec<u32>, Vec<u32>) {
+        let mut index = Vec::with_capacity(n);
+        let mut words = Vec::new();
+        for node in 0..n as NodeId {
+            match self.get(node) {
+                None => index.push(u32::MAX),
+                Some(m) => {
+                    index.push(words.len() as u32);
+                    words.push(u32::from(m.opaque) * M_OPAQUE | u32::from(m.controller) * M_CONTROLLER);
+                    words.extend([m.pairs.len() as u32, m.defs.len() as u32, m.implicit.len() as u32, m.self_dynamic.len() as u32]);
+                    for &(a, b) in m.pairs {
+                        words.extend([a, b]);
+                    }
+                    words.extend_from_slice(m.defs);
+                    words.extend_from_slice(m.implicit);
+                    words.extend_from_slice(m.self_dynamic);
+                }
+            }
+        }
+        (index, words)
+    }
+
+    /// Checks every record lies inside `words` (what `record` relies on).
+    fn check(index: &[u32], words: &[u32], n: usize) -> Result<(), String> {
+        if index.len() != n {
+            return Err("mention index has the wrong size".into());
+        }
+        for &at in index {
+            if at == u32::MAX {
+                continue;
+            }
+            let at = at as usize;
+            let head = words.get(at..at + 5).ok_or("mention record out of range")?;
+            let len = 5 + 2 * head[1] as usize + head[2] as usize + head[3] as usize + head[4] as usize;
+            if at + len > words.len() {
+                return Err("mention record out of range".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `(u32, u32)` is laid out as two consecutive `u32`s (checked at compile
+/// time), so stored pair words can be viewed as tuples.
+const _: () = assert!(
+    std::mem::size_of::<(u32, u32)>() == 8
+        && std::mem::align_of::<(u32, u32)>() == 4
+        && std::mem::offset_of!((u32, u32), 0) == 0
+        && std::mem::offset_of!((u32, u32), 1) == 4
+);
+
+fn record(words: &[u32], at: usize) -> Mentions<'_> {
+    let h = &words[at..at + 5];
+    let (np, nd, ni, ns) = (h[1] as usize, h[2] as usize, h[3] as usize, h[4] as usize);
+    let mut o = at + 5;
+    let pw = &words[o..o + 2 * np];
+    // SAFETY: `(u32, u32)` is two consecutive u32s (asserted above), and
+    // `pw` holds `2 * np` of them.
+    let pairs: &[(u32, u32)] = unsafe { std::slice::from_raw_parts(pw.as_ptr() as *const (u32, u32), np) };
+    o += 2 * np;
+    let defs = &words[o..o + nd];
+    o += nd;
+    let implicit = &words[o..o + ni];
+    o += ni;
+    let self_dynamic = &words[o..o + ns];
+    Mentions { pairs, defs, implicit, self_dynamic, opaque: h[0] & M_OPAQUE != 0, controller: h[0] & M_CONTROLLER != 0 }
 }
 
 #[derive(Debug, Default)]
 pub struct Graph {
     /// Sorted (node ids follow path order), so [`Graph::id`] is a binary
     /// search and no path is stored twice. Shared with patched graphs.
-    paths: Arc<[RelPath]>,
+    paths: Arc<StrTable>,
     /// (from, to) per edge id.
-    endpoints: Vec<(NodeId, NodeId)>,
-    data: Vec<EdgeData>,
-    /// Distinct edge details, concatenated; detail `i` ends at
-    /// `detail_ends[i]` and starts where detail `i - 1` ends.
-    detail_text: Box<str>,
-    detail_ends: Box<[u32]>,
-    scopes: Vec<String>,
+    endpoints: Slab<[NodeId; 2]>,
+    data: Slab<RawEdge>,
+    /// Distinct edge details.
+    details: StrTable,
+    scopes: Arc<StrTable>,
     /// [`name_id`] of each scope, to match `to_scope`s against method names.
-    scope_ids: Vec<u32>,
+    scope_ids: Slab<u32>,
     /// Number of distinct other files depending on each node / each node
     /// depends on (edges can repeat per scope).
-    distinct_in: Vec<u32>,
-    distinct_out: Vec<u32>,
+    distinct_in: Slab<u32>,
+    distinct_out: Slab<u32>,
     /// from -> to ("depends on").
     forward: Csr,
     /// to -> from ("is depended on by").
     reverse: Csr,
     /// Per node, the method names it defines and mentions (see
     /// [`Graph::set_mentions`]); `None` = unknown.
-    mentions: Vec<Option<Arc<FileMentions>>>,
-    unmentioned: Arc<[u32]>,
+    mentions: MentionStore,
+    unmentioned: Slab<u32>,
     /// Size/complexity tables (see [`Graph::set_metrics`]), shared with the
     /// extractors' outputs.
     metrics: Vec<Arc<MetricsTable>>,
     /// Details appended by [`Graph::patched`] since the last build (some
-    /// may be unused); bounds the garbage in `detail_text`.
+    /// may be unused); bounds the garbage in `details`.
     details_appended: u32,
 }
 
@@ -128,19 +298,19 @@ fn dedup_keys(keyed: &mut Vec<Key>) {
 }
 
 /// `distinct_in` / `distinct_out` from endpoints sorted by (from, to).
-fn distinct(n: usize, endpoints: &[(NodeId, NodeId)]) -> (Vec<u32>, Vec<u32>) {
+fn distinct(n: usize, endpoints: &[[NodeId; 2]]) -> (Slab<u32>, Slab<u32>) {
     let mut distinct_in = vec![0u32; n];
     let mut distinct_out = vec![0u32; n];
-    let mut last: Option<(NodeId, NodeId)> = None;
+    let mut last: Option<[NodeId; 2]> = None;
     // Duplicates are adjacent.
-    for &(f, t) in endpoints {
-        if f != t && last != Some((f, t)) {
+    for &[f, t] in endpoints {
+        if f != t && last != Some([f, t]) {
             distinct_in[t as usize] += 1;
             distinct_out[f as usize] += 1;
         }
-        last = Some((f, t));
+        last = Some([f, t]);
     }
-    (distinct_in, distinct_out)
+    (distinct_in.into(), distinct_out.into())
 }
 
 /// Scope strings in the order [`Graph::build`] interns them: first
@@ -295,7 +465,7 @@ impl Graph {
         for (new, &old) in order.iter().enumerate() {
             remap[old as usize] = new as NodeId;
         }
-        let paths: Arc<[RelPath]> = order.iter().map(|&i| names[i as usize].to_string()).collect();
+        let paths = Arc::new(StrTable::from_strs(order.iter().map(|&i| names[i as usize])));
 
         // Sort so the best duplicate (highest confidence, then lowest line) comes first, then dedup.
         let mut scope_ids: HashMap<&str, u32> = HashMap::new();
@@ -319,34 +489,48 @@ impl Graph {
         dedup_keys(&mut keyed);
 
         let mut detail_ids: HashMap<&str, u32> = HashMap::new();
-        let mut detail_text = String::new();
-        let mut detail_ends: Vec<u32> = Vec::new();
+        let mut detail_list: Vec<&str> = Vec::new();
         let mut endpoints = Vec::with_capacity(keyed.len());
         let mut data = Vec::with_capacity(keyed.len());
         for k in &keyed {
             let e = edges[k.6 as usize];
-            endpoints.push((k.0, k.1));
+            endpoints.push([k.0, k.1]);
             let detail = match &e.detail {
                 Some(d) => *detail_ids.entry(d.as_str()).or_insert_with(|| {
-                    detail_text.push_str(d);
-                    detail_ends.push(detail_text.len() as u32);
-                    (detail_ends.len() - 1) as u32
+                    detail_list.push(d);
+                    (detail_list.len() - 1) as u32
                 }),
                 None => u32::MAX,
             };
-            data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail, from_scope: k.3 .0, to_scope: k.3 .1, inherit: k.7 });
+            data.push(RawEdge::new(e, detail, k.3 .0, k.3 .1, k.7));
         }
         let n = paths.len();
-        let forward = Csr::build(n, endpoints.iter().copied());
-        let reverse = Csr::build(n, endpoints.iter().map(|&(f, t)| (t, f)));
+        let forward = Csr::build(n, endpoints.iter().map(|&[f, t]| (f, t)));
+        let reverse = Csr::build(n, endpoints.iter().map(|&[f, t]| (t, f)));
         // `endpoints` is sorted by (from, to, ..).
         let (distinct_in, distinct_out) = distinct(n, &endpoints);
         drop(scope);
         let scope_ids = scopes.iter().map(|s| name_id(s)).collect();
-        let mentions = vec![None; n];
+        let scopes = Arc::new(StrTable::from_strs(scopes.iter().map(String::as_str)));
+        let mentions = MentionStore::Owned(vec![None; n]);
+        let details = StrTable::from_strs(detail_list);
         drop(detail_ids);
-        let (detail_text, detail_ends) = (detail_text.into_boxed_str(), detail_ends.into_boxed_slice());
-        Self { paths, endpoints, data, detail_text, detail_ends, scopes, scope_ids, distinct_in, distinct_out, forward, reverse, mentions, unmentioned: Arc::from([]), metrics: Vec::new(), details_appended: 0 }
+        Self {
+            paths,
+            endpoints: endpoints.into(),
+            data: data.into(),
+            details,
+            scopes,
+            scope_ids,
+            distinct_in,
+            distinct_out,
+            forward,
+            reverse,
+            mentions,
+            unmentioned: Slab::default(),
+            metrics: Vec::new(),
+            details_appended: 0,
+        }
     }
 
     /// The graph [`Graph::build`] returns for `all` (the complete new input,
@@ -364,16 +548,16 @@ impl Graph {
     pub fn patched<'a>(&self, rows: &[(&'a str, Vec<&'a Edge>)], all: impl Iterator<Item = &'a Edge>, listed: impl Fn(&str) -> bool) -> Option<Graph> {
         // Scope ids depend on first appearance anywhere in the input.
         let order = scope_order(all);
-        if order.len() != self.scopes.len() || order.iter().zip(&self.scopes).any(|(a, b)| *a != b.as_str()) {
+        if order.len() != self.scopes.len() || order.iter().zip(self.scopes.iter()).any(|(a, b)| *a != b) {
             return None;
         }
-        let scope_ix: HashMap<&str, u32> = self.scopes.iter().enumerate().map(|(i, s)| (s.as_str(), i as u32)).collect();
+        let scope_ix: HashMap<&str, u32> = self.scopes.iter().enumerate().map(|(i, s)| (s, i as u32)).collect();
         let scope = |s: &Option<String>| s.as_deref().map_or(Some(u32::MAX), |s| scope_ix.get(s).copied());
 
-        let mut detail_text = String::from(&*self.detail_text);
-        let mut detail_ends: Vec<u32> = self.detail_ends.to_vec();
+        let old_details = self.details.len() as u32;
+        let mut appended: Vec<&str> = Vec::new();
         let mut new_details: HashMap<&str, u32> = HashMap::new();
-        let mut rows_out: Vec<(NodeId, Vec<(NodeId, NodeId)>, Vec<EdgeData>)> = Vec::with_capacity(rows.len());
+        let mut rows_out: Vec<(NodeId, Vec<[NodeId; 2]>, Vec<RawEdge>)> = Vec::with_capacity(rows.len());
         // Nodes that may have lost their last edge.
         let mut touched: Vec<NodeId> = Vec::new();
         for (from, edges) in rows {
@@ -399,21 +583,20 @@ impl Graph {
             let mut data = Vec::with_capacity(keyed.len());
             for k in &keyed {
                 let e = edges[k.6 as usize];
-                ends.push((k.0, k.1));
+                ends.push([k.0, k.1]);
                 let detail = match &e.detail {
                     Some(d) => *new_details.entry(d.as_str()).or_insert_with(|| {
-                        detail_text.push_str(d);
-                        detail_ends.push(detail_text.len() as u32);
-                        (detail_ends.len() - 1) as u32
+                        appended.push(d);
+                        old_details + (appended.len() - 1) as u32
                     }),
                     None => u32::MAX,
                 };
-                data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail, from_scope: k.3 .0, to_scope: k.3 .1, inherit: k.7 });
+                data.push(RawEdge::new(e, detail, k.3 .0, k.3 .1, k.7));
             }
             rows_out.push((f, ends, data));
         }
         let details_appended = self.details_appended + new_details.len() as u32;
-        if details_appended as usize > (self.detail_ends.len() / 4).max(1 << 12) {
+        if details_appended as usize > (self.details.len() / 4).max(1 << 12) {
             return None;
         }
         rows_out.sort_unstable_by_key(|r| r.0);
@@ -437,38 +620,153 @@ impl Graph {
         endpoints.extend_from_slice(&self.endpoints[at..]);
         data.extend_from_slice(&self.data[at..]);
 
-        let forward = Csr::build(n, endpoints.iter().copied());
-        let reverse = Csr::build(n, endpoints.iter().map(|&(f, t)| (t, f)));
+        let forward = Csr::build(n, endpoints.iter().map(|&[f, t]| (f, t)));
+        let reverse = Csr::build(n, endpoints.iter().map(|&[f, t]| (t, f)));
         for t in touched {
-            let deg = |c: &Csr| c.offsets[t as usize + 1] - c.offsets[t as usize];
-            if deg(&forward) == 0 && deg(&reverse) == 0 && !listed(&self.paths[t as usize]) {
+            if forward.degree(t) == 0 && reverse.degree(t) == 0 && !listed(self.paths.get(t as usize)) {
                 return None;
             }
         }
         let (distinct_in, distinct_out) = distinct(n, &endpoints);
+        let details = if appended.is_empty() { self.details.clone() } else { StrTable::from_strs(self.details.iter().chain(appended)) };
         Some(Self {
             paths: self.paths.clone(),
-            endpoints,
-            data,
-            detail_text: detail_text.into_boxed_str(),
-            detail_ends: detail_ends.into_boxed_slice(),
+            endpoints: endpoints.into(),
+            data: data.into(),
+            details,
             scopes: self.scopes.clone(),
             scope_ids: self.scope_ids.clone(),
             distinct_in,
             distinct_out,
             forward,
             reverse,
-            mentions: vec![None; n],
-            unmentioned: Arc::from([]),
+            mentions: MentionStore::Owned(vec![None; n]),
+            unmentioned: Slab::default(),
             metrics: Vec::new(),
             details_appended,
         })
     }
 
+    /// Saves the graph, its mentions and its metrics tables as sections
+    /// `base..base + 100` (see [`crate::store`]).
+    pub fn save(&self, w: &mut SectionWriter, base: u32) {
+        self.paths.save(w, base, base + 1);
+        w.put(base + 2, &self.endpoints);
+        w.put(base + 3, &self.data);
+        self.details.save(w, base + 4, base + 5);
+        self.scopes.save(w, base + 6, base + 7);
+        w.put(base + 8, &self.scope_ids);
+        w.put(base + 9, &self.distinct_in);
+        w.put(base + 10, &self.distinct_out);
+        for (i, c) in [&self.forward, &self.reverse].into_iter().enumerate() {
+            let b = base + 11 + 3 * i as u32;
+            w.put(b, &c.offsets);
+            w.put(b + 1, &c.targets);
+            w.put(b + 2, &c.edge_ids);
+        }
+        match &self.mentions {
+            MentionStore::Stored { index, words } => {
+                w.put(base + 17, index);
+                w.put(base + 18, words);
+            }
+            m @ MentionStore::Owned(_) => {
+                let (index, words) = m.encode(self.node_count());
+                w.put(base + 17, &index);
+                w.put(base + 18, &words);
+            }
+        }
+        w.put(base + 19, &self.unmentioned);
+        w.put::<u32>(base + 20, &[self.metrics.len() as u32, self.details_appended]);
+        for (i, t) in self.metrics.iter().enumerate() {
+            t.save(w, base + 30 + 4 * i as u32);
+        }
+    }
+
+    /// A graph saved by [`Graph::save`], its arrays pointing into the
+    /// mapped file. Checks everything the accessors index with (so a
+    /// malformed file is an error, never a crash or worse).
+    pub fn load(f: &SectionFile, base: u32) -> Result<Self, String> {
+        let paths = StrTable::load(f, base, base + 1)?;
+        let n = paths.len();
+        if (1..n).any(|i| paths.get(i - 1) >= paths.get(i)) {
+            return Err("graph paths are not sorted".into());
+        }
+        let endpoints: Slab<[NodeId; 2]> = f.slab(base + 2)?;
+        let data: Slab<RawEdge> = f.slab(base + 3)?;
+        let details = StrTable::load(f, base + 4, base + 5)?;
+        let scopes = StrTable::load(f, base + 6, base + 7)?;
+        let m = endpoints.len();
+        if data.len() != m || endpoints.iter().any(|&[a, b]| a as usize >= n || b as usize >= n) {
+            return Err("graph edges out of range".into());
+        }
+        let (nd, ns) = (details.len() as u32, scopes.len() as u32);
+        let ok = |i: u32, max: u32| i == u32::MAX || i < max;
+        if data.iter().any(|d| {
+            d.kind as usize >= KINDS.len() || d.confidence as usize >= CONFIDENCES.len() || d.inherit > 1 || !ok(d.detail, nd) || !ok(d.from_scope, ns) || !ok(d.to_scope, ns)
+        }) {
+            return Err("graph edge data out of range".into());
+        }
+        let scope_ids: Slab<u32> = f.slab(base + 8)?;
+        let distinct_in: Slab<u32> = f.slab(base + 9)?;
+        let distinct_out: Slab<u32> = f.slab(base + 10)?;
+        if scope_ids.len() != scopes.len() || distinct_in.len() != n || distinct_out.len() != n {
+            return Err("graph arrays have the wrong size".into());
+        }
+        let csr = |b: u32| -> Result<Csr, String> {
+            let c = Csr { offsets: f.slab(b)?, targets: f.slab(b + 1)?, edge_ids: f.slab(b + 2)? };
+            c.check(n, m)?;
+            Ok(c)
+        };
+        let (forward, reverse) = (csr(base + 11)?, csr(base + 14)?);
+        let (index, words): (Slab<u32>, Slab<u32>) = (f.slab(base + 17)?, f.slab(base + 18)?);
+        MentionStore::check(&index, &words, n)?;
+        let unmentioned: Slab<u32> = f.slab(base + 19)?;
+        let meta: Slab<u32> = f.slab(base + 20)?;
+        let [tables, details_appended] = <[u32; 2]>::try_from(&*meta).map_err(|_| "graph metadata is malformed")?;
+        let metrics = (0..tables).map(|i| MetricsTable::load(f, base + 30 + 4 * i).map(Arc::new)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            paths: Arc::new(paths),
+            endpoints,
+            data,
+            details,
+            scopes: Arc::new(scopes),
+            scope_ids,
+            distinct_in,
+            distinct_out,
+            forward,
+            reverse,
+            mentions: MentionStore::Stored { index, words },
+            unmentioned,
+            metrics,
+            details_appended,
+        })
+    }
+
+    /// Heap bytes held by the graph's own arrays (0 for a loaded graph;
+    /// mentions shared with extractors are not counted).
+    pub fn heap_bytes(&self) -> usize {
+        let csr = |c: &Csr| c.offsets.heap_bytes() + c.targets.heap_bytes() + c.edge_ids.heap_bytes();
+        self.paths.heap_bytes()
+            + self.endpoints.heap_bytes()
+            + self.data.heap_bytes()
+            + self.details.heap_bytes()
+            + self.scopes.heap_bytes()
+            + self.scope_ids.heap_bytes()
+            + self.distinct_in.heap_bytes()
+            + self.distinct_out.heap_bytes()
+            + csr(&self.forward)
+            + csr(&self.reverse)
+            + self.unmentioned.heap_bytes()
+            + match &self.mentions {
+                MentionStore::Owned(v) => v.len() * 8,
+                MentionStore::Stored { index, words } => index.heap_bytes() + words.heap_bytes(),
+            }
+    }
+
     /// Every edge in id order as an [`Edge`] (detail resolved), for
     /// comparing graphs in tests.
     pub fn edges_for_test(&self) -> Vec<Edge> {
-        (0..self.endpoints.len() as u32)
+        (0..self.edge_count() as u32)
             .map(|i| {
                 let (f, t, d) = self.edge(i);
                 let mut e = Edge::new(self.path(f), self.path(t), d.kind, d.confidence).at(d.line);
@@ -485,7 +783,7 @@ impl Graph {
     /// (forward, reverse) adjacency as (node, [(neighbour, edge id)]) for
     /// comparing graphs in tests.
     pub fn adjacency_for_test(&self) -> (Vec<Vec<(NodeId, u32)>>, Vec<Vec<(NodeId, u32)>>) {
-        let n = self.paths.len() as NodeId;
+        let n = self.node_count() as NodeId;
         ((0..n).map(|i| self.forward.neighbours(i).collect()).collect(), (0..n).map(|i| self.reverse.neighbours(i).collect()).collect())
     }
 
@@ -493,13 +791,14 @@ impl Graph {
     /// narrow a seed's direct dependents (see [`Graph::impact_scoped`]).
     /// Files of the table that are not nodes are ignored.
     pub fn set_mentions(&mut self, table: &MentionTable) {
-        self.mentions = vec![None; self.paths.len()];
+        let mut v = vec![None; self.node_count()];
         for (path, m) in &table.files {
             if let Some(n) = self.id(path) {
-                self.mentions[n as usize] = Some(m.clone());
+                v[n as usize] = Some(m.clone());
             }
         }
-        self.unmentioned = table.unmentioned.clone();
+        self.mentions = MentionStore::Owned(v);
+        self.unmentioned = table.unmentioned.to_vec().into();
     }
 
     /// Attaches the extractors' size/complexity tables (replacing any
@@ -512,7 +811,7 @@ impl Graph {
     /// Size and complexity of `node`'s file; `None` when no extractor
     /// analysed it (not code, ignored, or Ruby with `ruby.method_level` off).
     pub fn metrics(&self, node: NodeId) -> Option<FileMetrics> {
-        self.metrics_of(self.paths.get(node as usize)?)
+        ((node as usize) < self.node_count()).then(|| self.metrics_of(self.path(node)))?
     }
 
     /// [`Graph::metrics`] by path (the file need not be a node).
@@ -523,7 +822,10 @@ impl Graph {
     /// Per-method metrics of `node`'s file, sorted by start line; empty when
     /// unknown (JS/TS, templates, and files without methods).
     pub fn method_metrics(&self, node: NodeId) -> &[MethodMetric] {
-        self.paths.get(node as usize).and_then(|p| crate::metrics::lookup(&self.metrics, p)).map_or(&[], |(_, m)| m)
+        if node as usize >= self.node_count() {
+            return &[];
+        }
+        crate::metrics::lookup(&self.metrics, self.path(node)).map_or(&[], |(_, m)| m)
     }
 
     /// The method of `node`'s file whose lines contain `line` (1-based), e.g.
@@ -540,8 +842,8 @@ impl Graph {
     }
 
     /// The method facts of `node`, if known.
-    pub fn mentions(&self, node: NodeId) -> Option<&FileMentions> {
-        self.mentions.get(node as usize).and_then(|m| m.as_deref())
+    pub fn mentions(&self, node: NodeId) -> Option<Mentions<'_>> {
+        self.mentions.get(node)
     }
 
     pub fn node_count(&self) -> usize {
@@ -551,25 +853,23 @@ impl Graph {
         self.endpoints.len()
     }
     pub fn id(&self, path: &str) -> Option<NodeId> {
-        self.paths.binary_search_by(|p| p.as_str().cmp(path)).ok().map(|i| i as NodeId)
+        self.paths.binary_search(path).ok().map(|i| i as NodeId)
     }
     pub fn path(&self, node: NodeId) -> &str {
-        &self.paths[node as usize]
+        self.paths.get(node as usize)
     }
-    pub fn paths(&self) -> &[RelPath] {
-        &self.paths
+    /// Every node's path, in node id order (sorted).
+    pub fn paths(&self) -> impl ExactSizeIterator<Item = &str> + Clone + '_ {
+        self.paths.iter()
     }
     pub fn edge(&self, edge: u32) -> (NodeId, NodeId, EdgeData) {
-        let (f, t) = self.endpoints[edge as usize];
-        (f, t, self.data[edge as usize])
+        let [f, t] = self.endpoints[edge as usize];
+        (f, t, self.data[edge as usize].data())
     }
     pub fn edge_detail(&self, edge: u32) -> Option<&str> {
         match self.data[edge as usize].detail {
             u32::MAX => None,
-            i => {
-                let start = if i == 0 { 0 } else { self.detail_ends[i as usize - 1] as usize };
-                Some(&self.detail_text[start..self.detail_ends[i as usize] as usize])
-            }
+            i => Some(self.details.get(i as usize)),
         }
     }
     /// Files that directly depend on `node`, with the connecting edge id.
@@ -583,7 +883,7 @@ impl Graph {
     /// `(from_scope, to_scope)` of an edge; see [`Edge::from_scope`].
     pub fn edge_scopes(&self, edge: u32) -> (Option<&str>, Option<&str>) {
         let d = &self.data[edge as usize];
-        let get = |i: u32| (i != u32::MAX).then(|| self.scopes[i as usize].as_str());
+        let get = |i: u32| (i != u32::MAX).then(|| self.scopes.get(i as usize));
         (get(d.from_scope), get(d.to_scope))
     }
     /// Number of distinct files that directly depend on `node`.
@@ -596,7 +896,7 @@ impl Graph {
     }
     /// True when the edge is an inheritance edge; see [`Edge::inherit`].
     pub fn edge_inherits(&self, edge: u32) -> bool {
-        self.data[edge as usize].inherit
+        self.data[edge as usize].inherit()
     }
 
     /// Everything that may be affected if `seeds` change entirely: reverse BFS.
@@ -639,8 +939,8 @@ impl Graph {
         /// (heirs, seeds without method facts).
         const SET: u32 = 1 << 31;
         let set_of = |scope: u32| -> Option<(usize, bool)> { (SET..NOTHING).contains(&scope).then(|| (((scope - SET) >> 1) as usize, (scope - SET) & 1 == 1)) };
-        let mut position = vec![u32::MAX; self.paths.len()];
-        let mut whole = vec![false; self.paths.len()];
+        let mut position = vec![u32::MAX; self.node_count()];
+        let mut whole = vec![false; self.node_count()];
         let mut partial: HashSet<(NodeId, u32)> = HashSet::new();
         let mut found: Vec<(Hit, u32)> = Vec::new();
         let mut acts: Vec<Act> = Vec::new();
@@ -697,12 +997,12 @@ impl Graph {
             let set = set_of(cur.scope);
             for (next, edge) in self.reverse.neighbours(cur.node) {
                 let d = &self.data[edge as usize];
-                if d.confidence < opts.min_confidence || whole[next as usize] || next == cur.node {
+                if d.confidence() < opts.min_confidence || whole[next as usize] || next == cur.node {
                     continue;
                 }
                 let scope = if opts.file_level || cur.scope == ALL {
-                    if opts.file_level || d.inherit { ALL } else { d.from_scope }
-                } else if d.inherit {
+                    if opts.file_level || d.inherit() { ALL } else { d.from_scope }
+                } else if d.inherit() {
                     // An heir has the same methods; its own dependents are not filtered.
                     match set {
                         Some((k, _)) => SET + 2 * k as u32,
@@ -719,7 +1019,7 @@ impl Graph {
                     d.from_scope
                 } else {
                     if let Some((k, true)) = set
-                        && is_reference(d.kind)
+                        && is_reference(d.kind())
                         && !self.mentions(next).is_none_or(|m| m.opaque || m.mentions_any(&sets[k]))
                     {
                         continue;
@@ -769,13 +1069,13 @@ impl Graph {
         let mut i = 0;
         while i < files.len() {
             for (to, e) in self.forward.neighbours(files[i]) {
-                if self.data[e as usize].inherit && !files.contains(&to) {
+                if self.data[e as usize].inherit() && !files.contains(&to) {
                     files.push(to);
                 }
             }
             i += 1;
         }
-        let tables: Vec<&FileMentions> = files.iter().map(|&f| self.mentions(f)).collect::<Option<_>>()?;
+        let tables: Vec<Mentions<'_>> = files.iter().map(|&f| self.mentions(f)).collect::<Option<_>>()?;
         if tables.iter().any(|t| t.self_dynamic.last() == Some(&NO_DEF)) {
             return None;
         }
@@ -819,7 +1119,7 @@ impl Graph {
     }
 
     fn bfs(&self, csr: &Csr, seeds: &[NodeId], opts: QueryOpts) -> Impact {
-        let mut position = vec![u32::MAX; self.paths.len()];
+        let mut position = vec![u32::MAX; self.node_count()];
         let mut hits: Vec<Hit> = Vec::new();
         let mut sorted_seeds = seeds.to_vec();
         sorted_seeds.sort_unstable();
@@ -838,7 +1138,7 @@ impl Graph {
             for i in level_start..level_end {
                 let cur = hits[i].node;
                 for (next, edge) in csr.neighbours(cur) {
-                    if position[next as usize] != u32::MAX || self.data[edge as usize].confidence < opts.min_confidence {
+                    if position[next as usize] != u32::MAX || self.data[edge as usize].confidence() < opts.min_confidence {
                         continue;
                     }
                     position[next as usize] = hits.len() as u32;
@@ -1111,5 +1411,119 @@ mod tests {
         assert_eq!(g.method_at(a, 5).map(|m| m.complexity), Some(4));
         assert_eq!(g.method_at(a, 6), None);
         assert_eq!(g.method_at(a, 10).map(|m| m.complexity), Some(2));
+    }
+
+    #[test]
+    fn kinds_table_matches_discriminants() {
+        for (i, k) in KINDS.iter().enumerate() {
+            assert_eq!(*k as usize, i);
+        }
+        for (i, c) in CONFIDENCES.iter().enumerate() {
+            assert_eq!(*c as usize, i);
+        }
+    }
+
+    /// Saves `g` and maps it back.
+    pub(crate) fn reload(g: &Graph) -> Graph {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!("ripple-graph-{}-{}.bin", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let mut w = SectionWriter::new();
+        g.save(&mut w, 1000);
+        w.write_atomic(1, &path).unwrap();
+        let f = SectionFile::open(&path, 1).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let out = Graph::load(&f, 1000).unwrap();
+        assert_eq!(out.heap_bytes(), 0);
+        out
+    }
+
+    /// Everything observable about two graphs is the same, including every
+    /// single-seed impact (whole file and per scope / mentioned name).
+    pub(crate) fn assert_same(a: &Graph, b: &Graph) {
+        assert_eq!(a.paths().collect::<Vec<_>>(), b.paths().collect::<Vec<_>>());
+        assert_eq!(a.edges_for_test(), b.edges_for_test());
+        assert_eq!(a.adjacency_for_test(), b.adjacency_for_test());
+        for n in 0..a.node_count() as NodeId {
+            assert_eq!(a.mentions(n), b.mentions(n));
+            assert_eq!(a.metrics(n), b.metrics(n));
+            assert_eq!(a.method_metrics(n), b.method_metrics(n));
+            assert_eq!((a.fan_in(n), a.fan_out(n)), (b.fan_in(n), b.fan_out(n)));
+            for (e, f) in a.dependents(n).zip(b.dependents(n)) {
+                assert_eq!(e, f);
+                assert_eq!(a.edge_detail(e.1), b.edge_detail(f.1));
+                assert_eq!(a.edge_scopes(e.1), b.edge_scopes(f.1));
+                assert_eq!(format!("{:?}", a.edge(e.1)), format!("{:?}", b.edge(f.1)));
+            }
+            let mut names: Vec<String> = (0..a.edge_count() as u32).filter_map(|e| a.edge_scopes(e).1.map(String::from)).collect();
+            names.extend(["zzz".to_string(), "refund!".into(), "charge!".into(), "tax".into()]);
+            let mut seeds: Vec<Option<Vec<String>>> = vec![None];
+            seeds.extend(names.into_iter().map(|s| Some(vec![s])));
+            for scopes in seeds {
+                for opts in [QueryOpts::default(), QueryOpts { max_depth: 1, ..Default::default() }, QueryOpts { file_level: true, ..Default::default() }] {
+                    let (x, y) = (a.impact_scoped(&[(n, scopes.clone())], opts), b.impact_scoped(&[(n, scopes.clone())], opts));
+                    assert_eq!(format!("{:?}", x.hits), format!("{:?}", y.hits));
+                    for h in &x.hits {
+                        assert_eq!(x.path(h.node), y.path(h.node));
+                    }
+                }
+            }
+            assert_eq!(format!("{:?}", a.dependencies_closure(&[n], QueryOpts::default()).hits), format!("{:?}", b.dependencies_closure(&[n], QueryOpts::default()).hits));
+        }
+    }
+
+    #[test]
+    fn saved_graphs_answer_the_same() {
+        let mut g = g();
+        assert_same(&g, &reload(&g));
+        let fm1 = FileMetrics { lines: 30, complexity: 7, methods: 2, max_method: 4 };
+        let ms = [MethodMetric { start: 2, span: 3, complexity: 4 }, MethodMetric { start: 10, span: 0, complexity: 2 }];
+        g.set_metrics([
+            Arc::new(MetricsTable::build([("a", fm1, &ms[..])], true)),
+            Arc::new(MetricsTable::build([("b", FileMetrics::default(), &[][..])], false)),
+        ]);
+        g.set_mentions(&table(vec![("a", fm(&["x", "to_s"], &[("y", "x"), ("z", "-")])), ("c", fm(&[], &[]))], &["x"]));
+        let r = reload(&g);
+        assert_same(&g, &r);
+        // A reloaded graph saves and patches like the original.
+        assert_same(&r, &reload(&r));
+        let edges = vec![
+            Edge::new("b", "a", RubyConstant, Exact).at(3).detail("A"),
+            Edge::new("c", "b", RubyConstant, Exact).detail("new detail"),
+            Edge::new("d", "a", ApiCall, Heuristic),
+            Edge::new("e", "c", JsImport, Exact),
+            Edge::new("b", "a", RubyConstant, Inferred).at(1),
+        ];
+        let rows = vec![("c", vec![&edges[1]])];
+        let p1 = g.patched(&rows, edges.iter(), |_| true).unwrap();
+        let p2 = r.patched(&rows, edges.iter(), |_| true).unwrap();
+        assert_same(&p1, &p2);
+        assert_eq!(p2.edge_detail(p2.dependents(p2.id("b").unwrap()).next().unwrap().1), Some("new detail"));
+    }
+
+    #[test]
+    fn corrupt_graph_sections_are_rejected() {
+        let g = g();
+        let path = std::env::temp_dir().join(format!("ripple-graph-bad-{}.bin", std::process::id()));
+        // An edge pointing past the node table.
+        let mut w = SectionWriter::new();
+        g.save(&mut w, 0);
+        let mut w2 = SectionWriter::new();
+        // Rebuild with a bad endpoints section (sections are looked up by id, the later wins).
+        let f = {
+            w.write_atomic(1, &path).unwrap();
+            SectionFile::open(&path, 1).unwrap()
+        };
+        for id in 0..60 {
+            if id == 2 {
+                w2.put::<[u32; 2]>(2, &[[0, 999]; 4]);
+            } else if let Ok(b) = f.bytes(id) {
+                w2.put_bytes(id, b);
+            }
+        }
+        w2.write_atomic(1, &path).unwrap();
+        let f = SectionFile::open(&path, 1).unwrap();
+        assert!(Graph::load(&f, 0).unwrap_err().contains("out of range"));
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -199,13 +199,13 @@ pub struct PolicyIndex {
 
 impl PolicyIndex {
     pub fn build(policy: &Policy, graph: &Graph) -> Self {
-        let paths = graph.paths();
+        let n = graph.node_count();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
-        let chunk = paths.len().div_ceil(threads).max(1024);
+        let chunk = n.div_ceil(threads).max(1024);
         let classes = std::thread::scope(|s| {
-            let handles: Vec<_> = paths
-                .chunks(chunk)
-                .map(|part| s.spawn(move || part.iter().map(|p| policy.classify(p)).collect::<Vec<_>>()))
+            let handles: Vec<_> = (0..n)
+                .step_by(chunk)
+                .map(|a| s.spawn(move || (a..(a + chunk).min(n)).map(|i| policy.classify(graph.path(i as NodeId))).collect::<Vec<_>>()))
                 .collect();
             handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
         });

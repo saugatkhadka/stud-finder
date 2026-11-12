@@ -57,7 +57,31 @@ pub struct FileMentions {
 impl FileMentions {
     /// Does the file mention any of `names` (sorted)?
     pub fn mentions_any(&self, names: &[u32]) -> bool {
-        let p = &self.pairs;
+        self.view().mentions_any(names)
+    }
+
+    /// The borrowed form the graph hands out.
+    pub fn view(&self) -> Mentions<'_> {
+        Mentions { pairs: &self.pairs, defs: &self.defs, implicit: &self.implicit, self_dynamic: &self.self_dynamic, opaque: self.opaque, controller: self.controller }
+    }
+}
+
+/// A file's [`FileMentions`] as stored in a graph (owned or mapped); same
+/// fields, borrowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mentions<'a> {
+    pub pairs: &'a [(u32, u32)],
+    pub defs: &'a [u32],
+    pub implicit: &'a [u32],
+    pub self_dynamic: &'a [u32],
+    pub opaque: bool,
+    pub controller: bool,
+}
+
+impl Mentions<'_> {
+    /// Does the file mention any of `names` (sorted)?
+    pub fn mentions_any(&self, names: &[u32]) -> bool {
+        let p = self.pairs;
         names.iter().any(|&n| {
             let i = p.partition_point(|&(x, _)| x < n);
             i < p.len() && p[i].0 == n
