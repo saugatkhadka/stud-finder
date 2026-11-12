@@ -47,11 +47,31 @@ pub struct EvalOptions {
     pub min_confidence: Option<Confidence>,
     /// Index generation to stamp on the report.
     pub generation: u64,
-    /// Keep at most this many entries in `impacted.files` and `tests_to_run`.
-    /// Counts and reasons are always computed over the full set.
+    /// Cut every list to at most this many entries instead of its default
+    /// budget ([`crate::report::budget`]). Counts and rules always cover the full set.
     pub limit: Option<usize>,
+    /// No list budget: every dependent, further file and test is listed.
+    pub all: bool,
+    /// Always include the policy section (risk, rules, owners, areas), with
+    /// full evidence. Otherwise it is included, compactly, only when the
+    /// config defines rules or areas and a rule fired.
+    pub policy: bool,
     /// Ignore method / action scopes: every changed file is wholly changed.
     pub file_level: bool,
+    /// Repository root: lets the report give the line where a removed
+    /// method is still mentioned. `None` = no file reads.
+    pub root: Option<std::path::PathBuf>,
+}
+
+impl EvalOptions {
+    /// The size of a list whose default budget is `default`.
+    fn cap(&self, default: usize) -> usize {
+        match (self.all, self.limit) {
+            (true, None) => usize::MAX,
+            (_, Some(l)) => l,
+            (false, None) => default,
+        }
+    }
 }
 
 /// Evaluates with default options, classifying the graph on the fly.
@@ -81,23 +101,23 @@ fn within(depth: u32, limit: u32) -> bool {
     depth >= 1 && (limit == 0 || depth <= limit)
 }
 
-struct Changed {
-    file: ChangedFile,
-    class: FileClass,
+pub(crate) struct Changed {
+    pub(crate) file: ChangedFile,
+    pub(crate) class: FileClass,
     /// Areas of the new path and (for renames) the old path.
     touch_areas: Vec<u16>,
-    node: Option<NodeId>,
+    pub(crate) node: Option<NodeId>,
     /// Effective seed scopes (`None` = whole file).
     scopes: Option<Vec<String>>,
 }
 
-struct Ctx<'a> {
-    policy: &'a Policy,
-    graph: &'a Graph,
+pub(crate) struct Ctx<'a> {
+    pub(crate) policy: &'a Policy,
+    pub(crate) graph: &'a Graph,
     index: &'a PolicyIndex,
-    changed: Vec<Changed>,
+    pub(crate) changed: Vec<Changed>,
     seeds: Vec<(NodeId, Option<Vec<String>>)>,
-    eff: QueryOpts,
+    pub(crate) eff: QueryOpts,
     reaches: Vec<Reach>,
     has_lines: bool,
 }
@@ -117,6 +137,10 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     let mut files: Vec<ChangedFile> = Vec::new();
     let mut seen = HashSet::new();
     for f in changed {
+        if crate::load::CONFIG_FILE_NAMES.contains(&f.path.as_str()) {
+            warnings.push(Warning::new("ripple_config_changed", "ripple's own config: not analysed for impact").file(&f.path));
+            continue;
+        }
         if policy.is_ignored(&f.path) {
             warnings.push(Warning::new("changed_file_ignored", "matches `ignore` in ripple.yml; not analysed").file(&f.path));
             continue;
@@ -210,9 +234,12 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     }
 
     let main = &ctx.reaches[0];
+    let mut truncated = false;
+    let mut counts = Counts { changed: ctx.changed.len(), ..Default::default() };
     let changed_entries: Vec<ChangedEntry> = ctx
         .changed
         .iter()
+        .take(opts.cap(budget::CHANGED))
         .map(|c| ChangedEntry {
             path: c.file.path.clone(),
             status: c.file.status,
@@ -221,6 +248,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             deleted: c.file.deleted,
             first_line: c.file.first_line,
             scopes: c.scopes.clone(),
+            change: c.file.change.clone().unwrap_or_else(|| crate::changed::classify_change(&c.file, None, None)),
             language: c.class.language,
             areas: policy.area_names(&c.class.areas),
             dependents: c.node.map(|n| graph.fan_in(n)).unwrap_or(0),
@@ -229,6 +257,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             is_global: c.class.global,
         })
         .collect();
+    truncated |= changed_entries.len() < ctx.changed.len();
 
     for c in &ctx.changed {
         if c.class.global {
@@ -258,90 +287,355 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
         }
     }
 
-    // Impacted files and tests.
-    let mut summary = ImpactedSummary::default();
-    let mut tests_to_run: Vec<ImpactedFile> = ctx
+    // Method names per changed node that dependents may use by name
+    // (changed, signature-changed and removed methods; else `--scope`).
+    let mut used_names: BTreeMap<NodeId, Vec<String>> = BTreeMap::new();
+    let mut fresh_names: Vec<crate::findings::NamesOf> = Vec::new();
+    let mut singletons: BTreeMap<NodeId, Vec<String>> = BTreeMap::new();
+    for c in &ctx.changed {
+        let Some(n) = c.node else { continue };
+        let (mut v, removed): (Vec<String>, &[String]) = match &c.file.change {
+            Some(ch) => (ch.methods.iter().chain(&ch.signatures).chain(&ch.removed_methods).cloned().collect(), &ch.removed_methods),
+            None => (Vec::new(), &[]),
+        };
+        if v.is_empty() {
+            v.extend(c.scopes.iter().flatten().filter(|s| *s != ripple_core::model::SCOPE_BODY).cloned());
+        }
+        v.sort_unstable();
+        v.dedup();
+        if v.is_empty() {
+            continue;
+        }
+        if let Some(text) = crate::findings::read(opts.root.as_deref(), &c.file.path) {
+            let s = crate::findings::singleton_names(&text, &v);
+            if !s.is_empty() {
+                singletons.insert(n, s);
+            }
+        }
+        let fresh: Vec<String> = v.iter().filter(|x| !removed.contains(x)).cloned().collect();
+        if !fresh.is_empty() {
+            let single = singletons.get(&n).cloned().unwrap_or_default();
+            fresh_names.push(crate::findings::NamesOf { node: n, file: c.file.path.clone(), names: fresh, singleton: single });
+        }
+        used_names.insert(n, v);
+    }
+
+    // Walk the main BFS once: direct dependents, further files, tests.
+    let mut deps: Vec<usize> = Vec::new();
+    let mut further = Further::default();
+    let mut further_listed: Vec<usize> = Vec::new();
+    let mut tests: Vec<TestFile> = ctx
         .changed
         .iter()
         .filter(|c| c.class.test)
-        .map(|c| ImpactedFile {
-            file: c.file.path.clone(),
-            depth: 0,
-            via: None,
-            root: c.file.path.clone(),
-            kind: None,
-            confidence: None,
-            path_confidence: None,
-            line: None,
-            detail: None,
-            from_scope: None,
-            to_scope: None,
-            language: c.class.language,
-            areas: policy.area_names(&c.class.areas),
-        })
+        .map(|c| TestFile { file: c.file.path.clone(), depth: 0, of: None, via: None, kind: None, line: None, detail: None, mention_line: None })
         .collect();
-    // Entries past `limit` are counted but never materialised (hub seeds can
-    // reach tens of thousands of files). Hits are in BFS order, so the kept
-    // prefix is the nearest files.
-    let cap = opts.limit.unwrap_or(usize::MAX);
-    let mut tests_total = tests_to_run.len();
+    counts.tests = tests.len();
+    counts.tests_direct = tests.len();
+    let test_cap = opts.cap(budget::TESTS);
+    let mut test_hits: Vec<usize> = Vec::new();
+    let further_cap = opts.cap(budget::FURTHER);
+    let crosses = |i: usize, node: NodeId| {
+        let a = ctx.class(node).language.side();
+        let b = ctx.class(main.root[i]).language.side();
+        a.is_some() && b.is_some() && a != b
+    };
     for (i, hit) in main.impact.hits.iter().enumerate() {
         if hit.depth == 0 {
             continue;
         }
         let class = ctx.class(hit.node);
-        let (_, _, data) = graph.edge(hit.edge);
-        let entry = || {
-            let (from_scope, to_scope, _) = shown_scopes(graph, hit.edge);
-            ImpactedFile {
-            file: graph.path(hit.node).to_string(),
-            depth: hit.depth,
-            via: Some(graph.path(hit.via).to_string()),
-            root: graph.path(main.root[i]).to_string(),
-            kind: Some(data.kind),
-            confidence: Some(data.confidence),
-            path_confidence: Some(main.minc[i]),
-            line: (data.line != 0).then_some(data.line),
-            detail: graph.edge_detail(hit.edge).map(str::to_string),
-            from_scope,
-            to_scope,
-            language: class.language,
-            areas: policy.area_names(&class.areas),
-            }
-        };
-        summary.max_depth = summary.max_depth.max(hit.depth);
         if class.test {
-            summary.tests += 1;
-            tests_total += 1;
-            if tests_to_run.len() < cap {
-                tests_to_run.push(entry());
+            counts.tests += 1;
+            if hit.depth == 1 {
+                counts.tests_direct += 1;
             }
-        } else {
-            summary.total += 1;
-            *summary.by_depth.entry(hit.depth).or_default() += 1;
-            *summary.by_language.entry(class.language).or_default() += 1;
-            *summary.by_edge_kind.entry(data.kind).or_default() += 1;
-            *summary.by_min_confidence.entry(main.minc[i]).or_default() += 1;
-            if summary.files.len() < cap {
-                summary.files.push(entry());
+            if opts.all || hit.depth == 1 {
+                test_hits.push(i);
             }
+            continue;
+        }
+        if hit.depth == 1 {
+            deps.push(i);
+            continue;
+        }
+        counts.further += 1;
+        *further.by_depth.entry(hit.depth).or_default() += 1;
+        *further.by_language.entry(class.language).or_default() += 1;
+        for &a in &class.areas {
+            *further.by_area.entry(policy.area(a).name.clone()).or_default() += 1;
+        }
+        if let Some(t) = policy.max_tier(&class.areas) {
+            *further.by_tier.entry(t).or_default() += 1;
+        }
+        let notable = notable_reasons(crosses(i, hit.node), policy.max_tier(&class.areas), class.global);
+        if !notable.is_empty() {
+            counts.further_notable += 1;
+        }
+        if (opts.all || !notable.is_empty()) && further_listed.len() < further_cap {
+            further_listed.push(i);
         }
     }
+    counts.dependents = deps.len();
+    counts.impacted = counts.dependents + counts.further;
+
+    // Which changed methods a hop-1 file mentions, and the line where it
+    // calls a changed singleton method on the class constant.
+    let mention_info = |i: usize| -> (Vec<String>, Vec<u32>) {
+        let hit = &main.impact.hits[i];
+        let seed = main.root[i];
+        let uses: Vec<String> = match (used_names.get(&seed), graph.mentions(hit.node)) {
+            (Some(names), Some(m)) => names.iter().filter(|n| m.mentions_any(&[ripple_core::mentions::name_id(n)])).cloned().collect(),
+            _ => Vec::new(),
+        };
+        let on_const = match singletons.get(&seed) {
+            Some(single) if uses.iter().any(|u| single.contains(u)) => {
+                let consts = graph.edge_detail(hit.edge).map(crate::findings::detail_constants).unwrap_or_default();
+                let mut lines: Vec<u32> = crate::findings::read(opts.root.as_deref(), graph.path(hit.node))
+                    .map(|t| single.iter().filter(|u| uses.contains(u)).flat_map(|u| crate::findings::constant_call_lines(&t, &consts, u, 10)).collect())
+                    .unwrap_or_default();
+                lines.sort_unstable();
+                lines.dedup();
+                lines.truncate(10);
+                lines
+            }
+            _ => Vec::new(),
+        };
+        (uses, on_const)
+    };
+    let first_mention = |path: &str, uses: &[String]| -> Option<u32> {
+        if uses.is_empty() {
+            return None;
+        }
+        crate::findings::read(opts.root.as_deref(), path).and_then(|t| uses.iter().filter_map(|u| crate::findings::mention_line(&t, u)).min())
+    };
+    // Tests at hop 1: callers of the changed methods first.
+    let mut ranked: Vec<(usize, Vec<String>, Vec<u32>)> = test_hits
+        .iter()
+        .map(|&i| if main.impact.hits[i].depth == 1 && !used_names.is_empty() { let (u, c) = mention_info(i); (i, u, c) } else { (i, Vec::new(), Vec::new()) })
+        .collect();
+    ranked.sort_by(|a, b| {
+        let k = |x: &(usize, Vec<String>, Vec<u32>)| (main.impact.hits[x.0].depth, x.2.is_empty(), x.1.is_empty());
+        (k(a), graph.path(main.impact.hits[a.0].node)).cmp(&(k(b), graph.path(main.impact.hits[b.0].node)))
+    });
+    for (i, uses, on_const) in ranked.into_iter().take(test_cap.saturating_sub(tests.len())) {
+        let hit = &main.impact.hits[i];
+        let (_, _, data) = graph.edge(hit.edge);
+        let path = graph.path(hit.node);
+        tests.push(TestFile {
+            file: path.to_string(),
+            depth: hit.depth,
+            of: Some(graph.path(main.root[i]).to_string()),
+            via: (hit.depth > 1).then(|| graph.path(hit.via).to_string()),
+            kind: Some(data.kind),
+            line: (data.line != 0).then_some(data.line),
+            detail: graph.edge_detail(hit.edge).map(str::to_string),
+            mention_line: on_const.first().copied().or_else(|| first_mention(path, &uses)),
+        });
+    }
+    truncated |= counts.tests > tests.len();
+
+    // Direct dependents: which changed methods each mentions, and whether a
+    // singleton method is called on the class constant.
+    struct Dep {
+        i: usize,
+        uses: Vec<String>,
+        on_const: Vec<u32>,
+        inherit: bool,
+        cross: bool,
+    }
+    let mut dep_info: Vec<Dep> = deps
+        .iter()
+        .map(|&i| {
+            let hit = &main.impact.hits[i];
+            let (uses, on_const) = mention_info(i);
+            Dep { i, uses, on_const, inherit: graph.edge_inherits(hit.edge), cross: crosses(i, hit.node) }
+        })
+        .collect();
+    // Heirs / includers that never mention a changed method: grouped apart.
+    let mut inherit_only: Vec<String> = Vec::new();
+    dep_info.retain(|d| {
+        let scoped = used_names.contains_key(&main.root[d.i]);
+        let known = graph.mentions(main.impact.hits[d.i].node).is_some();
+        if scoped && known && d.inherit && d.uses.is_empty() {
+            inherit_only.push(graph.path(main.impact.hits[d.i].node).to_string());
+            false
+        } else {
+            true
+        }
+    });
+    inherit_only.sort();
+    counts.inherit_only = inherit_only.len();
+    let inherit_cap = opts.cap(budget::INHERIT_ONLY);
+    truncated |= inherit_only.len() > inherit_cap;
+    inherit_only.truncate(inherit_cap);
+    let key = |d: &Dep| {
+        let hit = &main.impact.hits[d.i];
+        let class = ctx.class(hit.node);
+        (
+            d.on_const.is_empty(),
+            d.uses.is_empty(),
+            !d.cross,
+            std::cmp::Reverse(policy.max_tier(&class.areas).filter(|t| *t >= Risk::High)),
+            std::cmp::Reverse(graph.edge(hit.edge).2.confidence),
+        )
+    };
+    dep_info.sort_by(|a, b| (key(a), graph.path(main.impact.hits[a.i].node)).cmp(&(key(b), graph.path(main.impact.hits[b.i].node))));
+    let dep_cap = opts.cap(budget::DEPENDENTS);
+    truncated |= dep_info.len() > dep_cap;
+    let dependents: Vec<Dependent> = dep_info
+        .iter()
+        .take(dep_cap)
+        .map(|d| {
+            let i = d.i;
+            let hit = &main.impact.hits[i];
+            let (_, _, data) = graph.edge(hit.edge);
+            let class = ctx.class(hit.node);
+            let (from_scope, to_scope, inherit) = shown_scopes(graph, hit.edge);
+            let path = graph.path(hit.node);
+            let of = graph.path(main.root[i]);
+            let mut detail = graph.edge_detail(hit.edge).map(str::to_string);
+            let mut line = (data.line != 0).then_some(data.line);
+            let mut mention_line = d.on_const.first().copied();
+            if data.kind == ripple_core::EdgeKind::RailsRoute
+                && let Some(ctrl) = crate::findings::controller_name(of)
+                && let Some(text) = crate::findings::read(opts.root.as_deref(), path)
+            {
+                // The route of the changed action, not the first route of the controller.
+                let routes = crate::findings::route_lines(&text, ctrl);
+                let actions: Vec<String> = used_names.get(&main.root[i]).cloned().unwrap_or_default();
+                match routes.iter().find(|(_, a)| actions.contains(a)) {
+                    Some((l, _)) => {
+                        mention_line = Some(*l);
+                        detail = text.lines().nth(*l as usize - 1).map(|t| t.trim().chars().take(120).collect());
+                    }
+                    None if actions.is_empty() && routes.len() > 1 => {
+                        let mut acts: Vec<&str> = routes.iter().map(|(_, a)| a.as_str()).collect();
+                        acts.sort_unstable();
+                        acts.dedup();
+                        detail = Some(format!("routes ({} actions)", acts.len()));
+                        line = None;
+                    }
+                    None => {}
+                }
+            } else if mention_line.is_none() {
+                mention_line = first_mention(path, &d.uses);
+            }
+            Dependent {
+                file: path.to_string(),
+                line,
+                kind: data.kind,
+                detail,
+                confidence: data.confidence,
+                of: of.to_string(),
+                from_scope,
+                to_scope,
+                inherit,
+                uses_methods: d.uses.clone(),
+                mention_line,
+                calls_on_constant: d.on_const.clone(),
+                language: class.language,
+                areas: policy.area_names(&class.areas),
+                crosses_boundary: d.cross,
+            }
+        })
+        .collect();
+
+    // Files mentioning a changed method name with no edge to it.
+    let mut exclude: BTreeSet<NodeId> = ctx.seeds.iter().map(|(n, _)| *n).collect();
+    exclude.extend(main.impact.hits.iter().filter(|h| h.depth <= 1).map(|h| h.node));
+    let (also_mentioned, also_total) = crate::findings::also_mentioned(&ctx, opts, &fresh_names, &exclude);
+    counts.also_mentioned = also_total;
+    truncated |= also_mentioned.iter().any(|a| a.files.len() < a.total);
+    let mut blind_spots = Vec::new();
+    if !used_names.is_empty() {
+        let mut all: Vec<&String> = used_names.values().flatten().collect();
+        all.sort_unstable();
+        all.dedup();
+        let q = |n: &str| if n.chars().all(|c| c.is_alphanumeric() || c == '_') { n.to_string() } else { format!("'{n}'") };
+        let rg = match all.as_slice() {
+            [one] => q(one),
+            many => many.iter().map(|n| format!("-e {}", q(n))).collect::<Vec<_>>().join(" "),
+        };
+        blind_spots.push("methods matched by name; receivers untyped".to_string());
+        blind_spots.push("JS/TS and send/try not checked".to_string());
+        blind_spots.push(format!("also run: rg -w {rg}"));
+    }
+
+    further.files = further_listed
+        .iter()
+        .map(|&i| {
+            let hit = &main.impact.hits[i];
+            let class = ctx.class(hit.node);
+            FurtherFile {
+                file: graph.path(hit.node).to_string(),
+                depth: hit.depth,
+                via: graph.path(hit.via).to_string(),
+                of: graph.path(main.root[i]).to_string(),
+                kind: graph.edge(hit.edge).2.kind,
+                confidence: main.minc[i],
+                language: class.language,
+                areas: policy.area_names(&class.areas),
+                notable: notable_reasons(crosses(i, hit.node), policy.max_tier(&class.areas), class.global),
+            }
+        })
+        .collect();
+    truncated |= further.files.len() < if opts.all { counts.further } else { counts.further_notable };
+
+    // What the changed files rely on (hop 1, forward).
+    let mut relies: Vec<Dependency> = Vec::new();
+    let mut seen_dep: HashSet<NodeId> = HashSet::new();
+    let changed_nodes: HashSet<NodeId> = ctx.changed.iter().filter_map(|c| c.node).collect();
+    for c in &ctx.changed {
+        let Some(n) = c.node else { continue };
+        // A method-scoped change relies on what its changed methods reference.
+        let within = c.scopes.as_ref();
+        for (to, e) in graph.dependencies(n) {
+            let (_, _, d) = graph.edge(e);
+            if d.confidence < eff.min_confidence || changed_nodes.contains(&to) {
+                continue;
+            }
+            if let Some(names) = within
+                && !graph.edge_scopes(e).0.is_some_and(|f| names.iter().any(|x| x == f))
+            {
+                continue;
+            }
+            if !seen_dep.insert(to) {
+                continue;
+            }
+            relies.push(Dependency {
+                file: graph.path(to).to_string(),
+                of: c.file.path.clone(),
+                line: (d.line != 0).then_some(d.line),
+                kind: d.kind,
+                detail: graph.edge_detail(e).map(str::to_string),
+                confidence: d.confidence,
+            });
+        }
+    }
+    relies.sort_by(|a, b| (std::cmp::Reverse(a.confidence), &a.file).cmp(&(std::cmp::Reverse(b.confidence), &b.file)));
+    counts.relies_on = relies.len();
+    let relies_cap = opts.cap(budget::RELIES_ON);
+    truncated |= relies.len() > relies_cap;
+    relies.truncate(relies_cap);
+
     // The same query with every file wholly changed, so readers can see how
     // much the method-level analysis narrowed the result.
-    summary.file_level_total = if eff.file_level {
-        summary.total
+    counts.impacted_file_level = if eff.file_level {
+        counts.impacted
     } else {
         let whole: Vec<(NodeId, Option<Vec<String>>)> = ctx.seeds.iter().map(|(n, _)| (*n, None)).collect();
         let imp = graph.impact_scoped(&whole, QueryOpts { file_level: true, ..eff });
         imp.impacted().filter(|h| !ctx.class(h.node).test).count()
     };
-    if let Some(limit) = opts.limit {
-        tests_to_run.truncate(limit); // changed test files may exceed it on their own
-        summary.truncated = summary.total > summary.files.len() || tests_total > tests_to_run.len();
-    }
+
+    let (removed_methods, removed_total) = crate::findings::removed_methods(&ctx, opts);
+    counts.removed_methods = removed_total;
+    truncated |= removed_methods.len() < removed_total || removed_methods.iter().any(|r| r.mentions.len() < r.mentions_total);
+    let incomplete = crate::findings::incomplete(&ctx);
 
     // Areas reached: changed files first (depth 0), then impacted non-test files in BFS order.
+    let full = opts.policy || opts.all;
     let mut areas: BTreeMap<u16, AreaReached> = BTreeMap::new();
     let mut bump = |area: u16, depth: u32, example: &dyn Fn() -> ImpactPath| {
         let a = policy.area(area);
@@ -352,7 +646,7 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
             touched: false,
             files: 0,
             min_depth: depth,
-            example: example(),
+            example: full.then(example),
         });
         e.files += 1;
         e.touched |= depth == 0;
@@ -379,38 +673,93 @@ pub fn evaluate_with(policy: &Policy, graph: &Graph, index: &PolicyIndex, change
     warnings.sort_by(|a, b| (&a.code, &a.file, &a.message).cmp(&(&b.code, &b.file, &b.message)));
     warnings.dedup();
 
-    let summary_line = format!(
-        "{} risk: {} changed file{}, {} impacted file{}{}{}, {} test{} to run, {} rule{} fired",
-        risk_word(risk),
-        changed_entries.len(),
-        plural(changed_entries.len()),
-        summary.total,
-        plural(summary.total),
-        if summary.total > 0 { format!(" (up to {} hop{})", summary.max_depth, plural(summary.max_depth as usize)) } else { String::new() },
-        if summary.file_level_total != summary.total { format!(" [method-level; {} if whole files are assumed changed]", summary.file_level_total) } else { String::new() },
-        tests_total,
-        plural(tests_total),
-        reasons.len(),
-        plural(reasons.len()),
-    );
-
-    let total_us = started.elapsed().as_micros() as u64;
-    Report {
-        schema_version: SCHEMA_VERSION,
-        risk,
-        summary: summary_line,
-        reasons,
-        require,
-        changed: changed_entries,
-        impacted: summary,
-        tests_to_run,
-        areas_reached,
-        owners,
-        warnings,
-        query: QueryInfo { max_depth: eff.max_depth, min_confidence: eff.min_confidence, file_level: eff.file_level },
-        timing: Timing { refresh_us: 0, query_us, evaluate_us: total_us.saturating_sub(query_us) },
-        index: IndexInfo { generation: opts.generation, nodes: graph.node_count(), edges: graph.edge_count(), pending_changes: 0 },
+    let configured = !policy.uses_default_rules() || !policy.areas().is_empty();
+    let show_policy = opts.policy || (configured && !reasons.is_empty());
+    if !full {
+        for r in &mut reasons {
+            r.evidence.impacted.truncate(budget::EVIDENCE);
+        }
     }
+    let policy_result = show_policy.then(|| PolicyResult { risk, reasons, require, owners, areas: areas_reached });
+
+    let mut report = Report {
+        schema_version: SCHEMA_VERSION,
+        summary: String::new(),
+        counts,
+        truncated,
+        changed: changed_entries,
+        removed_methods,
+        dependents,
+        inherit_only,
+        also_mentioned,
+        relies_on: relies,
+        further,
+        tests,
+        incomplete,
+        blind_spots,
+        usually_changes_with: None,
+        policy: policy_result,
+        warnings,
+        query: QueryInfo { max_depth: eff.max_depth, min_confidence: eff.min_confidence, file_level: eff.file_level, all: opts.all },
+        timing: Timing { refresh_us: 0, query_us, evaluate_us: 0 },
+        index: IndexInfo { generation: opts.generation, nodes: graph.node_count(), edges: graph.edge_count(), pending_changes: 0, stale: false },
+    };
+    report.summary = summary_line(&report);
+    report.timing.evaluate_us = (started.elapsed().as_micros() as u64).saturating_sub(query_us);
+    report
+}
+
+/// `crosses_boundary`, `high_tier`, `global`: why a far file is worth a look.
+fn notable_reasons(crosses: bool, tier: Option<Risk>, global: bool) -> Vec<String> {
+    let mut v = Vec::new();
+    if crosses {
+        v.push("crosses_boundary".to_string());
+    }
+    if tier.is_some_and(|t| t >= Risk::High) {
+        v.push("high_tier".to_string());
+    }
+    if global {
+        v.push("global".to_string());
+    }
+    v
+}
+
+/// The report's one-line summary. Recomputed by the query side after it
+/// adds `incomplete` entries.
+pub fn summary_line(r: &Report) -> String {
+    let c = &r.counts;
+    let mut parts = vec![format!("{} changed file{}", c.changed, plural(c.changed))];
+    if c.inherit_only > 0 {
+        let callers = c.dependents - c.inherit_only;
+        parts.push(format!("{callers} direct dependent{} (+{} only inherit/include)", plural(callers), c.inherit_only));
+    } else {
+        parts.push(format!("{} direct dependent{}", c.dependents, plural(c.dependents)));
+    }
+    if c.also_mentioned > 0 {
+        parts.push(format!("{} more mention the name with no edge", c.also_mentioned));
+    }
+    if r.query.max_depth != 1 {
+        let hops = if r.query.max_depth == 0 { "further hops".to_string() } else { format!("hops 2-{}", r.query.max_depth) };
+        parts.push(format!("{} more at {hops}", c.further));
+    }
+    parts.push(format!("{} test{} reach{} it", c.tests, plural(c.tests), if c.tests == 1 { "es" } else { "" }));
+    if c.removed_methods > 0 {
+        parts.push(format!("{} removed method{} still mentioned", c.removed_methods, plural(c.removed_methods)));
+    }
+    if c.impacted_file_level != c.impacted && !r.query.file_level {
+        parts.push(format!("method-level ({} if whole files changed)", c.impacted_file_level));
+    }
+    if let Some(p) = &r.policy {
+        parts.push(format!("{} risk", risk_word(p.risk)));
+    }
+    let mut s = parts.join("; ");
+    if !r.incomplete.is_empty() {
+        let mut reasons: Vec<&str> = r.incomplete.iter().map(|i| i.reason.as_str()).collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        s.push_str(&format!("; may be incomplete ({})", reasons.join(", ")));
+    }
+    s
 }
 
 pub(crate) fn risk_word(r: Risk) -> &'static str {
@@ -484,7 +833,7 @@ fn list(items: &[String], max: usize) -> String {
 }
 
 impl Ctx<'_> {
-    fn class(&self, node: NodeId) -> &FileClass {
+    pub(crate) fn class(&self, node: NodeId) -> &FileClass {
         self.index.get(node).expect("policy index matches graph")
     }
 

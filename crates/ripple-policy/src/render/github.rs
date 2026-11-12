@@ -25,7 +25,8 @@ fn escape_prop(s: &str) -> String {
 pub fn workflow_commands(report: &Report) -> String {
     let mut out = String::new();
     let mut per_file: Vec<(&str, Vec<&crate::report::Reason>)> = Vec::new();
-    for reason in &report.reasons {
+    let reasons: &[crate::report::Reason] = report.policy.as_ref().map(|p| p.reasons.as_slice()).unwrap_or(&[]);
+    for reason in reasons {
         for file in &reason.evidence.changed {
             match per_file.iter_mut().find(|(f, _)| *f == file.as_str()) {
                 Some((_, rs)) => rs.push(reason),
@@ -55,14 +56,18 @@ pub fn workflow_commands(report: &Report) -> String {
 
 /// `key=value` lines for `$GITHUB_OUTPUT`.
 pub fn outputs(report: &Report) -> String {
+    let (risk, require) = match &report.policy {
+        Some(p) => (p.risk, p.require.join(",")),
+        None => (ripple_core::Risk::Low, String::new()),
+    };
     format!(
         "risk={}\nrequire={}\nimpacted={}\nimpacted_file_level={}\ntests={}\nchanged={}\n",
-        risk_word(report.risk).to_lowercase(),
-        report.require.join(","),
-        report.impacted.total,
-        report.impacted.file_level_total,
-        report.tests_total(),
-        report.changed.len()
+        risk_word(risk).to_lowercase(),
+        require,
+        report.counts.impacted,
+        report.counts.impacted_file_level,
+        report.counts.tests,
+        report.counts.changed
     )
 }
 

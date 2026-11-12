@@ -1,10 +1,10 @@
 //! Markdown for a pull-request comment / step summary. Written for a reader
 //! who has never heard of ripple.
 
-use super::{conf_str, detail_with_scope, kind_str, mode_line, path_line, scope_list, thousands};
+use super::{conf_str, detail_with_scope, kind_str, mode_line, path_line, thousands};
 use crate::eval::{plural, risk_word};
-use crate::report::{ImpactedFile, Report};
-use ripple_core::Risk;
+use crate::report::{MentionHow, Report};
+use ripple_core::{Confidence, Risk};
 use std::fmt::Write;
 
 /// Hidden marker so CI can find and update its previous comment.
@@ -36,7 +36,7 @@ fn lines(added: Option<u32>, deleted: Option<u32>) -> String {
 
 /// "**212** impacted files (method-level; 1,362 if whole files are assumed changed)".
 fn impacted_head(r: &Report) -> String {
-    let (n, whole) = (r.impacted.total, r.impacted.file_level_total);
+    let (n, whole) = (r.counts.impacted, r.counts.impacted_file_level);
     let mut s = format!("**{}** impacted file{}", thousands(n), plural(n));
     if !r.query.file_level && whole != n {
         s.push_str(&format!(" (method-level; {} if whole files are assumed changed)", thousands(whole)));
@@ -44,82 +44,130 @@ fn impacted_head(r: &Report) -> String {
     s
 }
 
-/// Renders the report. At most `max_listed` impacted files are listed (the
+fn more(o: &mut String, shown: usize, total: usize) {
+    if total > shown {
+        let _ = writeln!(o, "- …and {} more (`--all` or the JSON report lists them)", total - shown);
+    }
+}
+
+/// Renders the report. Each list shows at most `max_listed` entries (the
 /// counts are always complete).
 pub fn render(report: &Report, max_listed: usize) -> String {
     let mut o = String::new();
     let r = report;
+    let cap = max_listed.max(1);
+    let risk = r.policy.as_ref().map(|p| p.risk);
     let _ = writeln!(o, "{COMMENT_MARKER}");
-    let _ = writeln!(o, "## Change impact: {} risk\n", risk_word(r.risk));
-    let mut head = vec![
-        badge(r.risk).to_string(),
-        format!("**{}** changed file{}", r.changed.len(), plural(r.changed.len())),
-        impacted_head(r),
-        format!("**{}** test{} to run", thousands(r.tests_total()), plural(r.tests_total())),
-    ];
-    if !r.require.is_empty() {
-        head.push(format!("requires {}", r.require.iter().map(|s| code(s)).collect::<Vec<_>>().join(", ")));
+    match risk {
+        Some(k) => {
+            let _ = writeln!(o, "## Change impact: {} risk\n", risk_word(k));
+        }
+        None => {
+            let _ = writeln!(o, "## Change impact\n");
+        }
+    }
+    let mut head = Vec::new();
+    if let Some(k) = risk {
+        head.push(badge(k).to_string());
+    }
+    head.push(format!("**{}** changed file{}", r.counts.changed, plural(r.counts.changed)));
+    head.push(format!("**{}** direct dependent{}", thousands(r.counts.dependents), plural(r.counts.dependents)));
+    head.push(impacted_head(r));
+    head.push(format!("**{}** test{} reach it", thousands(r.counts.tests), plural(r.counts.tests)));
+    if let Some(p) = &r.policy
+        && !p.require.is_empty()
+    {
+        head.push(format!("requires {}", p.require.iter().map(|s| code(s)).collect::<Vec<_>>().join(", ")));
     }
     let _ = writeln!(o, "{}\n", head.join(" · "));
     let _ = writeln!(
         o,
-        "<sub>This report lists every file that depends, directly or through other files, on the files changed here \
+        "<sub>Files that depend, directly or through other files, on the files changed here \
          (Ruby constants and requires, Rails conventions, JS/TS imports, frontend API calls to Rails routes). \
-         The risk level comes from the rules in this repository's `ripple.yml`.</sub>\n"
+         Risk comes from the rules in this repository's `ripple.yml`.</sub>\n"
     );
 
-    // Why.
-    let _ = writeln!(o, "### Why this risk level\n");
-    if r.reasons.is_empty() {
-        let _ = writeln!(o, "No rule matched, so the risk is **low**.\n");
-    }
-    for reason in &r.reasons {
-        let _ = write!(o, "- **{}** {}: {}", risk_word(reason.risk), code(&reason.rule), cell(&reason.message));
-        if let Some(d) = &reason.description {
-            let _ = write!(o, " — _{}_", cell(d));
+    if !r.removed_methods.is_empty() {
+        let _ = writeln!(o, "### Removed methods still mentioned\n");
+        for m in r.removed_methods.iter().take(cap) {
+            let _ = writeln!(o, "- {}: {} file{} still mention it", code(&format!("{}#{}", m.file, m.method)), m.mentions_total, plural(m.mentions_total));
+            for x in &m.mentions {
+                let at = x.line.map(|l| format!(":{l}")).unwrap_or_default();
+                let how = match x.how {
+                    MentionHow::SameFile => "same file",
+                    MentionHow::Dependent => "dependent",
+                    MentionHow::ByName => "by name only",
+                };
+                let _ = writeln!(o, "  - {} ({how})", code(&format!("{}{at}", x.file)));
+            }
         }
+        more(&mut o, r.removed_methods.len().min(cap), r.counts.removed_methods);
         let _ = writeln!(o);
-        if let Some(p) = reason.evidence.impacted.first() {
-            let _ = writeln!(o, "  - e.g. {}", path_line(p, code, "→"));
-        }
     }
-    let _ = writeln!(o);
 
-    if !r.require.is_empty() {
-        let _ = writeln!(o, "### Required before merging\n");
-        for req in &r.require {
-            let who: Vec<&str> = r.reasons.iter().filter(|x| x.require.contains(req)).map(|x| x.rule.as_str()).collect();
-            let _ = writeln!(o, "- [ ] {} (from {})", code(req), who.iter().map(|w| code(w)).collect::<Vec<_>>().join(", "));
-        }
-        if !r.owners.is_empty() {
-            let _ = writeln!(o, "\nSuggested reviewers (owners of the areas involved): {}", r.owners.join(", "));
+    if !r.incomplete.is_empty() {
+        let _ = writeln!(o, "### The impact may be incomplete\n");
+        for i in &r.incomplete {
+            let file = i.file.as_deref().map(|f| format!("{} ", code(f))).unwrap_or_default();
+            let _ = writeln!(o, "- {file}{}: {}", code(&i.reason), cell(&i.message));
         }
         let _ = writeln!(o);
     }
 
-    if !r.areas_reached.is_empty() {
-        let _ = writeln!(o, "### Areas involved\n");
-        let _ = writeln!(o, "| Area | Tier | How | Files | Owners | Closest path |");
-        let _ = writeln!(o, "|---|---|---|---:|---|---|");
-        for a in &r.areas_reached {
-            let how = if a.touched { "changed directly".to_string() } else { format!("{} hop{} away", a.min_depth, plural(a.min_depth as usize)) };
-            let _ = writeln!(
-                o,
-                "| {} | {} | {} | {} | {} | {} |",
-                cell(&a.area),
-                format!("{:?}", a.tier).to_lowercase(),
-                how,
-                a.files,
-                cell(&a.owners.join(", ")),
-                cell(&path_line(&a.example, code, "→"))
-            );
+    if let Some(p) = &r.policy {
+        let _ = writeln!(o, "### Why this risk level\n");
+        if p.reasons.is_empty() {
+            let _ = writeln!(o, "No rule matched, so the risk is **low**.\n");
+        }
+        for reason in &p.reasons {
+            let _ = write!(o, "- **{}** {}: {}", risk_word(reason.risk), code(&reason.rule), cell(&reason.message));
+            if let Some(d) = &reason.description {
+                let _ = write!(o, " — _{}_", cell(d));
+            }
+            let _ = writeln!(o);
+            if let Some(path) = reason.evidence.impacted.first() {
+                let _ = writeln!(o, "  - e.g. {}", path_line(path, code, "→"));
+            }
         }
         let _ = writeln!(o);
+
+        if !p.require.is_empty() {
+            let _ = writeln!(o, "### Required before merging\n");
+            for req in &p.require {
+                let who: Vec<&str> = p.reasons.iter().filter(|x| x.require.contains(req)).map(|x| x.rule.as_str()).collect();
+                let _ = writeln!(o, "- [ ] {} (from {})", code(req), who.iter().map(|w| code(w)).collect::<Vec<_>>().join(", "));
+            }
+            if !p.owners.is_empty() {
+                let _ = writeln!(o, "\nSuggested reviewers (owners of the areas involved): {}", p.owners.join(", "));
+            }
+            let _ = writeln!(o);
+        }
+
+        if !p.areas.is_empty() {
+            let _ = writeln!(o, "### Areas involved\n");
+            let _ = writeln!(o, "| Area | Tier | How | Files | Owners | Closest path |");
+            let _ = writeln!(o, "|---|---|---|---:|---|---|");
+            for a in &p.areas {
+                let how = if a.touched { "changed directly".to_string() } else { format!("{} hop{} away", a.min_depth, plural(a.min_depth as usize)) };
+                let example = a.example.as_ref().map(|e| cell(&path_line(e, code, "→"))).unwrap_or_default();
+                let _ = writeln!(
+                    o,
+                    "| {} | {} | {} | {} | {} | {} |",
+                    cell(&a.area),
+                    risk_word(a.tier).to_lowercase(),
+                    how,
+                    a.files,
+                    cell(&a.owners.join(", ")),
+                    example
+                );
+            }
+            let _ = writeln!(o);
+        }
     }
 
     let _ = writeln!(o, "### Changed files\n");
-    let _ = writeln!(o, "| File | Status | Lines | Language | Areas | Direct dependents |");
-    let _ = writeln!(o, "|---|---|---|---|---|---:|");
+    let _ = writeln!(o, "| File | Status | Lines | Change | Language | Areas | Direct dependents |");
+    let _ = writeln!(o, "|---|---|---|---|---|---|---:|");
     for c in &r.changed {
         let mut file = code(&c.path);
         if let Some(old) = &c.old_path {
@@ -135,87 +183,102 @@ pub fn render(report: &Report, max_listed: usize) -> String {
         if !c.in_graph {
             notes.push("not indexed");
         }
-        if let Some(scopes) = &c.scopes {
-            let label = if scopes.len() == 1 { "method" } else { "methods" };
-            if scopes.is_empty() {
-                file.push_str(" · no method changed");
-            } else {
-                file.push_str(&format!(" · {label}: {}", scope_list(scopes, 4, code)));
-            }
-        }
         let deps = if c.in_graph { c.dependents.to_string() } else { "?".into() };
         let _ = writeln!(
             o,
-            "| {}{} | {} | {} | {} | {} | {} |",
+            "| {}{} | {} | {} | {} | {} | {} | {} |",
             cell(&file),
             if notes.is_empty() { String::new() } else { format!(" ({})", notes.join(", ")) },
             format!("{:?}", c.status).to_lowercase(),
             lines(c.added, c.deleted),
+            cell(&super::text::change_desc(&c.change)),
             c.language.as_str(),
             cell(&c.areas.join(", ")),
             deps
         );
     }
+    if r.counts.changed > r.changed.len() {
+        let _ = writeln!(o, "\n…and {} more changed files.", r.counts.changed - r.changed.len());
+    }
     let _ = writeln!(o);
 
-    let imp = &r.impacted;
-    let _ = writeln!(o, "### Impacted files ({})\n", imp.total);
-    if imp.total == 0 {
-        let _ = writeln!(o, "Nothing else in the dependency graph depends on these changes.\n");
+    let _ = writeln!(o, "### Direct dependents ({})\n", r.counts.dependents);
+    if r.counts.dependents == 0 {
+        let _ = writeln!(o, "Nothing in the dependency graph depends directly on these changes.\n");
     } else {
-        let by_conf: Vec<String> = imp.by_min_confidence.iter().rev().map(|(c, n)| format!("{n} {}", conf_str(*c))).collect();
-        let _ = writeln!(o, "Weakest link on the path: {}. Exact = resolved by a parser; inferred = Rails/bundler convention; heuristic = name or URL matching.\n", by_conf.join(", "));
-        let mut listed = 0;
-        let mut depth_groups: Vec<(u32, Vec<&ImpactedFile>)> = Vec::new();
-        for f in &imp.files {
-            match depth_groups.last_mut() {
-                Some((d, v)) if *d == f.depth => v.push(f),
-                _ => depth_groups.push((f.depth, vec![f])),
+        for d in r.dependents.iter().take(cap) {
+            let mut why = vec![kind_str(d.kind).to_string()];
+            if let Some(det) = detail_with_scope(d.detail.as_deref(), d.to_scope.as_deref()) {
+                why.push(code(&det));
             }
+            if let Some(fs) = &d.from_scope {
+                why.push(format!("in {}", code(fs)));
+            }
+            if d.confidence != Confidence::Exact {
+                why.push(conf_str(d.confidence).to_string());
+            }
+            if !d.uses_methods.is_empty() {
+                why.push(format!("calls {}", d.uses_methods.iter().map(|m| code(m)).collect::<Vec<_>>().join(", ")));
+            }
+            if d.crosses_boundary {
+                why.push("crosses Ruby/JS".to_string());
+            }
+            let at = d.mention_line.or(d.line).map(|l| format!(":{l}")).unwrap_or_default();
+            let areas = if d.areas.is_empty() { String::new() } else { format!(" [{}]", d.areas.join(", ")) };
+            let _ = writeln!(o, "- {}{areas} → {} ({})", code(&format!("{}{at}", d.file)), code(&d.of), why.join(", "));
         }
-        for (depth, files) in depth_groups {
-            if listed >= max_listed {
-                break;
-            }
-            let total_here = imp.by_depth.get(&depth).copied().unwrap_or(files.len());
-            let label = if depth == 1 { "Directly depend on a changed file".to_string() } else { format!("{depth} hops away") };
-            let _ = writeln!(o, "<details{}><summary>{label} ({total_here})</summary>\n", if depth == 1 { " open" } else { "" });
-            for f in files.iter().take(max_listed - listed) {
-                let mut why = Vec::new();
-                if let Some(k) = f.kind {
-                    why.push(kind_str(k).to_string());
+        more(&mut o, r.dependents.len().min(cap), r.counts.dependents - r.counts.inherit_only);
+        if r.counts.inherit_only > 0 {
+            let files: Vec<String> = r.inherit_only.iter().take(cap).map(|f| code(f)).collect();
+            let rest = r.counts.inherit_only - files.len();
+            let tail = if rest > 0 { format!(" and {rest} more") } else { String::new() };
+            let _ = writeln!(o, "\nInherit from or include it but do not call the changed methods ({}): {}{tail}", r.counts.inherit_only, files.join(", "));
+        }
+        let _ = writeln!(o);
+    }
+
+    for a in r.also_mentioned.iter().filter(|a| a.total > 0) {
+        let defs = if a.definitions == 1 { "defined only in the changed file".to_string() } else { format!("{} files define a method of that name", a.definitions) };
+        let _ = writeln!(o, "### Also mention {} ({}, no dependency edge)\n", code(&a.name), a.total);
+        let _ = writeln!(o, "Matched by name only (receiver type unknown); {defs}.\n");
+        for x in a.files.iter().take(cap) {
+            let at = x.line.map(|l| format!(":{l}")).unwrap_or_default();
+            let _ = writeln!(o, "- {}", code(&format!("{}{at}", x.file)));
+        }
+        more(&mut o, a.files.len().min(cap), a.total);
+        let _ = writeln!(o);
+    }
+
+    if r.counts.further > 0 {
+        let f = &r.further;
+        let depths: Vec<String> = f.by_depth.iter().map(|(d, n)| format!("{n} at {d} hops")).collect();
+        let _ = writeln!(o, "### Further away ({})\n", r.counts.further);
+        let _ = writeln!(o, "{}. Weakest link on each path: exact = resolved by a parser; inferred = Rails/bundler convention; heuristic = name or URL matching.\n", depths.join(", "));
+        if !f.files.is_empty() {
+            let _ = writeln!(o, "<details><summary>{} listed</summary>\n", f.files.len().min(cap));
+            for x in f.files.iter().take(cap) {
+                let mut why = vec![kind_str(x.kind).to_string()];
+                if x.confidence != Confidence::Exact {
+                    why.push(conf_str(x.confidence).to_string());
                 }
-                if let Some(d) = detail_with_scope(f.detail.as_deref(), f.to_scope.as_deref()) {
-                    why.push(code(&d));
-                }
-                if let Some(fs) = &f.from_scope {
-                    why.push(format!("in {}", code(fs)));
-                }
-                if let Some(c) = f.path_confidence.filter(|c| *c != ripple_core::Confidence::Exact) {
-                    why.push(conf_str(c).to_string());
-                }
-                let via = f.via.as_deref().map(|v| format!(" ← {}", code(v))).unwrap_or_default();
-                let areas = if f.areas.is_empty() { String::new() } else { format!(" [{}]", f.areas.join(", ")) };
-                let _ = writeln!(o, "- {}{}{} {}", code(&f.file), areas, via, if why.is_empty() { String::new() } else { format!("({})", why.join(", ")) });
-                listed += 1;
+                why.extend(x.notable.iter().cloned());
+                let areas = if x.areas.is_empty() { String::new() } else { format!(" [{}]", x.areas.join(", ")) };
+                let _ = writeln!(o, "- {}{areas} ← {} ({} hops; {})", code(&x.file), code(&x.via), x.depth, why.join(", "));
             }
             let _ = writeln!(o, "\n</details>\n");
         }
-        if imp.total > listed {
-            let _ = writeln!(o, "…and {} more (see the JSON report for the full list).\n", imp.total - listed);
-        }
     }
 
-    if !r.tests_to_run.is_empty() {
-        let _ = writeln!(o, "### Tests to run ({})\n", r.tests_total());
+    if r.counts.tests > 0 {
+        let _ = writeln!(o, "### Tests that reach the change ({}; {} direct)\n", thousands(r.counts.tests), r.counts.tests_direct);
         let _ = writeln!(o, "```");
-        for t in r.tests_to_run.iter().take(max_listed.max(1)) {
+        for t in r.tests.iter().take(cap) {
             let _ = writeln!(o, "{}", t.file);
         }
         let _ = writeln!(o, "```");
-        let shown = r.tests_to_run.len().min(max_listed.max(1));
-        if r.tests_total() > shown {
-            let _ = writeln!(o, "…and {} more.", r.tests_total() - shown);
+        let shown = r.tests.len().min(cap);
+        if r.counts.tests > shown {
+            let _ = writeln!(o, "…and {} more.", r.counts.tests - shown);
         }
         let _ = writeln!(o);
     }

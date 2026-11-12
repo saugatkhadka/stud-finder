@@ -102,16 +102,6 @@ pub(crate) fn detail_with_scope(detail: Option<&str>, to_scope: Option<&str>) ->
     }
 }
 
-/// "refund!, charge!, a, b +3": at most `cap` names, then a count.
-pub(crate) fn scope_list(scopes: &[String], cap: usize, fmt: impl Fn(&str) -> String) -> String {
-    let mut s = scopes.iter().take(cap).map(|s| fmt(s)).collect::<Vec<_>>().join(", ");
-    let rest = scopes.len().saturating_sub(cap);
-    if rest > 0 {
-        s.push_str(&format!(" +{rest}"));
-    }
-    s
-}
-
 /// 1362 -> "1,362".
 pub(crate) fn thousands(n: usize) -> String {
     let digits = n.to_string();
@@ -162,8 +152,5 @@ mod tests {
         assert_eq!(super::thousands(999), "999");
         assert_eq!(super::thousands(1362), "1,362");
         assert_eq!(super::thousands(1234567), "1,234,567");
-        let v: Vec<String> = ["a", "b", "c", "d", "e", "f"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(super::scope_list(&v, 4, |s| s.to_string()), "a, b, c, d +2");
-        assert_eq!(super::scope_list(&v[..2], 4, |s| format!("`{s}`")), "`a`, `b`");
     }
 }
