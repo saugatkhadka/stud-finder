@@ -17,15 +17,19 @@
 //! fingerprint are never fed to Rubydex; only the others are. A batch whose
 //! Rubydex merge would cost more than a fresh build is rebuilt instead.
 //!
-//! A file whose definitions keep their fingerprint and whose constant
-//! references name the same set of names as before (`FileEntry::fp_names`)
-//! takes the fast path too, however many references of each name there are
-//! and wherever they are: Rubydex resolves *names* (a position-free id of
-//! the string, its parent scope and its lexical nesting), so every reference
-//! of a name resolves like the others; the resolver handles every definition
-//! before any reference, so the order of references does not matter; and the
-//! file's document in Rubydex, while stale, holds the same names (keeping
-//! them alive and making [`shadow::documents_using`] see the file).
+//! A file whose definitions keep their fingerprint and whose plain constant
+//! references name the same set of names *between the same superclass /
+//! mixin references* (`FileEntry::fp_names`) takes the fast path too,
+//! however many references of each name there are: Rubydex resolves *names*
+//! (a position-free id of the string, its parent scope and its lexical
+//! nesting), so every reference of a name resolves like the others; the
+//! resolver handles every definition before any reference; references go in
+//! offset order, and the only order-dependence is a lookup made while an
+//! ancestor chain is incomplete (settled through `Object` for good), so the
+//! position of a name's references relative to the ancestor references is
+//! hashed. The file's document in Rubydex, while stale, holds the same names
+//! (keeping them alive and making [`shadow::documents_using`] see the file),
+//! in the same order relative to its ancestor references.
 
 mod actions;
 mod analyse;

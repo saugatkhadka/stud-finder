@@ -617,3 +617,40 @@ fn metrics_update_changes_only_the_edited_file() {
     assert_eq!(changed, vec![path_hash(path)]);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Moving a reference across an `include` keeps the definitions and the set
+/// of reference names, but Rubydex resolves references in offset order and,
+/// while `D`'s ancestors are incomplete, settles `N` through `Object` for
+/// good. Such an edit must not take the reference-only fast path; adding
+/// another reference of a name in the same place may.
+#[test]
+fn reference_order_across_include_matches_build() {
+    let tmp = std::env::temp_dir().join(format!("ripple-refgap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    for (f, s) in [
+        ("app/models/m.rb", "module M\n  N = 1\nend\n"),
+        ("lib/n.rb", "N = 2\n"),
+        ("app/models/d.rb", "class D\n  include M\n\n  def a\n    N\n  end\nend\n"),
+    ] {
+        std::fs::create_dir_all(tmp.join(f).parent().unwrap()).unwrap();
+        std::fs::write(tmp.join(f), s).unwrap();
+    }
+    let path = "app/models/d.rb";
+    let mut ext = RubyExtractor::new();
+    ext.build(&workspace(&tmp)).expect("build");
+    let steps = [
+        ("class D\n  def a\n    N\n  end\n\n  include M\nend\n", false),
+        ("class D\n  include M\n\n  def a\n    N\n  end\nend\n", false),
+        ("class D\n  include M\n\n  def a\n    N\n    x = N\n  end\nend\n", true),
+        ("class D\n  N\n  include M\n\n  def a\n    N\n    x = N\n  end\nend\n", false),
+    ];
+    for (i, (src, fast)) in steps.iter().enumerate() {
+        std::fs::write(tmp.join(path), src).unwrap();
+        let ws = workspace(&tmp);
+        let inc = ext.update(&ws, &ChangeSet { modified: vec![path.into()], removed: vec![] }).expect("update");
+        let fresh = RubyExtractor::new().build(&ws).expect("build");
+        assert_eq!(edges(&inc), edges(&fresh), "step {i}");
+        assert_eq!(inc.stats.get("ruby_fast_ref_files_this_run").copied().unwrap_or(0) > 0, *fast, "step {i} fast path");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}

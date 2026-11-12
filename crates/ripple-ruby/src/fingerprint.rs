@@ -33,11 +33,12 @@
 //! output, which is recomputed for every changed file anyway.
 //!
 //! [`of`] also returns a second hash, of the definitions part (everything
-//! above but the constant references) and the *set* of distinct constant
-//! reference names. Two versions with equal second hashes differ at most in
-//! how many plain references of each name there are and where (superclasses
-//! and mixins are part of the definitions); see the crate docs for why that
-//! is enough to skip Rubydex too.
+//! above but the constant references) and, in offset order, the
+//! superclass / mixin reference names with the *set* of plain reference
+//! names between each two of them. Two versions with equal second hashes
+//! differ at most in how many plain references of each name there are and
+//! where within such a gap; see [`reference_gaps`] and the crate docs for
+//! why that is enough to skip Rubydex too.
 
 use crate::analyse::FileEntry;
 use rubydex::indexing::local_graph::LocalGraph;
@@ -60,12 +61,53 @@ pub fn of(lg: Option<&LocalGraph>, entry: &FileEntry) -> (u64, u64) {
     };
     definitions(lg, &mut h);
     let mut names_h = h.clone();
-    let mut names: Vec<u64> = lg.constant_references().values().map(|r| r.name_id().get()).collect();
-    names.sort_unstable();
-    names.dedup();
-    names.hash(&mut names_h);
+    reference_gaps(lg, &mut names_h);
     references(lg, &mut h);
     (h.finish(), names_h.finish())
+}
+
+/// The part of the references the second hash keeps: in offset order, each
+/// superclass / mixin reference's name, and between two of them the *set*
+/// of plain reference names. Rubydex resolves reference units in offset
+/// order within a document and, while a nesting's ancestor chain is still
+/// incomplete (an ancestor reference not yet resolved), settles a lookup
+/// tentatively through `Object` for good. So where a plain name first
+/// appears relative to the ancestor references matters; how many plain
+/// references of a name there are, and their order among themselves, does
+/// not (a plain reference never changes an ancestor chain, and a nested
+/// name's parent always has a smaller depth, which Rubydex processes first).
+fn reference_gaps(lg: &LocalGraph, h: &mut DefaultHasher) {
+    let mut ancestor: std::collections::HashSet<ConstantReferenceId> = std::collections::HashSet::new();
+    for d in lg.definitions().values() {
+        let ms: &[Mixin] = match d {
+            Definition::Class(c) => {
+                ancestor.extend(c.superclass_ref().iter().copied());
+                c.mixins()
+            }
+            Definition::Module(m) => m.mixins(),
+            Definition::SingletonClass(s) => s.mixins(),
+            _ => &[],
+        };
+        ancestor.extend(ms.iter().map(|m| *m.constant_reference_id()));
+    }
+    let mut refs: Vec<_> = lg.constant_references().iter().map(|(id, r)| (r.offset().clone(), ancestor.contains(id), r.name_id().get())).collect();
+    refs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut gap: Vec<u64> = Vec::new();
+    let flush = |gap: &mut Vec<u64>, h: &mut DefaultHasher| {
+        gap.sort_unstable();
+        gap.dedup();
+        gap.hash(h);
+        gap.clear();
+    };
+    for (_, is_ancestor, name) in refs {
+        if is_ancestor {
+            flush(&mut gap, h);
+            name.hash(h);
+        } else {
+            gap.push(name);
+        }
+    }
+    flush(&mut gap, h);
 }
 
 /// Is `def` local to its class body (see the module docs)? `nesting` is
