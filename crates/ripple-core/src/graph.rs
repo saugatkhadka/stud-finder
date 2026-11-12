@@ -183,9 +183,11 @@ impl Impact {
 }
 
 /// Edge kinds through which a file uses another file's methods by name, so
-/// the mention filter applies to them.
+/// the mention filter applies to them. `RubyRequire` is deliberately absent:
+/// a file that only requires another (an entry point registering subcommands,
+/// `config/application.rb`) runs it without naming its methods.
 fn is_reference(kind: EdgeKind) -> bool {
-    matches!(kind, EdgeKind::RubyConstant | EdgeKind::RailsInferred | EdgeKind::RubyRequire | EdgeKind::RailsView)
+    matches!(kind, EdgeKind::RubyConstant | EdgeKind::RailsInferred | EdgeKind::RailsView)
 }
 
 impl Graph {
@@ -771,13 +773,13 @@ mod tests {
             let imp = g.impact_scoped(&[seed], QueryOpts { max_depth: depth, ..Default::default() });
             names(&g, &imp).into_iter().skip(1).map(|(n, d)| format!("{n}:{d}")).collect::<Vec<_>>().join(" ")
         };
-        let unfiltered = "dyn:1 page:1 sub:1 tmpl:1";
+        let unfiltered = "dyn:1 lazy:1 page:1 sub:1 tmpl:1";
         // charge! grows to refund! (same file): svc and job; beyond hop 1 file-level.
-        assert_eq!(run(Some(&["charge!"]), 1), "dyn:1 job:1 page:1 sub:1 svc:1 tmpl:1");
-        assert_eq!(run(Some(&["charge!"]), 0), "dyn:1 job:1 page:1 sub:1 svc:1 tmpl:1 caller:2 sub_user:2");
-        assert_eq!(run(Some(&["refund!"]), 1), "dyn:1 page:1 sub:1 svc:1 tmpl:1");
+        assert_eq!(run(Some(&["charge!"]), 1), "dyn:1 job:1 lazy:1 page:1 sub:1 svc:1 tmpl:1");
+        assert_eq!(run(Some(&["charge!"]), 0), "dyn:1 job:1 lazy:1 page:1 sub:1 svc:1 tmpl:1 caller:2 sub_user:2");
+        assert_eq!(run(Some(&["refund!"]), 1), "dyn:1 lazy:1 page:1 sub:1 svc:1 tmpl:1");
         // tax grows to the concern's helper, which report mentions.
-        assert_eq!(run(Some(&["tax"]), 1), "dyn:1 page:1 report:1 sub:1 tmpl:1");
+        assert_eq!(run(Some(&["tax"]), 1), "dyn:1 lazy:1 page:1 report:1 sub:1 tmpl:1");
         // Class body (callback), implicit (to_s calls fmt), never mentioned: whole file.
         let whole = "dyn:1 job:1 lazy:1 page:1 report:1 sub:1 svc:1 tmpl:1";
         assert_eq!(run(Some(&["audit"]), 1), whole);
