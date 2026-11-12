@@ -206,6 +206,11 @@ pub struct When {
 #[serde(default, deny_unknown_fields)]
 pub struct QueryConfig {
     /// Maximum hops walked from a changed file. 0 = unlimited.
+    ///
+    /// Defaults to 3. A file-level graph of a Rails app is densely connected:
+    /// measured on Mastodon, the unlimited closure of a typical source file is
+    /// ~630 of ~800 reachable non-test files (it says "everything"), while
+    /// 3 hops gives a median of 9 and a 90th percentile of 192.
     pub max_depth: u32,
     /// Edges below this confidence are ignored unless a rule/CLI flag overrides.
     pub min_confidence: crate::model::Confidence,
@@ -213,7 +218,7 @@ pub struct QueryConfig {
 
 impl Default for QueryConfig {
     fn default() -> Self {
-        Self { max_depth: 0, min_confidence: crate::model::Confidence::Heuristic }
+        Self { max_depth: 3, min_confidence: crate::model::Confidence::Heuristic }
     }
 }
 

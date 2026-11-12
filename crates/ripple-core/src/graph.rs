@@ -143,33 +143,46 @@ impl Graph {
     /// keeping the highest confidence (then lowest line). Self-edges are dropped.
     /// `extra_nodes` lets files with no edges still be addressable.
     pub fn build<'a>(edges: impl IntoIterator<Item = &'a Edge>, extra_nodes: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut best: HashMap<(&str, &str, EdgeKind), &Edge> = HashMap::new();
-        for e in edges {
-            if e.from == e.to {
-                continue;
-            }
-            best.entry((e.from.as_str(), e.to.as_str(), e.kind))
-                .and_modify(|cur| {
-                    if (e.confidence, std::cmp::Reverse(e.line)) > (cur.confidence, std::cmp::Reverse(cur.line)) {
-                        *cur = e;
-                    }
-                })
-                .or_insert(e);
+        // Intern paths first so dedup and ordering work on integers, not strings:
+        // this runs on every index generation and dominates update latency.
+        let edges: Vec<&Edge> = edges.into_iter().filter(|e| e.from != e.to).collect();
+        let mut seen: HashMap<&str, u32> = HashMap::with_capacity(edges.len() / 4);
+        let mut names: Vec<&str> = Vec::new();
+        let mut intern = |s: &'a str| -> u32 {
+            *seen.entry(s).or_insert_with(|| {
+                names.push(s);
+                (names.len() - 1) as u32
+            })
+        };
+        let raw: Vec<(u32, u32)> = edges.iter().map(|e| (intern(&e.from), intern(&e.to))).collect();
+        for extra in extra_nodes {
+            intern(extra);
         }
-        let mut chosen: Vec<&Edge> = best.into_values().collect();
-        chosen.sort_by(|a, b| (&a.from, &a.to, a.kind).cmp(&(&b.from, &b.to, b.kind)));
-
-        let mut names: Vec<&str> = chosen.iter().flat_map(|e| [e.from.as_str(), e.to.as_str()]).chain(extra_nodes).collect();
-        names.sort_unstable();
-        names.dedup();
-        let paths: Vec<RelPath> = names.iter().map(|s| s.to_string()).collect();
+        // Node ids follow sorted path order so they are stable across runs.
+        let mut order: Vec<u32> = (0..names.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| names[i as usize]);
+        let mut remap = vec![0 as NodeId; names.len()];
+        for (new, &old) in order.iter().enumerate() {
+            remap[old as usize] = new as NodeId;
+        }
+        let paths: Vec<RelPath> = order.iter().map(|&i| names[i as usize].to_string()).collect();
         let index: HashMap<RelPath, NodeId> = paths.iter().enumerate().map(|(i, p)| (p.clone(), i as NodeId)).collect();
 
+        // Sort so the best duplicate (highest confidence, then lowest line) comes first, then dedup.
+        let mut keyed: Vec<(NodeId, NodeId, EdgeKind, std::cmp::Reverse<Confidence>, u32, u32)> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, &(f, t))| (remap[f as usize], remap[t as usize], edges[i].kind, std::cmp::Reverse(edges[i].confidence), edges[i].line, i as u32))
+            .collect();
+        keyed.sort_unstable();
+        keyed.dedup_by_key(|k| (k.0, k.1, k.2));
+
         let mut details = Vec::new();
-        let mut endpoints = Vec::with_capacity(chosen.len());
-        let mut data = Vec::with_capacity(chosen.len());
-        for e in &chosen {
-            endpoints.push((index[&e.from], index[&e.to]));
+        let mut endpoints = Vec::with_capacity(keyed.len());
+        let mut data = Vec::with_capacity(keyed.len());
+        for k in &keyed {
+            let e = edges[k.5 as usize];
+            endpoints.push((k.0, k.1));
             let detail = match &e.detail {
                 Some(d) => {
                     details.push(d.clone());
