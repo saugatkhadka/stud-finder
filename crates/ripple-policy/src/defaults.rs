@@ -28,7 +28,7 @@ fn area(tier: Risk, description: &str, paths: &[String]) -> Area {
 ///
 /// | area | tier | what |
 /// |---|---|---|
-/// | `payments` | high | billing, payments, payouts, invoices, refunds, checkout, purchases, Stripe/PayPal/Braintree |
+/// | `payments` | medium | billing, payments, payouts, invoices, refunds, checkout, purchases, Stripe/PayPal/Braintree |
 /// | `auth` | high | sessions, authentication, passwords, OAuth/OmniAuth, two-factor, WebAuthn, logins, `app/models/user.rb`, Devise/Doorkeeper/OmniAuth/Rack::Attack initializers |
 /// | `migrations` | medium | `db/migrate`, `db/post_migrate`, `db/schema.rb`, `db/structure.sql` |
 /// | `api` | medium | `app/controllers/api`, GraphQL, Grape (`lib/api`) |
@@ -42,8 +42,11 @@ pub fn default_areas() -> Vec<(String, Area)> {
     vec![
         (
             "payments".into(),
+            // Medium, not high: keyword matching is a guess, and in a payments
+            // product it matches a third of the code (Gumroad: 30% of commits).
+            // Redefine `payments` with your own paths and tier to sharpen it.
             area(
-                Risk::High,
+                Risk::Medium,
                 "Billing and payments (built-in, by path keywords)",
                 &[kw("billing,payment,Payment,payout,Payout,stripe,Stripe,paypal,PayPal,braintree,invoice,Invoice,refund,Refund,checkout,Checkout,purchase,Purchase")],
             ),
@@ -105,13 +108,13 @@ fn rule(id: &str, description: &str, risk: Risk, require: &[&str], when: When) -
 /// | id | when | risk | require |
 /// |---|---|---|---|
 /// | `default.touches_critical` | touches an area of tier critical | critical | `human_review` |
-/// | `default.touches_high` | touches an area of tier high (built-in: `payments`, `auth`) | high | `human_review` |
+/// | `default.touches_high` | touches an area of tier high (built-in: `auth`) | high | `human_review` |
 /// | `default.schema_change` | touches the `migrations` area | medium | `human_review` |
 /// | `default.touches_medium` | touches an area of tier medium | medium | |
 /// | `default.complex_file` | one changed file is in the top 2% by complexity and has over 30 changed lines | high | `human_review` |
-/// | `default.hotspot_churning` | one changed file is a hotspot with churn over 10 | high | `human_review` |
-/// | `default.hotspot_change` | one changed file is a hotspot with over 20 changed lines | high | `human_review` |
-/// | `default.impacted_over_25pct` | impacts more than 25% of the repository's files | high | `run_full_suite` |
+/// | `default.hotspot_churning` | one changed file is a hotspot with churn over 20 | high | `human_review` |
+/// | `default.hotspot_change` | one changed file is a hotspot with over 50 changed lines | high | `human_review` |
+/// | `default.impacted_over_40pct` | impacts more than 40% of the repository's files | high | `run_full_suite` |
 /// | `default.impacted_over_5pct` | impacts more than 5% of the repository's files | medium | |
 /// | `default.widely_used` | one changed file is in the top 1% by dependents and has over 10 changed lines | medium | |
 /// | `default.complex_method` | one changed file is in the top 2% by most complex method and has over 10 changed lines | medium | |
@@ -131,7 +134,9 @@ fn rule(id: &str, description: &str, risk: Risk, require: &[&str], when: When) -
 /// `impacted_files_over_percent`), so the same rules fit a 2,000-file and
 /// a 60,000-file codebase. Calibrated by replaying ~300 recent commits each
 /// of two Rails apps (Mastodon, Gumroad) offline, aiming at 10-15% of
-/// commits rated high or critical; see docs/CHANGES-omakase.md.
+/// commits rated high or critical. No one set reaches that on both: these
+/// put 8.3% (Mastodon) and 16.9% (Gumroad) at high+, the closest pair
+/// found (see docs/CHANGES-omakase.md).
 ///
 /// Tier conditions mean "at least this tier", so touching a critical area
 /// fires every `touches_*` rule; the report keeps only the highest rung of
@@ -178,21 +183,21 @@ pub fn default_rules() -> Vec<Rule> {
             "Changes a hotspot that keeps changing",
             Risk::High,
             &["human_review"],
-            When { hotspot: Some(true), churn_over: Some(10), ..Default::default() },
+            When { hotspot: Some(true), churn_over: Some(20), ..Default::default() },
         ),
         rule(
             "default.hotspot_change",
             "Substantial edit to a hotspot",
             Risk::High,
             &["human_review"],
-            When { hotspot: Some(true), changed_lines_over: Some(20), ..Default::default() },
+            When { hotspot: Some(true), changed_lines_over: Some(50), ..Default::default() },
         ),
         rule(
-            "default.impacted_over_25pct",
-            "Huge blast radius (more than a quarter of the repository)",
+            "default.impacted_over_40pct",
+            "Huge blast radius (more than 40% of the repository)",
             Risk::High,
             &["run_full_suite"],
-            When { impacted_files_over_percent: Some(25.0), impacted_files_over: Some(100), ..Default::default() },
+            When { impacted_files_over_percent: Some(40.0), impacted_files_over: Some(100), ..Default::default() },
         ),
         rule(
             "default.impacted_over_5pct",

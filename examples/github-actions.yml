@@ -1,0 +1,88 @@
+# .github/workflows/ripple-impact.yml
+# Zero-config change impact for pull requests with `ripple impact`:
+# annotations, a job summary, a sticky PR comment and a `risk:<level>` label.
+# Works without a ripple.yml (built-in areas and rules); add one to tune it.
+#
+# Exit codes of `ripple impact` (see `ripple --help`):
+#   0  ran; nothing reached --fail-on
+#   1  ran; the risk or a required action reached --fail-on
+#   2  usage, configuration or other error (no report)
+name: ripple impact
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write   # comment and label
+
+concurrency:
+  group: ripple-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  BASE: origin/${{ github.base_ref }}
+  # A level (low|medium|high|critical), action names (e.g. human_review), or both.
+  FAIL_ON: critical
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the merge base with the target branch, and history signals
+
+      - name: Install ripple
+        # Replace with however you distribute the binary (release asset, cache, cargo install).
+        run: |
+          cargo install --locked --git https://github.com/your-org/ripple ripple-cli
+          ripple --version
+
+      - name: Index once
+        # Both reports below then come from the same index.
+        run: ripple daemon start
+
+      - name: Change impact
+        id: ripple
+        # --format github: ::warning annotations on changed lines, the job
+        # summary, and step outputs risk / require / impacted / tests / changed.
+        run: ripple impact --base "$BASE" --format github --fail-on "$FAIL_ON"
+
+      - name: Markdown report
+        if: always() && steps.ripple.outcome != 'skipped'
+        run: ripple impact --base "$BASE" --format markdown > "$RUNNER_TEMP/ripple.md" || true
+
+      - name: Sticky comment and risk label
+        if: always() && steps.ripple.outputs.risk != ''
+        uses: actions/github-script@v7
+        env:
+          RISK: ${{ steps.ripple.outputs.risk }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const path = `${process.env.RUNNER_TEMP}/ripple.md`;
+            if (fs.existsSync(path) && fs.statSync(path).size > 0) {
+              const body = fs.readFileSync(path, 'utf8');
+              const marker = '<!-- ripple-impact-report -->';
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+              const mine = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+              if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              else await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+            // One risk:<level> label, replacing any earlier one.
+            const label = `risk:${process.env.RISK}`;
+            const { data: current } = await github.rest.issues.listLabelsOnIssue({ owner, repo, issue_number });
+            for (const l of current) {
+              if (l.name.startsWith('risk:') && l.name !== label) {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: l.name });
+              }
+            }
+            await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [label] });
+
+      - name: Stop the daemon
+        if: always()
+        run: ripple daemon stop || true

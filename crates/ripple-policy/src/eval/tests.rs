@@ -284,9 +284,9 @@ fn default_rules_reach_any_depth_and_blast_radius() {
     assert!(pol(&r).reasons[0].message.contains("30 files impacted, 7% of the repository's 431"), "{}", pol(&r).reasons[0].message);
     // The same 30 files in a repository of 1031 (3%): ordinary.
     assert!(ids(&evaluate(&p, &hub(30, 1000), &[m("app/hub.rb")])).is_empty());
-    // 150 of 451 (33%): huge; the lower rung is dropped.
-    let r = evaluate(&p, &hub(150, 300), &[m("app/hub.rb")]);
-    assert_eq!((pol(&r).risk, ids(&r)), (Risk::High, vec!["default.impacted_over_25pct".to_string()]), "lower rung dropped");
+    // 250 of 551 (45%): huge; the lower rung is dropped.
+    let r = evaluate(&p, &hub(250, 300), &[m("app/hub.rb")]);
+    assert_eq!((pol(&r).risk, ids(&r)), (Risk::High, vec!["default.impacted_over_40pct".to_string()]), "lower rung dropped");
     assert_eq!(pol(&r).require, ["run_full_suite"]);
     assert!(r.warnings.iter().all(|w| w.code != "rule_signal_not_ready"), "built-in metric rules skip quietly");
 

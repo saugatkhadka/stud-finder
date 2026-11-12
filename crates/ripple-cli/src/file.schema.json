@@ -1,1 +1,414 @@
-{"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ripple file report",
+  "description": "Output of `ripple file PATH --format json`. With `ripple file -` (paths on stdin) each output line is one such object, or {\"file\", \"error\"} for a path that failed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "file",
+    "language",
+    "areas",
+    "tier",
+    "owners",
+    "is_test",
+    "is_global",
+    "in_graph",
+    "ranked",
+    "metrics",
+    "methods",
+    "top_methods",
+    "uncovered_methods",
+    "dependents",
+    "dependencies",
+    "tests",
+    "usually_changes_with",
+    "signals"
+  ],
+  "properties": {
+    "file": {
+      "$ref": "#/$defs/path"
+    },
+    "language": {
+      "$ref": "#/$defs/language"
+    },
+    "areas": {
+      "type": "array",
+      "description": "Areas (ripple.yml or built-in) the file is in.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "area",
+          "tier",
+          "owners"
+        ],
+        "properties": {
+          "area": {
+            "type": "string"
+          },
+          "tier": {
+            "$ref": "#/$defs/risk"
+          },
+          "owners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "tier": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Highest tier of its areas; null when in none.",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical",
+        null
+      ]
+    },
+    "owners": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Owners of its areas, then CODEOWNERS owners."
+    },
+    "is_test": {
+      "type": "boolean"
+    },
+    "is_global": {
+      "type": "boolean"
+    },
+    "in_graph": {
+      "type": "boolean"
+    },
+    "ranked": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Files in the hotspot ranking; null when the file is not ranked or the ranking is not ready."
+    },
+    "metrics": {
+      "$ref": "#/$defs/metrics"
+    },
+    "methods": {
+      "$ref": "#/$defs/count"
+    },
+    "top_methods": {
+      "type": "array",
+      "description": "Up to 5 most complex methods (Ruby).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "start",
+          "end",
+          "complexity"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start": {
+            "$ref": "#/$defs/count"
+          },
+          "end": {
+            "$ref": "#/$defs/count"
+          },
+          "complexity": {
+            "$ref": "#/$defs/count"
+          },
+          "coverage": {
+            "$ref": "#/$defs/percent"
+          }
+        }
+      }
+    },
+    "uncovered_methods": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Methods with no covered line in the coverage report."
+    },
+    "dependents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "top"
+      ],
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/count",
+          "description": "Direct non-test dependents."
+        },
+        "top": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "file",
+              "dependents"
+            ],
+            "properties": {
+              "file": {
+                "$ref": "#/$defs/path"
+              },
+              "dependents": {
+                "$ref": "#/$defs/count"
+              }
+            }
+          }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count"
+      ],
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "files"
+      ],
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/count"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/path"
+          },
+          "description": "At most 10."
+        }
+      }
+    },
+    "usually_changes_with": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/cochange"
+      }
+    },
+    "signals": {
+      "$ref": "#/$defs/signals"
+    }
+  },
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "path": {
+      "type": "string"
+    },
+    "percent": {
+      "type": "number",
+      "minimum": 0
+    },
+    "language": {
+      "enum": [
+        "ruby",
+        "js",
+        "template",
+        "other"
+      ]
+    },
+    "signal_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "ready",
+            "building",
+            "loading",
+            "disabled",
+            "unavailable"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the signal is not ready, or a caveat when it is."
+        }
+      }
+    },
+    "signals": {
+      "type": "object",
+      "description": "State of each signal besides the dependency graph. Rules needing a signal that is not ready do not fire (and add a `rule_signal_not_ready` warning).",
+      "additionalProperties": false,
+      "required": [
+        "complexity",
+        "churn",
+        "cochange",
+        "coverage",
+        "hotspot"
+      ],
+      "properties": {
+        "complexity": {
+          "$ref": "#/$defs/signal_status"
+        },
+        "churn": {
+          "$ref": "#/$defs/signal_status"
+        },
+        "cochange": {
+          "$ref": "#/$defs/signal_status"
+        },
+        "coverage": {
+          "$ref": "#/$defs/signal_status"
+        },
+        "hotspot": {
+          "$ref": "#/$defs/signal_status"
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Size, complexity, churn, coverage and hotspot rank of a changed non-test file. Each part is absent when unknown or its signal is not ready.",
+      "additionalProperties": false,
+      "properties": {
+        "complexity": {
+          "$ref": "#/$defs/count"
+        },
+        "max_method": {
+          "$ref": "#/$defs/count"
+        },
+        "lines": {
+          "$ref": "#/$defs/count"
+        },
+        "churn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "commits",
+            "recent_commits"
+          ],
+          "properties": {
+            "commits": {
+              "$ref": "#/$defs/count"
+            },
+            "recent_commits": {
+              "$ref": "#/$defs/count"
+            },
+            "last_changed": {
+              "type": "integer",
+              "description": "Unix seconds."
+            }
+          }
+        },
+        "coverage": {
+          "type": "object",
+          "description": "Absent when the file is in no coverage report (unknown, not 0%).",
+          "additionalProperties": false,
+          "required": [
+            "covered",
+            "coverable"
+          ],
+          "properties": {
+            "percent": {
+              "$ref": "#/$defs/percent"
+            },
+            "covered": {
+              "$ref": "#/$defs/count"
+            },
+            "coverable": {
+              "$ref": "#/$defs/count"
+            },
+            "changed_lines_percent": {
+              "$ref": "#/$defs/percent"
+            },
+            "stale": {
+              "type": "boolean"
+            }
+          }
+        },
+        "hotspot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rank",
+            "of",
+            "percentile"
+          ],
+          "properties": {
+            "rank": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "of": {
+              "$ref": "#/$defs/count",
+              "description": "Files ranked: `rank` of `of`."
+            },
+            "percentile": {
+              "$ref": "#/$defs/percent"
+            },
+            "hotspot": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "cochange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "together",
+        "of",
+        "why"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "via": {
+          "$ref": "#/$defs/path"
+        },
+        "together": {
+          "$ref": "#/$defs/count"
+        },
+        "of": {
+          "$ref": "#/$defs/count"
+        },
+        "why": {
+          "type": "string"
+        }
+      }
+    },
+    "risk": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    }
+  }
+}

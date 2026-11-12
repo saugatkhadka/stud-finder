@@ -36,22 +36,28 @@ through the `ripple` CLI and an agent skill (`skill/ripple/SKILL.md`).
 ```sh
 cargo build --release -p ripple-cli     # binary: target/release/ripple
 cd your-rails-app
-ripple init                             # writes a commented starter ripple.yml
-ripple config check                     # validates it; shows what each area matches
 ripple impact                           # working tree vs HEAD, untracked files included
 ripple impact --base main               # everything since merge-base(main, HEAD)
 ripple dependents app/models/purchase.rb --scope refund!   # what uses Purchase#refund!
 ripple file app/models/purchase.rb      # one file's profile
 ripple rank                             # riskiest files first
+ripple doctor                           # what is ready, what is not, and how to fix it
+ripple config show                      # the built-in areas and rules in effect here
+ripple skill install                    # teach coding agents to use ripple (.claude/skills/ripple)
 ```
 
 The first command starts a background daemon for the repository (one per
 repository and config file). Later commands reuse it. CI runs without a
 daemon: see [`examples/github-workflow.yml`](examples/github-workflow.yml)
-and `ripple check`.
+and `ripple check`, or [`examples/github-actions.yml`](examples/github-actions.yml)
+for `ripple impact --base … --format github --fail-on …`.
 
-Without a `ripple.yml`, ripple still reports dependents and metrics, but
-shows no risk section. Run `ripple init` to get one.
+No configuration is needed: built-in areas (payments, auth, migrations,
+api, config, jobs, mailers, shared components; each applies only where its
+paths exist), built-in `default.*` rules, CODEOWNERS and coverage reports
+in the usual places apply, and every report has a risk section.
+`ripple config show` lists what is in effect; `ripple init` writes a
+`ripple.yml` that spells it out, commented, for you to override.
 
 ## Commands
 
@@ -67,18 +73,24 @@ be relative to the current directory or absolute.
 | `dependents FILE` | The `impact` report of FILE as if it had changed. `--scope NAME` (repeatable) starts from those methods or actions. |
 | `file FILE` | One file's profile: language, areas, code lines, complexity, its 5 most complex methods, churn, coverage, dependents, dependencies, direct tests, co-change partners, hotspot rank, and the state of each signal. Waits up to 5 s for history, coverage and the ranking on a fresh daemon (`--no-wait`: answer at once). |
 | `rank` | Riskiest non-test Ruby and JS/TS files first, each with the reason. `--limit N` (20), `--path GLOB` (repeatable), `--area NAME`, `--by score\|churn\|complexity\|coverage`. Waits up to 5 s for history and coverage (`--no-wait`: at once); with no ranking yet it prints `ranking not ready: …` and exits 4. |
-| `check --base REF` | CI entry point: `impact` of the branch, always with the risk section. `--format github\|markdown\|json\|text` (github under Actions), `--fail-on low\|medium\|high\|critical\|never` (default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`. Never starts a daemon. |
+| `check --base REF` | CI entry point: `impact` of the branch, always with the risk section. `--format github\|markdown\|json\|text` (github under Actions), `--fail-on LEVEL\|ACTION,…` (a level, required actions such as `human_review`, or both; `never`; default `ci.fail_on`), `--markdown-out PATH`, `--json-out PATH`. Never starts a daemon. |
 | `history build` / `history status` | Build or update the git-history cache now; show its state. |
-| `schema` | Print the JSON Schema of the report (see [JSON output](#json-output)). |
+| `schema impact\|file\|rank` | Print a JSON Schema (copies in `docs/`; see [JSON output](#json-output)). |
+| `config show [--format json]` | The configuration in effect: built-in and configured areas (with file counts), rules and their origin, CODEOWNERS, coverage reports found, this repository's percentile cut-offs. |
+| `doctor` (alias `status`) | Config, daemon, index, signals and agent skill: what is ready and what to run if not. Exit 1 when something needs fixing. |
+| `skill install\|update\|uninstall\|status\|print` | The agent skill embedded in this binary. `--project` (default) or `--user` (`$HOME`), `--agent claude\|codex\|agents` (repeatable). Never overwrites or removes a locally edited skill without `--force`. |
+| `completions SHELL` | Shell completions (bash, zsh, fish, elvish, powershell). |
 | `daemon status\|start\|stop` | Manage the daemon. `serve [--foreground]` runs it directly. |
-| `init [--force]` | Write a commented starter `ripple.yml`. `config check` validates it. |
+| `init [--force] [--stdout]` | Write a `ripple.yml` listing this repository's effective defaults, all commented out (it changes nothing until edited). `config check` validates it. |
 | `why FROM TO`, `dependencies FILE`, `areas FILE`, `stats` | Shortest dependency path between two files; what a file depends on; how `ripple.yml` classifies a file; index statistics. |
 
 Flags shared by `impact` and `dependents`:
 
 | Flag | Meaning |
 |---|---|
-| `--format text\|json` (`impact` also `markdown`) | Output format. Default text. |
+| `--format text\|json` (`impact` also `markdown`, `github`) | Output format. Default text. |
+| `--fail-on LEVEL\|ACTION,…` (`impact`) | Exit 1 when the risk is at or above LEVEL or a listed action is required. |
+| `-` as the only path (`impact -`, `file -`) | Read paths from stdin, one per line (`file -` writes one JSON object per line). |
 | `--depth N` | Hops to follow from a changed file (`0` = unlimited; default `query.max_depth`, 3). |
 | `--min-confidence exact\|inferred\|heuristic` | Ignore weaker edges. |
 | `--all` / `--limit N` | Do not cut the lists / cut each list at N (`changed` keeps at least its default 30). Counts are never cut. |
@@ -86,9 +98,14 @@ Flags shared by `impact` and `dependents`:
 | `--no-wait` | Answer from the current index at once (the answer may be marked stale). |
 | `--file-level` (`impact`) | Treat each changed file as wholly changed (the wider answer). |
 
-**Exit codes:** 0 success; 1 `check` found risk at or above the fail-on
-level; 2 usage, config, git or internal error, or a file not in the index;
-3 `daemon status` found no daemon; 4 `rank` has no ranking yet.
+**Exit codes:** 0 success; 1 `check` or `impact --fail-on` reached the
+fail-on level or action, `doctor` found something to fix, or `skill status`
+found an outdated or edited skill; 2 usage, config, git or internal error,
+or a file not in the index; 3 `daemon status` found no daemon; 4 `rank` has
+no ranking yet.
+
+Data goes to stdout, diagnostics and hints to stderr. Colour only on a
+terminal, never with `NO_COLOR` or `TERM=dumb`. `-q/--quiet` drops hints.
 
 ## How to read the report
 
@@ -311,7 +328,13 @@ a `no_line_counts` warning when there is no diff, for example in
 
 ## `ripple.yml`
 
-A missing file means no areas and the built-in rules (see below). Unknown
+A missing file means the built-in areas and rules. A `ripple.yml` extends
+them: an area or rule with a built-in's name or id replaces it, anything
+else is added. `defaults: {areas: false}` / `{rules: false}` drops all
+built-in areas / rules (any explicit `rules:` list keeps the built-in rules
+unless `rules: false`), `defaults.disable: [name, …]` drops single ones (a
+rule id with or without `default.`), and `defaults.codeowners: false`
+ignores CODEOWNERS. `ripple config show` prints the merged result. Unknown
 keys and invalid values are errors that name the key and line.
 `ripple config check` validates the file and shows what each area matches.
 [`examples/ripple.yml`](examples/ripple.yml) uses every `when` key.
@@ -330,7 +353,8 @@ keys and invalid values are errors that name the key and line.
 | `daemon.max_wait_ms` | `150` | How long a query waits for pending edits (see [Freshness](#freshness)). |
 | `daemon.idle_timeout_minutes` | `30` | The daemon exits when idle this long; `0` = never. |
 | `history` | — | `enabled` (`true`), `max_commits` (`20000`; `0` = all), `max_age_days` (none), `max_files_per_commit` (`30`), `min_together` (`3`), `min_confidence` (`0.3`), `min_lift` (`2.0`), `limit` (`5`). |
-| `coverage` | — | `enabled` (`true`), `paths` (`[]` = auto-detect under `coverage/`), `max_age_days` (none). |
+| `coverage` | — | `enabled` (`true`), `paths` (`[]` = auto-detect under `coverage/`, `tmp/coverage/`, `{spec,test,frontend,client,web}/coverage/`, `app/{javascript,frontend}/coverage/`), `max_age_days` (none). |
+| `defaults` | all on | `areas`, `rules`, `codeowners` (booleans), `disable: [names]`; see above. |
 | `rank.hotspot_percent` | `1` | Top share of `ripple rank` that counts as a hotspot. |
 | `rank.weights` | `churn: 3, complexity: 1, dependents: 0.5, uncovered: 1` | Rank weights (each ≥ 0; `complexity` or `dependents` above 0). |
 | `ruby`, `js`, `boundary` | — | Extractor settings (autoload roots, tsconfig, route files, HTTP callees). Changing them rebuilds the index. |
@@ -367,9 +391,15 @@ All keys in a rule must hold for it to fire.
 | `changed_lines_coverage_under: P` | Coverage of the lines the diff touched in a file is below P% (needs a diff). |
 | `uncovered: true\|false` | A changed source file has known 0% coverage (`uncovered_includes_unknown: true` counts files in no report). |
 | `hotspot: true\|false` | A changed source file is a hotspot. |
+| `impacted_files_over_percent: P` | Impacted non-test files are more than P% of the repository's non-test files. |
+| `complexity_top_percent: P` | A changed source file's complexity is in the top P% of this repository's files. |
+| `max_method_complexity_top_percent: P` | The same for its most complex method. |
+| `dependents_top_percent: P` | A changed source file's direct dependents are in the top P% of this repository. |
+| `dependents_over: N` | A changed source file has more than N direct non-test dependents. |
 
 **Per-file keys** (`churn_over`, `complexity_over`,
-`max_method_complexity_over`, `coverage_under`,
+`max_method_complexity_over`, the three `*_top_percent` keys,
+`dependents_over`, `coverage_under`,
 `changed_lines_coverage_under`, `uncovered: true`, `hotspot: true`, and next
 to them `untested: true` and `changed_lines_over`) must all hold on **the
 same** changed file. Pairing a metric with `changed_lines_over` keeps a
@@ -379,9 +409,12 @@ app/models/purchase.rb (complexity 1186, 57 lines changed)`.
 
 ### Starter rules
 
-These are the calibrated rules. `ripple init` writes them along with example
-areas, area rules and a `changed_files_over` rule for you to adapt. With no
-`rules:` key, the same thresholds apply as built-in `default.*` rules.
+Absolute-threshold rules to adapt when you write your own. The built-in
+`default.*` rules use relative thresholds instead (top 2% complexity, top
+1% dependents, more than 5% / 40% of the repository impacted, each with an
+absolute floor); `ripple config show` lists them, and
+[docs/CHANGES-omakase.md](docs/CHANGES-omakase.md) gives their calibration
+(8.3% of Mastodon's and 16.9% of Gumroad's recent commits at HIGH+).
 
 ```yaml
 rules:
@@ -426,8 +459,8 @@ rules:
 ```
 
 The built-ins also include `touches_tier: critical` → critical,
-`touches_tier: high` → high, and reaching a critical area within 1 hop →
-medium (at any depth → low).
+`touches_tier: high` → high, `touches_tier: medium` → medium, and reaching
+a critical area within 1 hop → medium (at any depth → low).
 
 **How these were calibrated, and why you must tune them.** We replayed
 about 300 recent commits each of Gumroad and Mastodon (offline, from stored
@@ -443,7 +476,7 @@ of HIGH+ commits is one your reviewers can act on.
 git worktree add ../replay HEAD && cd ../replay && mkdir -p /tmp/replay
 for c in $(git rev-list --no-merges -n 300 HEAD | tail -r); do   # Linux: tac
   git checkout -q --detach "$c"
-  until ripple history status | jq -e --arg c "$c" '.head == $c and .state == "ready"' >/dev/null; do sleep 0.2; done
+  until ripple history status --format json | jq -e --arg c "$c" '.head == $c and .state == "ready"' >/dev/null; do sleep 0.2; done
   ripple rank --limit 1 >/dev/null                                 # refresh the hotspot ranking
   ripple impact --base "$c^" --sync --format json > "/tmp/replay/$c.json"
 done
@@ -489,7 +522,8 @@ release build, daemon mode.
 | Save an edit that adds or changes a constant reference or class structure → fresh answer | ~35 ms | ~71 ms | ~430 ms ² |
 | Daemon memory (footprint) | 86 MB | 138 MB | 713 MB |
 
-¹ A 30-file diff; about 20 ms of it is rule evaluation.
+¹ A 30-file diff; rule evaluation took about 20 ms of it then and about
+3-5 ms since the by-name findings were shared and parallelised.
 ² Bounded by the Rubydex resolver, which re-resolves constants for such edits.
 
 ## JSON output
