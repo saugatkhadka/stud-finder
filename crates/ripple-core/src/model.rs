@@ -68,11 +68,24 @@ pub struct Edge {
     /// Short human-readable evidence: the constant name, import specifier,
     /// URL, `controller#action`, ... Keep under ~80 chars.
     pub detail: Option<String>,
+    /// The part of `from` the reference sits in, when only that part depends
+    /// on `to`: today a controller action name (`"index"`). `None` = the whole
+    /// file depends on `to` (class body, callbacks, private helpers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_scope: Option<String>,
+    /// The part of `to` that `from` depends on: a controller action name for
+    /// `ApiCall` / `ViewMount` edges. `None` = depends on the whole file.
+    ///
+    /// Impact queries use the two scopes together: a dependent whose edge
+    /// names `to_scope: "show"` is only reached through a controller that was
+    /// itself reached via an unscoped reference or one with `from_scope: "show"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_scope: Option<String>,
 }
 
 impl Edge {
     pub fn new(from: impl Into<RelPath>, to: impl Into<RelPath>, kind: EdgeKind, confidence: Confidence) -> Self {
-        Self { from: from.into(), to: to.into(), kind, confidence, line: 0, detail: None }
+        Self { from: from.into(), to: to.into(), kind, confidence, line: 0, detail: None, from_scope: None, to_scope: None }
     }
     pub fn at(mut self, line: u32) -> Self {
         self.line = line;
@@ -80,6 +93,14 @@ impl Edge {
     }
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+    pub fn from_scope(mut self, scope: impl Into<String>) -> Self {
+        self.from_scope = Some(scope.into());
+        self
+    }
+    pub fn to_scope(mut self, scope: impl Into<String>) -> Self {
+        self.to_scope = Some(scope.into());
         self
     }
 }
@@ -103,6 +124,12 @@ pub struct JsCallSite {
     /// True when the call goes through a generated route helper (js-routes etc.),
     /// in which case `url` holds the helper name instead and matching is exact.
     pub route_helper: bool,
+    /// True when the URL is only navigated to (`href=`, `<Link>`, `<a>`,
+    /// `router.visit`, `window.location = ...`) and no response is consumed by
+    /// this file. Such a file does not break when the controller changes, so
+    /// linkers skip these unless `boundary.link_edges` is on.
+    #[serde(default)]
+    pub link: bool,
 }
 
 /// Cross-language facts extractors hand to linkers. Extend by adding fields;

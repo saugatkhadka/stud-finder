@@ -15,6 +15,9 @@ pub struct EdgeData {
     pub line: u32,
     /// Index into `Graph::details`, or `u32::MAX` for none.
     detail: u32,
+    /// Interned `Edge::from_scope` / `Edge::to_scope`, or `u32::MAX` for none.
+    from_scope: u32,
+    to_scope: u32,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +70,9 @@ pub struct Graph {
     endpoints: Vec<(NodeId, NodeId)>,
     data: Vec<EdgeData>,
     details: Vec<String>,
+    scopes: Vec<String>,
+    /// Number of distinct files depending on each node (edges can repeat per scope).
+    distinct_in: Vec<u32>,
     /// from -> to ("depends on").
     forward: Csr,
     /// to -> from ("is depended on by").
@@ -106,6 +112,21 @@ pub struct Impact {
     pub hits: Vec<Hit>,
     /// node id -> index into `hits`, or `u32::MAX`.
     position: Vec<u32>,
+    /// Scope-aware search tree; `path` walks this so the explanation uses the
+    /// reference that actually let the search through. Empty for forward queries.
+    acts: Vec<Act>,
+    /// hit index -> index into `acts` of the activation that first reached it.
+    hit_act: Vec<u32>,
+}
+
+/// One (file, scope) reached by the scope-aware search.
+#[derive(Debug, Clone, Copy)]
+struct Act {
+    node: NodeId,
+    /// `u32::MAX` = whole file.
+    scope: u32,
+    parent: u32,
+    edge: u32,
 }
 
 impl Impact {
@@ -126,6 +147,19 @@ impl Impact {
     /// The last element is the seed with edge `u32::MAX`.
     pub fn path(&self, node: NodeId) -> Vec<(NodeId, u32)> {
         let mut out = Vec::new();
+        if !self.acts.is_empty() {
+            let Some(&p) = self.position.get(node as usize).filter(|&&p| p != u32::MAX) else { return out };
+            let mut a = self.hit_act[p as usize];
+            loop {
+                let act = self.acts[a as usize];
+                out.push((act.node, act.edge));
+                if act.edge == u32::MAX {
+                    break;
+                }
+                a = act.parent;
+            }
+            return out;
+        }
         let mut cur = node;
         while let Some(hit) = self.get(cur) {
             out.push((hit.node, hit.edge));
@@ -139,7 +173,7 @@ impl Impact {
 }
 
 impl Graph {
-    /// Builds the graph. Duplicate `(from, to, kind)` edges are collapsed,
+    /// Builds the graph. Duplicate `(from, to, kind, scopes)` edges are collapsed,
     /// keeping the highest confidence (then lowest line). Self-edges are dropped.
     /// `extra_nodes` lets files with no edges still be addressable.
     pub fn build<'a>(edges: impl IntoIterator<Item = &'a Edge>, extra_nodes: impl IntoIterator<Item = &'a str>) -> Self {
@@ -169,19 +203,40 @@ impl Graph {
         let index: HashMap<RelPath, NodeId> = paths.iter().enumerate().map(|(i, p)| (p.clone(), i as NodeId)).collect();
 
         // Sort so the best duplicate (highest confidence, then lowest line) comes first, then dedup.
-        let mut keyed: Vec<(NodeId, NodeId, EdgeKind, std::cmp::Reverse<Confidence>, u32, u32)> = raw
+        let mut scope_ids: HashMap<&str, u32> = HashMap::new();
+        let mut scopes: Vec<String> = Vec::new();
+        let mut scope = |s: &'a Option<String>| -> u32 {
+            match s {
+                None => u32::MAX,
+                Some(s) => *scope_ids.entry(s.as_str()).or_insert_with(|| {
+                    scopes.push(s.clone());
+                    (scopes.len() - 1) as u32
+                }),
+            }
+        };
+        let scoped: Vec<(u32, u32)> = edges.iter().map(|e| (scope(&e.from_scope), scope(&e.to_scope))).collect();
+        let mut keyed: Vec<(NodeId, NodeId, EdgeKind, (u32, u32), std::cmp::Reverse<Confidence>, u32, u32)> = raw
             .iter()
             .enumerate()
-            .map(|(i, &(f, t))| (remap[f as usize], remap[t as usize], edges[i].kind, std::cmp::Reverse(edges[i].confidence), edges[i].line, i as u32))
+            .map(|(i, &(f, t))| (remap[f as usize], remap[t as usize], edges[i].kind, scoped[i], std::cmp::Reverse(edges[i].confidence), edges[i].line, i as u32))
             .collect();
         keyed.sort_unstable();
-        keyed.dedup_by_key(|k| (k.0, k.1, k.2));
+        keyed.dedup_by_key(|k| (k.0, k.1, k.2, k.3));
+        // An unscoped edge already says "the whole file depends on it", so the
+        // same reference repeated per action adds nothing: drop those.
+        let mut whole: std::collections::HashSet<(NodeId, NodeId, EdgeKind, u32)> = std::collections::HashSet::new();
+        for k in &keyed {
+            if k.3 .0 == u32::MAX {
+                whole.insert((k.0, k.1, k.2, k.3 .1));
+            }
+        }
+        keyed.retain(|k| k.3 .0 == u32::MAX || !whole.contains(&(k.0, k.1, k.2, k.3 .1)));
 
         let mut details = Vec::new();
         let mut endpoints = Vec::with_capacity(keyed.len());
         let mut data = Vec::with_capacity(keyed.len());
         for k in &keyed {
-            let e = edges[k.5 as usize];
+            let e = edges[k.6 as usize];
             endpoints.push((k.0, k.1));
             let detail = match &e.detail {
                 Some(d) => {
@@ -190,12 +245,21 @@ impl Graph {
                 }
                 None => u32::MAX,
             };
-            data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail });
+            data.push(EdgeData { kind: e.kind, confidence: e.confidence, line: e.line, detail, from_scope: k.3 .0, to_scope: k.3 .1 });
         }
         let n = paths.len();
         let forward = Csr::build(n, endpoints.iter().copied());
         let reverse = Csr::build(n, endpoints.iter().map(|&(f, t)| (t, f)));
-        Self { paths, index, endpoints, data, details, forward, reverse }
+        let mut distinct_in = vec![0u32; n];
+        let mut last: Option<(NodeId, NodeId)> = None;
+        // `endpoints` is sorted by (from, to, ..), so duplicates are adjacent.
+        for &(f, t) in &endpoints {
+            if last != Some((f, t)) {
+                distinct_in[t as usize] += 1;
+                last = Some((f, t));
+            }
+        }
+        Self { paths, index, endpoints, data, details, scopes, distinct_in, forward, reverse }
     }
 
     pub fn node_count(&self) -> usize {
@@ -231,16 +295,86 @@ impl Graph {
     pub fn dependencies(&self, node: NodeId) -> impl Iterator<Item = (NodeId, u32)> + '_ {
         self.forward.neighbours(node)
     }
+    /// `(from_scope, to_scope)` of an edge; see [`Edge::from_scope`].
+    pub fn edge_scopes(&self, edge: u32) -> (Option<&str>, Option<&str>) {
+        let d = &self.data[edge as usize];
+        let get = |i: u32| (i != u32::MAX).then(|| self.scopes[i as usize].as_str());
+        (get(d.from_scope), get(d.to_scope))
+    }
+    /// Number of distinct files that directly depend on `node`.
     pub fn fan_in(&self, node: NodeId) -> usize {
-        self.reverse.degree(node)
+        self.distinct_in[node as usize] as usize
     }
     pub fn fan_out(&self, node: NodeId) -> usize {
         self.forward.degree(node)
     }
 
     /// Everything that may be affected if `seeds` change: reverse BFS.
+    ///
+    /// Scope-aware: each reached file carries the set of its parts (controller
+    /// actions) that are affected, or "all of it". A dependent attached to one
+    /// action (`to_scope`) is only followed when that action is affected.
     pub fn impact(&self, seeds: &[NodeId], opts: QueryOpts) -> Impact {
-        self.bfs(&self.reverse, seeds, opts)
+        const ALL: u32 = u32::MAX;
+        let mut position = vec![u32::MAX; self.paths.len()];
+        let mut whole = vec![false; self.paths.len()];
+        let mut partial: std::collections::HashSet<(NodeId, u32)> = std::collections::HashSet::new();
+        let mut hits: Vec<Hit> = Vec::new();
+        let mut hit_act: Vec<u32> = Vec::new();
+        let mut acts: Vec<Act> = Vec::new();
+        let mut sorted_seeds = seeds.to_vec();
+        sorted_seeds.sort_unstable();
+        sorted_seeds.dedup();
+        for s in sorted_seeds {
+            position[s as usize] = hits.len() as u32;
+            whole[s as usize] = true;
+            hits.push(Hit { node: s, depth: 0, via: s, edge: u32::MAX });
+            hit_act.push(acts.len() as u32);
+            acts.push(Act { node: s, scope: ALL, parent: u32::MAX, edge: u32::MAX });
+        }
+        let (mut level_start, mut depth) = (0, 0);
+        while level_start < acts.len() {
+            if opts.max_depth != 0 && depth >= opts.max_depth {
+                break;
+            }
+            let level_end = acts.len();
+            let mut fresh: Vec<(Hit, u32)> = Vec::new();
+            for i in level_start..level_end {
+                let cur = acts[i];
+                for (next, edge) in self.reverse.neighbours(cur.node) {
+                    let d = &self.data[edge as usize];
+                    if d.confidence < opts.min_confidence || whole[next as usize] {
+                        continue;
+                    }
+                    if d.to_scope != ALL && cur.scope != ALL && d.to_scope != cur.scope {
+                        continue;
+                    }
+                    // A whole-file activation re-walks edges an earlier partial
+                    // one already followed; `whole`/`partial` make that a no-op.
+                    if d.from_scope == ALL {
+                        whole[next as usize] = true;
+                    } else if !partial.insert((next, d.from_scope)) {
+                        continue;
+                    }
+                    let act = acts.len() as u32;
+                    acts.push(Act { node: next, scope: d.from_scope, parent: i as u32, edge });
+                    if position[next as usize] == u32::MAX {
+                        position[next as usize] = 0; // placeholder, fixed below
+                        fresh.push((Hit { node: next, depth: depth + 1, via: cur.node, edge }, act));
+                    }
+                }
+            }
+            // Deterministic order within a level regardless of adjacency layout.
+            fresh.sort_unstable_by_key(|(h, _)| h.node);
+            for (h, act) in fresh {
+                position[h.node as usize] = hits.len() as u32;
+                hits.push(h);
+                hit_act.push(act);
+            }
+            level_start = level_end;
+            depth += 1;
+        }
+        Impact { hits, position, acts, hit_act }
     }
 
     /// Everything `seeds` rely on: forward BFS. Useful as agent context
@@ -284,7 +418,7 @@ impl Graph {
             level_start = level_end;
             depth += 1;
         }
-        Impact { hits, position }
+        Impact { hits, position, acts: Vec::new(), hit_act: Vec::new() }
     }
 }
 
@@ -339,6 +473,47 @@ mod tests {
         let (_, edge) = imp.path(g.id("b").unwrap())[0];
         assert_eq!(g.edge_detail(edge), Some("A"));
         assert_eq!(g.edge(edge).2.line, 3, "exact edge wins over inferred duplicate");
+    }
+
+    #[test]
+    fn scopes_limit_what_passes_through_a_controller() {
+        // ctrl#index uses model; ctrl#show uses other. page_i calls index, page_s calls show,
+        // page_any calls the controller with no action known.
+        let edges = vec![
+            Edge::new("ctrl", "model", RubyConstant, Exact).from_scope("index").at(5),
+            Edge::new("ctrl", "other", RubyConstant, Exact).from_scope("show").at(9),
+            Edge::new("ctrl", "base", RubyConstant, Exact),
+            Edge::new("page_i", "ctrl", ApiCall, Inferred).to_scope("index"),
+            Edge::new("page_s", "ctrl", ApiCall, Inferred).to_scope("show"),
+            Edge::new("page_any", "ctrl", ApiCall, Inferred),
+            Edge::new("importer", "page_s", JsImport, Exact),
+        ];
+        let g = Graph::build(&edges, []);
+        let run = |seed: &str| {
+            let imp = g.impact(&[g.id(seed).unwrap()], QueryOpts::default());
+            names(&g, &imp).into_iter().skip(1).collect::<Vec<_>>()
+        };
+        let s = |v: &[(&str, u32)]| v.iter().map(|&(a, b)| (a.to_string(), b)).collect::<Vec<_>>();
+        assert_eq!(run("model"), s(&[("ctrl", 1), ("page_any", 2), ("page_i", 2)]));
+        assert_eq!(run("other"), s(&[("ctrl", 1), ("page_any", 2), ("page_s", 2), ("importer", 3)]));
+        // Class-level reference and a change to the controller itself reach every action.
+        assert_eq!(run("base").len(), 5);
+        assert_eq!(run("ctrl"), s(&[("page_any", 1), ("page_i", 1), ("page_s", 1), ("importer", 2)]));
+        assert_eq!(g.fan_in(g.id("ctrl").unwrap()), 3);
+        // Both changed at once: ctrl is reached twice at depth 1, with different actions.
+        let imp = g.impact(&[g.id("model").unwrap(), g.id("other").unwrap()], QueryOpts::default());
+        let path: Vec<&str> = imp.path(g.id("page_s").unwrap()).iter().map(|&(n, _)| g.path(n)).collect();
+        assert_eq!(path, ["page_s", "ctrl", "other"], "explanation goes through the reference inside #show");
+        assert_eq!(g.edge_scopes(imp.path(g.id("page_s").unwrap())[1].1), (Some("show"), None));
+    }
+
+    #[test]
+    fn unscoped_edge_absorbs_scoped_duplicates() {
+        let edges = vec![
+            Edge::new("ctrl", "model", RubyConstant, Exact).from_scope("index"),
+            Edge::new("ctrl", "model", RubyConstant, Exact),
+        ];
+        assert_eq!(Graph::build(&edges, []).edge_count(), 1);
     }
 
     #[test]

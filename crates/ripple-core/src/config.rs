@@ -117,6 +117,9 @@ pub struct BoundaryConfig {
     /// (an API client configured with a base URL: `apiRequest("GET", "v1/foo")`
     /// with base `/api/`). Each base is tried in order.
     pub url_bases: Vec<String>,
+    /// Also create edges for plain navigation links (`href={Routes.x_path()}`).
+    /// Off by default: a link to a page is not a dependency on its controller.
+    pub link_edges: bool,
 }
 
 impl Default for BoundaryConfig {
@@ -127,6 +130,7 @@ impl Default for BoundaryConfig {
             http_callees: Vec::new(),
             url_prefixes: Vec::new(),
             url_bases: vec!["/".into(), "/api/".into()],
+            link_edges: false,
         }
     }
 }
