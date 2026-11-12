@@ -153,11 +153,14 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn start(root: &Path) -> Self {
+        Self::start_with(root, ServeOptions::default())
+    }
+    pub fn start_with(root: &Path, opts: ServeOptions) -> Self {
         let sock = socket_dir();
         let paths = paths_in(sock.path(), root);
         let delay = Arc::new(AtomicU64::new(0));
         let (r, p, d) = (root.to_path_buf(), paths.clone(), delay.clone());
-        let thread = std::thread::spawn(move || server::serve(&r, pipeline(d), p, ServeOptions { signals: false, ..Default::default() }));
+        let thread = std::thread::spawn(move || server::serve(&r, pipeline(d), p, ServeOptions { signals: false, ..opts }));
         wait_for_daemon(&paths, Duration::from_secs(10)).expect("daemon up");
         Self { paths, delay, thread: Some(thread), _sock: sock }
     }

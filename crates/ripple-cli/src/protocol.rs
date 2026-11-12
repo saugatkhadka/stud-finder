@@ -59,6 +59,16 @@
 //! treated as wholly changed: its diff hunks are not mapped onto method
 //! ranges that were indexed from older contents.
 //!
+//! **Git history.** An `impact` answer carries one more envelope field,
+//! `"history": {"state": "ready|building|disabled|unavailable", "reason"?,
+//! "head"?, "commits", "churn_available", "cochange", "cochange_reason"?,
+//! "updating"?, "recent_days"?, "churn"?: {path: {"commits",
+//! "recent_commits", "last_changed"?}}, "usually_changes_with"?: [{"path",
+//! "via", "together", "of", "score", "lift", "last_together", "seeds"}],
+//! "lookup_us"?}` ([`crate::historyd::HistoryInfo`]); it never waits for
+//! history to be built. `stats` has the status (and build details) under
+//! `result.history`.
+//!
 //! `sync: true` waits without a time limit and is never stale (it fails
 //! with `sync_timeout` if the watcher does not answer within 2 s).
 //! `no_wait: true` never waits. `stats` never waits.
@@ -247,6 +257,12 @@ pub fn ok_line(id: &Value, generation: u64, server_us: u64, result: &str) -> Str
 
 /// [`ok_line`] with the freshness fields of a query answer.
 pub fn ok_line_fresh(id: &Value, generation: u64, server_us: u64, fresh: Option<&Freshness>, result: &str) -> String {
+    ok_line_history(id, generation, server_us, fresh, None, result)
+}
+
+/// [`ok_line_fresh`] plus the `history` object of an `impact` answer
+/// (valid JSON; see [`crate::historyd::HistoryInfo`]).
+pub fn ok_line_history(id: &Value, generation: u64, server_us: u64, fresh: Option<&Freshness>, history: Option<&str>, result: &str) -> String {
     let id = serde_json::to_string(id).unwrap_or_else(|_| "null".into());
     let mut s = String::with_capacity(result.len() + 160);
     s.push_str("{\"id\":");
@@ -258,6 +274,10 @@ pub fn ok_line_fresh(id: &Value, generation: u64, server_us: u64, fresh: Option<
             s.push_str(",\"pending\":");
             s.push_str(&serde_json::to_string(&f.pending).unwrap_or_else(|_| "[]".into()));
         }
+    }
+    if let Some(h) = history {
+        s.push_str(",\"history\":");
+        s.push_str(h);
     }
     s.push_str(",\"result\":");
     s.push_str(result);
@@ -291,6 +311,9 @@ pub struct Response<'a> {
     pub pending: Vec<String>,
     #[serde(default)]
     pub pending_count: usize,
+    /// Git-history signals of an `impact` answer (absent from older daemons).
+    #[serde(borrow, default)]
+    pub history: Option<&'a serde_json::value::RawValue>,
     #[serde(borrow, default)]
     pub result: Option<&'a serde_json::value::RawValue>,
     #[serde(default)]

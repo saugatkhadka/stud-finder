@@ -509,7 +509,7 @@ fn autostart_after_idle_exit() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let paths = env.paths();
     let (r, p) = (env.repo.root.clone(), paths.clone());
-    let opts = ripple_cli::server::ServeOptions { signals: false, idle_timeout: Some(Duration::from_millis(200)) };
+    let opts = ripple_cli::server::ServeOptions { signals: false, idle_timeout: Some(Duration::from_millis(200)), ..Default::default() };
     let t = std::thread::spawn(move || ripple_cli::server::serve(&r, pipeline(Default::default()), p, opts));
     wait_socket(&paths.socket);
     t.join().unwrap().unwrap();

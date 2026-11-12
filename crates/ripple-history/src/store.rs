@@ -181,5 +181,5 @@ pub(crate) fn decode(b: &[u8]) -> Result<History> {
     ensure!(churn.len() == files && churn.iter().all(|c| (c.2 as usize) < nc), "bad churn");
     ensure!(adj_off.len() == files + 1 && adj_off.windows(2).all(|w| w[0] <= w[1]) && adj_off[files] as usize == adj.len(), "bad partner lists");
     ensure!(adj.iter().all(|p| (p.other as usize) < files && (p.last as usize) < nc), "bad partner lists");
-    Ok(History { head, opts, names, name_off, commits, tx_off, tx, churn, adj_off, adj, pair_commits })
+    Ok(History { head, opts, names, name_off, commits, tx_off, tx, churn, adj_off, adj, pair_commits, recent: Vec::new() }.derive())
 }

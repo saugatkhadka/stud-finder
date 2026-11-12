@@ -63,7 +63,7 @@ pub fn resolve_rev(repo: &Path, rev: &str) -> Result<String> {
 }
 
 /// Is `a` an ancestor of (or equal to) `b`?
-pub(crate) fn is_ancestor(repo: &Path, a: &str, b: &str) -> Result<bool> {
+pub fn is_ancestor(repo: &Path, a: &str, b: &str) -> Result<bool> {
     let st = git_cmd(repo).args(["merge-base", "--is-ancestor", a, b]).stdout(Stdio::null()).stderr(Stdio::null()).status().context("running git")?;
     match st.code() {
         Some(0) => Ok(true),

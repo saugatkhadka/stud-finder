@@ -402,6 +402,10 @@ pub struct GitTracker {
     pub watching: AtomicBool,
     pub counters: GitCounters,
     inner: Mutex<Inner>,
+    /// Called when a query finds HEAD at a new commit (see [`GitTracker::on_head_move`]).
+    head_hook: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// FNV of the last HEAD seen (0: none yet).
+    last_head: AtomicU64,
 }
 
 /// Resolves the git binary once: `git --exec-path`/git skips wrappers such
@@ -448,6 +452,25 @@ impl GitTracker {
             watching: AtomicBool::new(false),
             counters: GitCounters::default(),
             inner: Mutex::new(Inner::default()),
+            head_hook: OnceLock::new(),
+            last_head: AtomicU64::new(0),
+        }
+    }
+
+    /// Registers `f` to be told (cheaply, on the request thread) whenever a
+    /// diff query finds HEAD at a different commit than the previous one.
+    pub fn on_head_move(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.head_hook.set(Box::new(f));
+    }
+
+    fn note_head(&self, head: &Option<String>) {
+        let mut h: u64 = 0xcbf29ce484222325;
+        fnv(&mut h, head.as_deref().unwrap_or("-").as_bytes());
+        let prev = self.last_head.swap(h, Ordering::Relaxed);
+        if prev != h
+            && let Some(f) = self.head_hook.get()
+        {
+            f();
         }
     }
 
@@ -664,6 +687,7 @@ impl GitTracker {
             inner.config = Some(cfg);
         }
         let head = self.head(inner)?;
+        self.note_head(&head);
         self.refresh_index(inner);
         match spec {
             DiffSpec::Staged => self.staged(inner, &head),

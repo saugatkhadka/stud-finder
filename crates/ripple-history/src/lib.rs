@@ -41,7 +41,11 @@
 mod gitlog;
 mod store;
 
-pub use gitlog::{Cancelled, resolve_rev};
+pub use gitlog::{Cancelled, is_ancestor, resolve_rev};
+
+/// [`Churn::recent_changes`] counts commits this many days before the
+/// newest commit of the window.
+pub const RECENT_DAYS: i64 = 90;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -171,6 +175,9 @@ pub struct Churn {
     pub pair_changes: u32,
     /// Committer time (unix seconds) of the newest one.
     pub last_changed: i64,
+    /// Commits touching the file (sweeps included) in the [`RECENT_DAYS`]
+    /// before the newest commit of the window.
+    pub recent_changes: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +216,9 @@ pub struct History {
     pub(crate) adj: Vec<Pair>,
     /// Non-sweep commits in the window (the denominator of base rates).
     pub(crate) pair_commits: u32,
+    /// Per file: commits in the last [`RECENT_DAYS`] of the window. Derived
+    /// (not stored in the sidecar): see [`History::derive`].
+    pub(crate) recent: Vec<u32>,
 }
 
 /// What a build or update did, for logs.
@@ -373,6 +383,30 @@ impl History {
             + self.churn.capacity() * 12
             + self.adj_off.capacity() * 4
             + self.adj.capacity() * std::mem::size_of::<Pair>()
+            + self.recent.capacity() * 4
+    }
+
+    /// Fills the derived fields from the stored ones (after assembling or loading).
+    pub(crate) fn derive(mut self) -> Self {
+        let mut recent = vec![0u32; self.file_count()];
+        if let Some(newest) = self.commits.first().map(|c| c.time) {
+            let cut = newest.saturating_sub(RECENT_DAYS * 86_400);
+            for (c, meta) in self.commits.iter().enumerate() {
+                // Newest first, but committer times are not monotonic: no early exit.
+                if meta.time >= cut {
+                    for &f in &self.tx[self.tx_off[c] as usize..self.tx_off[c + 1] as usize] {
+                        recent[f as usize] += 1;
+                    }
+                }
+            }
+        }
+        self.recent = recent;
+        self
+    }
+
+    /// Commits in the window touching more than `max_files_per_commit` files.
+    pub fn sweep_commit_count(&self) -> usize {
+        self.commits.len() - self.pair_commits as usize
     }
 
     /// The `i`-th file with history (sorted by path), for iteration.
@@ -406,7 +440,7 @@ impl History {
     pub fn churn(&self, path: &str) -> Option<Churn> {
         let id = self.id(path)?;
         let (changes, pair_changes, last) = self.churn[id as usize];
-        Some(Churn { changes, pair_changes, last_changed: self.commits[last as usize].time })
+        Some(Churn { changes, pair_changes, last_changed: self.commits[last as usize].time, recent_changes: self.recent[id as usize] })
     }
 
     /// Files that usually change with `files`, with the default query
@@ -575,7 +609,7 @@ impl History {
         }
         adj.shrink_to_fit();
         tx.shrink_to_fit();
-        Self { head, opts, names, name_off, commits, tx_off, tx, churn, adj_off, adj, pair_commits }
+        Self { head, opts, names, name_off, commits, tx_off, tx, churn, adj_off, adj, pair_commits, recent: Vec::new() }.derive()
     }
 }
 

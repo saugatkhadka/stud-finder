@@ -269,3 +269,22 @@ impl History {
         store::decode(b).unwrap()
     }
 }
+
+#[test]
+fn recent_changes_count_the_last_days_of_the_window() {
+    let day = 86_400;
+    let t = 1_700_000_000;
+    let h = History::from_commits(
+        "h",
+        &Options::default(),
+        &[("c3", t, &["a.rb", "b.rb"]), ("c2", t - 10 * day, &["a.rb"]), ("c1", t - (crate::RECENT_DAYS + 1) * day, &["a.rb", "b.rb"])],
+    );
+    let a = h.churn("a.rb").unwrap();
+    assert_eq!((a.changes, a.recent_changes), (3, 2));
+    assert_eq!(h.churn("b.rb").unwrap().recent_changes, 1);
+    // Derived again on load.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("h.bin");
+    h.save(&p).unwrap();
+    assert_eq!(History::load(&p).unwrap(), h);
+}
