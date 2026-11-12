@@ -1444,3 +1444,29 @@ fn untested_joins_the_per_file_conditions() {
     // With a metric condition: invoice is complex but tested, charge untested but has no metrics.
     assert_eq!(msg("{untested: true, complexity_over: 100}", &both), None);
 }
+
+#[test]
+fn bulk_non_source_changes_collapse_per_directory_in_text_and_markdown() {
+    let p = policy("");
+    let mut changed = vec![m("app/models/invoice.rb").lines(3, 1)];
+    for i in 0..4 {
+        changed.push(m(&format!("app/javascript/locales/l{i}.json")).lines(2, 0));
+    }
+    // Only two in this directory: listed one by one.
+    changed.push(m("config/locales/a.yml").lines(1, 1));
+    changed.push(m("config/locales/b.yml").lines(1, 1));
+    let r = run(&p, &changed);
+    assert_eq!(r.changed.len(), 7, "the report itself lists every file");
+    let t = crate::render::text::render(&r, 30, false);
+    let rows: Vec<&str> = t.lines().filter(|l| l.starts_with("changed ")).collect();
+    assert_eq!(rows.len(), 4, "{t}");
+    assert!(rows.contains(&"changed 4 files in app/javascript/locales/ (other, +8 -0) [frontend]"), "{t}");
+    assert!(rows.iter().any(|l| l.starts_with("changed M config/locales/a.yml  other")), "{t}");
+    assert!(rows.iter().any(|l| l.starts_with("changed M app/models/invoice.rb  ruby")), "{t}");
+    let md = crate::render::markdown::render(&r, 30);
+    assert!(md.lines().any(|l| l == "| 4 files in `app/javascript/locales/` | modified | +8 −0 | | other | frontend | |"), "{md}");
+    assert!(!md.lines().any(|l| l.starts_with("| `app/javascript/locales/l0.json`")), "{md}");
+    assert!(md.contains("`config/locales/b.yml`"), "{md}");
+    let json = crate::render::json::render(&r, false);
+    assert!(json.contains("app/javascript/locales/l3.json"), "JSON unchanged");
+}

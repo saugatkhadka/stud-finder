@@ -111,7 +111,23 @@ pub fn render(report: &Report, max_listed: usize, color: bool) -> String {
     }
 
     // 4. Changed files.
-    for c in &r.changed {
+    for row in super::changed_rows(&r.changed) {
+        let c = match row {
+            super::ChangedRow::One(c) => c,
+            super::ChangedRow::Dir { dir, files } => {
+                let (statuses, lines, areas) = super::dir_totals(&files);
+                let mut extra = vec!["other".to_string()];
+                if !statuses.is_empty() {
+                    extra.push(statuses);
+                }
+                if let Some((a, d)) = lines {
+                    extra.push(format!("+{a} -{d}"));
+                }
+                let areas = if areas.is_empty() { String::new() } else { format!(" [{}]", areas.join(",")) };
+                let _ = writeln!(o, "changed {} files in {dir} ({}){areas}", files.len(), extra.join(", "));
+                continue;
+            }
+        };
         let status = match c.status {
             FileStatus::Added => "A",
             FileStatus::Modified => "M",

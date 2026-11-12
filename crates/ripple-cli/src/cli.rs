@@ -1225,6 +1225,16 @@ mod tests {
         assert_eq!(cfg.ci.fail_on, Some(Risk::Critical));
         ripple_policy::Policy::compile(cfg).unwrap();
         uses_every_when_key(INIT_TEMPLATE);
+        // The commented daemon / history / coverage blocks are valid once uncommented.
+        let tail = &INIT_TEMPLATE[INIT_TEMPLATE.find("# The background daemon").expect("daemon block")..];
+        let yaml: String = std::iter::once("version: 1".to_string())
+            .chain(tail.lines().filter(|l| ["# daemon:", "# history:", "# coverage:", "#   "].iter().any(|p| l.starts_with(p)) && !l.trim_start_matches('#').trim().starts_with('#')).map(|l| l[2..].to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = ripple_policy::parse_config(&yaml, "tail").unwrap_or_else(|e| panic!("{e:?}\n{yaml}"));
+        assert_eq!(cfg.daemon.sleep_after_seconds, 300);
+        assert_eq!(cfg.history.max_age_days, Some(365));
+        assert_eq!(cfg.coverage.max_age_days, Some(7));
     }
 
     /// `ripple init`'s output parses, compiles, and changes nothing.

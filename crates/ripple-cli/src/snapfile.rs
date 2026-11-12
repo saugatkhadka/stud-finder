@@ -94,6 +94,47 @@ pub fn save(snap: &Snapshot, path: &Path) -> Result<u64, String> {
     w.write_atomic(FORMAT, path).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
+/// Snapshots kept per directory by [`prune`], counting the one just written.
+pub const PRUNE_KEEP: usize = 3;
+/// [`prune`] deletes any other snapshot older than this.
+pub const PRUNE_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 3600);
+/// [`prune`] never deletes a snapshot written more recently than this: another
+/// daemon may have just saved it and be about to map it in its new image.
+pub const PRUNE_MIN_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Deletes stale snapshots next to `keep` (the file just written): other
+/// `index-*.snap` files (one per root and `--config`, e.g. other worktrees
+/// sharing the git directory) older than [`PRUNE_MAX_AGE`], or beyond the
+/// newest [`PRUNE_KEEP`]. Files younger than [`PRUNE_MIN_AGE`] and `keep`
+/// itself are never touched; a sleeping daemon that has its (older) file
+/// mapped is unaffected, as a mapping outlives the file's name and a daemon
+/// only reads its file right after writing it. Returns the deleted paths.
+pub fn prune(keep: &Path, now: SystemTime) -> Vec<PathBuf> {
+    let Some(dir) = keep.parent() else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut others: Vec<(SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with("index-") && n.ends_with(".snap") && e.path() != keep
+        })
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    others.sort_by_key(|o| std::cmp::Reverse(o.0));
+    let mut deleted = Vec::new();
+    for (i, (mtime, path)) in others.into_iter().enumerate() {
+        let age = now.duration_since(mtime).unwrap_or_default();
+        // `keep` is the newest; `i + 1` others are newer than or as new as this one.
+        let surplus = i + 1 >= PRUNE_KEEP;
+        if age >= PRUNE_MIN_AGE && (surplus || age >= PRUNE_MAX_AGE) && std::fs::remove_file(&path).is_ok() {
+            deleted.push(path);
+        }
+    }
+    deleted
+}
+
 /// Maps the snapshot at `path` if it is valid for `root` as configured now.
 pub fn load(path: &Path, root: &Path) -> Result<Snapshot, String> {
     let f = SectionFile::open(path, FORMAT)?;

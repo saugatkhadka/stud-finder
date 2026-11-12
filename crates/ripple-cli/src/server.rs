@@ -826,6 +826,11 @@ fn go_to_sleep(shared: &Shared, engine: &mut Option<Engine>, pipeline: &mut Opti
         }
     };
     let save_ms = t.elapsed().as_secs_f64() * 1000.0;
+    for p in crate::snapfile::prune(&shared.sleep.path, SystemTime::now()) {
+        if std::env::var_os("RIPPLE_DEBUG").is_some() {
+            eprintln!("ripple: removed old snapshot {}", p.display());
+        }
+    }
     shared.sleep.sleeps.fetch_add(1, Ordering::Relaxed);
     if shared.sleep.reexec {
         let e = reexec(shared, since);

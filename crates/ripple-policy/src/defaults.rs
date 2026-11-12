@@ -136,7 +136,7 @@ fn rule(id: &str, description: &str, risk: Risk, require: &[&str], when: When) -
 /// of two Rails apps (Mastodon, Gumroad) offline, aiming at 10-15% of
 /// commits rated high or critical. No one set reaches that on both: these
 /// put 8.3% (Mastodon) and 16.9% (Gumroad) at high+, the closest pair
-/// found (see docs/CHANGES-omakase.md).
+/// found (see docs/CONFIG.md, "Calibration").
 ///
 /// Tier conditions mean "at least this tier", so touching a critical area
 /// fires every `touches_*` rule; the report keeps only the highest rung of
