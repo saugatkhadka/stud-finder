@@ -134,6 +134,84 @@ pub struct Engine {
     listing: Listing,
     current: Option<Arc<Snapshot>>,
     scopes: Arc<BTreeMap<RelPath, Vec<ScopeRange>>>,
+    /// Files whose out-edges changed in some output since the published
+    /// graph; `None` = unknown (the next publish builds the graph).
+    dirty: Option<BTreeSet<RelPath>>,
+}
+
+/// Whether `edges` are grouped by `from` in increasing order.
+fn sorted_by_from(edges: &[Edge]) -> bool {
+    edges.windows(2).all(|w| w[0].from <= w[1].from)
+}
+
+/// The edges of each `from`, in order.
+fn groups(edges: &[Edge]) -> HashMap<&str, Vec<&Edge>> {
+    let mut out: HashMap<&str, Vec<&Edge>> = HashMap::new();
+    for e in edges {
+        out.entry(e.from.as_str()).or_default().push(e);
+    }
+    out
+}
+
+/// Files whose out-edges (as an ordered list) differ between two complete
+/// outputs.
+fn changed_rows(old: &[Edge], new: &[Edge], out: &mut BTreeSet<RelPath>) {
+    if old == new {
+        return;
+    }
+    if sorted_by_from(old) && sorted_by_from(new) {
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() || j < new.len() {
+            let from = match (old.get(i), new.get(j)) {
+                (Some(a), Some(b)) => a.from.as_str().min(b.from.as_str()),
+                (Some(a), None) => a.from.as_str(),
+                (None, Some(b)) => b.from.as_str(),
+                (None, None) => break,
+            };
+            let a = i + old[i..].iter().take_while(|e| e.from == from).count();
+            let b = j + new[j..].iter().take_while(|e| e.from == from).count();
+            if old[i..a] != new[j..b] {
+                out.insert(from.to_string());
+            }
+            (i, j) = (a, b);
+        }
+        return;
+    }
+    let (a, b) = (groups(old), groups(new));
+    for (from, v) in &a {
+        if b.get(from) != Some(v) {
+            out.insert(from.to_string());
+        }
+    }
+    for from in b.keys() {
+        if !a.contains_key(from) {
+            out.insert(from.to_string());
+        }
+    }
+}
+
+/// Replaces the out-edges of `files` (sorted) in the complete edge set
+/// `old` by `rows` (see [`ExtractOutput::replaced`]), keeping `from` order
+/// when `old` has it, so the result is what a complete output would be.
+fn splice(old: Vec<Edge>, files: &[RelPath], rows: Vec<Edge>) -> Vec<Edge> {
+    let replaced = |f: &str| files.binary_search_by(|p| p.as_str().cmp(f)).is_ok();
+    if !(sorted_by_from(&old) && sorted_by_from(&rows)) {
+        let mut out: Vec<Edge> = old.into_iter().filter(|e| !replaced(&e.from)).collect();
+        out.extend(rows);
+        return out;
+    }
+    let mut out = Vec::with_capacity(old.len() + rows.len());
+    let mut rows = rows.into_iter().peekable();
+    for e in old {
+        while rows.peek().is_some_and(|r| r.from < e.from) {
+            out.extend(rows.next());
+        }
+        if !replaced(&e.from) {
+            out.push(e);
+        }
+    }
+    out.extend(rows);
+    out
 }
 
 fn load_policy(root: &Path) -> (Policy, Option<Warning>) {
@@ -174,6 +252,7 @@ impl Engine {
             listing: Listing::Git,
             current: None,
             scopes: Arc::default(),
+            dirty: None,
         };
         let snap = engine.full_build()?;
         Ok((engine, snap))
@@ -185,6 +264,17 @@ impl Engine {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Every extractor and linker edge of the last pass (not the
+    /// tombstones), in the order the graph is built from.
+    pub fn output_edges(&self) -> impl Iterator<Item = &Edge> {
+        self.outputs.iter().chain(&self.link_outputs).flat_map(|o| o.edges.iter())
+    }
+
+    /// The edges kept for the former dependents of deleted files.
+    pub fn tombstone_edges(&self) -> impl Iterator<Item = &Edge> {
+        self.tombstones.values().flatten()
     }
 
     /// The method-mention facts of the last pass, if an extractor reports them.
@@ -210,6 +300,7 @@ impl Engine {
         self.ws.files = files;
         self.tombstones.retain(|p, _| !self.files.contains(p));
 
+        self.dirty = None;
         self.run_extractors(None, &mut timings);
         self.run_linkers(None, &mut timings);
         let snap = self.publish(start, timings);
@@ -300,6 +391,8 @@ impl Engine {
                 return self.full_build();
             }
             if changes.is_empty() {
+                // Same outputs: the graph only needs its node payloads again.
+                self.dirty = Some(BTreeSet::new());
                 return Ok(self.publish(Instant::now(), BTreeMap::new()));
             }
         }
@@ -315,6 +408,11 @@ impl Engine {
         let start = Instant::now();
         let mut timings = BTreeMap::new();
 
+        // The graph is patched unless the node set or the tombstones change.
+        self.dirty = Some(BTreeSet::new());
+        if !changes.removed.is_empty() || changes.modified.iter().any(|p| self.tombstones.contains_key(p)) {
+            self.dirty = None;
+        }
         // Keep the former dependents of deleted files reachable (see `tombstone`).
         if let Some(cur) = self.current.clone() {
             for p in &changes.removed {
@@ -341,6 +439,7 @@ impl Engine {
             let mut v: Vec<RelPath> = files.iter().cloned().collect();
             v.sort_unstable();
             self.ws.files = v;
+            self.dirty = None;
         }
 
         self.run_extractors(Some(changes), &mut timings);
@@ -384,7 +483,7 @@ impl Engine {
                         let t = Instant::now();
                         let name = ex.name().to_string();
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match (full, changes) {
-                            (false, Some(c)) => ex.update(ws, c),
+                            (false, Some(c)) => ex.update_rows(ws, c),
                             _ => ex.build(ws),
                         }));
                         (name, r, us(t))
@@ -396,7 +495,21 @@ impl Engine {
         for (i, (name, r, t)) in results.into_iter().enumerate() {
             timings.insert(format!("extract_{name}_us"), t);
             match r {
-                Ok(Ok(out)) => {
+                Ok(Ok(mut out)) => {
+                    let old = std::mem::take(&mut self.outputs[i].edges);
+                    match out.replaced.take() {
+                        Some(files) => {
+                            if let Some(d) = &mut self.dirty {
+                                d.extend(files.iter().cloned());
+                            }
+                            out.edges = splice(old, &files, std::mem::take(&mut out.edges));
+                        }
+                        None => {
+                            if let Some(d) = &mut self.dirty {
+                                changed_rows(&old, &out.edges, d);
+                            }
+                        }
+                    }
                     self.outputs[i] = out;
                     self.failed[i] = false;
                 }
@@ -436,18 +549,67 @@ impl Engine {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| linker.link(&self.ws, &facts, changes)));
             timings.insert(format!("link_{name}_us"), us(t));
             match r {
-                Ok(Ok(out)) => self.link_outputs[i] = out,
+                Ok(Ok(out)) => {
+                    if let Some(d) = &mut self.dirty {
+                        changed_rows(&self.link_outputs[i].edges, &out.edges, d);
+                    }
+                    self.link_outputs[i] = out
+                }
                 Ok(Err(e)) => self.link_outputs[i].warnings = vec![Warning::new("linker_failed", format!("{name}: {e:#}; keeping its previous edges"))],
                 Err(_) => self.link_outputs[i].warnings = vec![Warning::new("linker_panicked", format!("{name} panicked; keeping its previous edges"))],
             }
         }
     }
 
+    /// The current graph with the rows of the dirty files replaced (see
+    /// [`Graph::patched`]), or `None` when it must be built.
+    fn patch_graph(&self) -> Option<Graph> {
+        if std::env::var_os("RIPPLE_NO_GRAPH_PATCH").is_some() {
+            return None;
+        }
+        let dirty = self.dirty.as_ref()?;
+        let cur = self.current.as_ref()?;
+        let outputs: Vec<&ExtractOutput> = self.outputs.iter().chain(&self.link_outputs).collect();
+        let mut rows: Vec<(&str, Vec<&Edge>)> = dirty.iter().map(|f| (f.as_str(), Vec::new())).collect();
+        let index: HashMap<&str, usize> = dirty.iter().enumerate().map(|(i, f)| (f.as_str(), i)).collect();
+        for o in &outputs {
+            if sorted_by_from(&o.edges) {
+                for (from, row) in rows.iter_mut() {
+                    let a = o.edges.partition_point(|e| e.from.as_str() < *from);
+                    row.extend(o.edges[a..].iter().take_while(|e| e.from == *from));
+                }
+            } else {
+                for e in &o.edges {
+                    if let Some(&i) = index.get(e.from.as_str()) {
+                        rows[i].1.push(e);
+                    }
+                }
+            }
+        }
+        for e in self.tombstones.values().flatten() {
+            if let Some(&i) = index.get(e.from.as_str()) {
+                rows[i].1.push(e);
+            }
+        }
+        let all = outputs.iter().flat_map(|o| o.edges.iter()).chain(self.tombstones.values().flatten());
+        cur.graph.patched(&rows, all, |p| self.files.contains(p))
+    }
+
     fn publish(&mut self, start: Instant, mut timings: BTreeMap<String, u64>) -> Arc<Snapshot> {
         let t = Instant::now();
-        let edges = self.outputs.iter().chain(&self.link_outputs).flat_map(|o| o.edges.iter()).chain(self.tombstones.values().flatten());
-        let mut graph = Graph::build(edges, self.ws.files.iter().map(String::as_str));
-        timings.insert("graph_build_us".into(), us(t));
+        let mut graph = match self.patch_graph() {
+            Some(g) => {
+                timings.insert("graph_patch_us".into(), us(t));
+                g
+            }
+            None => {
+                let edges = self.outputs.iter().chain(&self.link_outputs).flat_map(|o| o.edges.iter()).chain(self.tombstones.values().flatten());
+                let g = Graph::build(edges, self.ws.files.iter().map(String::as_str));
+                timings.insert("graph_build_us".into(), us(t));
+                g
+            }
+        };
+        self.dirty = None;
         if let Some(m) = self.outputs.iter().find_map(|o| o.facts.mentions.as_ref()) {
             graph.set_mentions(m);
         }

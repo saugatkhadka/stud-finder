@@ -113,6 +113,10 @@ struct Timings {
     batch_rebuilt: bool,
 }
 
+fn verify_rows() -> bool {
+    std::env::var_os("RIPPLE_RUBY_VERIFY_ROWS").is_some_and(|v| v == "1")
+}
+
 fn micros(since: Instant) -> u64 {
     since.elapsed().as_micros() as u64
 }
@@ -216,6 +220,19 @@ impl State {
             self.files.insert(p, e);
         }
         (new_edges, paths)
+    }
+
+    /// `RIPPLE_RUBY_VERIFY_ROWS=1` (tests): checks a fast-path result against
+    /// a full edge pass and panics on any difference.
+    fn verify_rows(&mut self, ws: &Workspace, rows: &[Edge], paths: &[String]) {
+        let (totals, kinds, over) = (self.totals.clone(), self.kind_counts, self.over.clone());
+        let all = self.all_edges(ws);
+        let want: Vec<&Edge> = all.iter().filter(|e| paths.binary_search(&e.from).is_ok()).collect();
+        let got: Vec<&Edge> = rows.iter().collect();
+        assert_eq!(want, got, "fast-path rows differ from a full edge pass");
+        assert_eq!(self.totals, totals, "fast-path edge stats differ");
+        assert_eq!(self.kind_counts, kinds, "fast-path edge kind counts differ");
+        assert_eq!(edges::namespace_counts(&self.over), edges::namespace_counts(&over), "fast-path namespace counts differ");
     }
 
     /// The output for `edges` (all edges, or with `replaced` the rows of
@@ -570,8 +587,10 @@ impl RubyExtractor {
         // keys...) and the inflections unchanged: a file that keeps its
         // fingerprint needs no Rubydex work.
         let same_set = stale.is_empty() && todo.iter().all(|(p, k)| state.files.get(*p).is_some_and(|e| e.kind == Some(*k)));
+        // `RIPPLE_RUBY_NO_FAST=1`: every changed file takes the slow path (for comparisons).
+        let fast_ok = same_set && std::env::var_os("RIPPLE_RUBY_NO_FAST").is_none_or(|v| v != "1");
         let (body, structural): (Vec<Analysed>, Vec<Analysed>) = analysed.into_iter().partition(|a| {
-            same_set && a.path != INFLECTIONS && state.files.get(&a.path).is_some_and(|e| e.fp == a.entry.fp)
+            fast_ok && a.path != INFLECTIONS && state.files.get(&a.path).is_some_and(|e| e.fp == a.entry.fp)
         });
         t.fast_files = body.len();
         t.slow_files = structural.len();
@@ -580,10 +599,13 @@ impl RubyExtractor {
             state.names.globalize(&mut a.entry.methods);
         }
 
-        if structural.is_empty() && state.converged {
+        if same_set && structural.is_empty() && state.converged {
             let start = Instant::now();
             let (edges, replaced) = if rows {
                 let (edges, paths) = state.row_edges(ws, body);
+                if verify_rows() {
+                    state.verify_rows(ws, &edges, &paths);
+                }
                 (edges, Some(paths))
             } else {
                 for a in body {
