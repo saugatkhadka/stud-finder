@@ -44,7 +44,7 @@ pub mod budget {
     pub const EVIDENCE: usize = 1;
 }
 
-/// The impact report: the agent / CI API. See the README section "Output".
+/// The impact report: the agent / CI API. Sections are described in docs/METRICS.md.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Report {
     pub schema_version: u32,

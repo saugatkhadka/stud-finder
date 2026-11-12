@@ -35,10 +35,12 @@ jobs:
           fetch-depth: 0   # the merge base with the target branch, and history signals
 
       - name: Install ripple
-        # Replace with however you distribute the binary (release asset, cache, cargo install).
+        # A pinned release binary (checksum-verified). From source instead:
+        #   cargo install --locked --git https://github.com/saugatkhadka/stud-finder --branch main ripple-cli
         run: |
-          cargo install --locked --git https://github.com/your-org/ripple ripple-cli
-          ripple --version
+          curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/main/install.sh | RIPPLE_VERSION=ripple-v0.1.0 bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/ripple" --version
 
       - name: Index once
         # Both reports below then come from the same index.
