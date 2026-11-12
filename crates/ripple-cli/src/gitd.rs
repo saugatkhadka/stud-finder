@@ -467,7 +467,9 @@ impl GitTracker {
         let mut h: u64 = 0xcbf29ce484222325;
         fnv(&mut h, head.as_deref().unwrap_or("-").as_bytes());
         let prev = self.last_head.swap(h, Ordering::Relaxed);
-        if prev != h
+        // The first observation is not a move (the history thread reads HEAD itself).
+        if prev != 0
+            && prev != h
             && let Some(f) = self.head_hook.get()
         {
             f();

@@ -22,7 +22,8 @@
 //! # Threads and locks
 //!
 //! One background thread per daemon, at utility QoS on macOS (nice 10 on
-//! Linux; `git log` children inherit it). It sleeps on a condvar until a HEAD
+//! Linux); the `git` processes it starts run at nice 10 (thread priority is
+//! not inherited by them). It sleeps on a condvar until a HEAD
 //! move is reported: idle cost is zero. Queries read the published [`View`]
 //! by cloning an `Arc` under an `RwLock` that the thread takes for writing
 //! only to swap in a finished one.
@@ -418,8 +419,10 @@ fn is_cancelled(e: &anyhow::Error) -> bool {
     e.root_cause().downcast_ref::<ripple_history::Cancelled>().is_some()
 }
 
-/// Thread-wide low priority (inherited by the `git` children it starts).
+/// Low priority for this thread and, separately, for the `git` processes it
+/// starts (neither macOS QoS nor Linux per-thread nice is inherited by them).
 fn lower_priority() {
+    ripple_history::lower_child_priority();
     #[cfg(target_os = "macos")]
     // SAFETY: only changes this thread's QoS class.
     unsafe {
@@ -845,8 +848,8 @@ pub fn oneshot_view(root: &Path, cfg: &Config) -> View {
     }
 }
 
-/// `ripple history build`: brings the sidecar up to HEAD in the foreground.
-pub fn cli_build(root: &Path) -> Result<u8> {
+/// `ripple history build`: brings the sidecar up to HEAD (or `at`) in the foreground.
+pub fn cli_build(root: &Path, at: Option<&str>) -> Result<u8> {
     let cfg = load_config(root);
     if !cfg.history.enabled {
         println!("history is disabled (history.enabled: false in ripple.yml)");
@@ -857,7 +860,10 @@ pub fn cli_build(root: &Path) -> Result<u8> {
         bail!("{SHALLOW}");
     }
     let sidecar = dirs.sidecar();
-    let head = head_of(root).map_err(|r| anyhow::anyhow!("{r}"))?;
+    let head = match at {
+        Some(rev) => ripple_history::resolve_rev(root, rev)?,
+        None => head_of(root).map_err(|r| anyhow::anyhow!("{r}"))?,
+    };
     let opts = options_for(&cfg);
     let no = AtomicBool::new(false);
     let t = Instant::now();

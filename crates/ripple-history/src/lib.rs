@@ -41,7 +41,7 @@
 mod gitlog;
 mod store;
 
-pub use gitlog::{Cancelled, is_ancestor, resolve_rev};
+pub use gitlog::{Cancelled, is_ancestor, lower_child_priority, resolve_rev};
 
 /// [`Churn::recent_changes`] counts commits this many days before the
 /// newest commit of the window.

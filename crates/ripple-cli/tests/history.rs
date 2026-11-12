@@ -183,7 +183,7 @@ fn one_shot_uses_the_sidecar_only() {
     assert_eq!(h.state, "unavailable");
     assert!(h.reason.as_deref().unwrap().contains("ripple history build"), "{h:?}");
     assert!(!sidecar(&repo.root).exists(), "one-shot never builds");
-    ripple_cli::historyd::cli_build(&repo.root).unwrap();
+    ripple_cli::historyd::cli_build(&repo.root, None).unwrap();
     let h = call();
     assert_eq!(h.state, "ready");
     assert_eq!(h.churn["lib/a.txt"].commits, 1);

@@ -101,7 +101,11 @@ enum ConfigCmd {
 #[derive(Subcommand)]
 enum HistoryCmd {
     /// Build or update the cache to HEAD in the foreground.
-    Build,
+    Build {
+        /// Build at this commit instead of HEAD (benchmarks, CI caches).
+        #[arg(long, value_name = "REV", hide = true)]
+        at: Option<String>,
+    },
     /// Show the running daemon's history state, else the cache's.
     Status,
 }
@@ -333,7 +337,7 @@ fn run(cli: Cli) -> Result<u8> {
         Cmd::Init { force } => init(&root, force),
         Cmd::Config { cmd: ConfigCmd::Check } => config_check(&root),
         Cmd::Daemon { cmd } => daemon_cmd(&root, cmd),
-        Cmd::History { cmd: HistoryCmd::Build } => crate::historyd::cli_build(&root),
+        Cmd::History { cmd: HistoryCmd::Build { at } } => crate::historyd::cli_build(&root, at.as_deref()),
         Cmd::History { cmd: HistoryCmd::Status } => {
             let daemon = if cli.no_daemon { None } else { DaemonPaths::for_root(&root).ok().and_then(|p| Client::connect(&p)) };
             let stats = match daemon {
