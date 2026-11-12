@@ -19,7 +19,7 @@ or a coverage tool. See [Limitations and evidence](#limitations-and-evidence).
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/saugatkhadka/stud-finder/ripple/install.sh | bash
 ```
 
 The script picks the release tarball for your OS and CPU, downloads it and
@@ -37,7 +37,7 @@ tells you if the directory is not on your `PATH`.
 From source (Rust stable):
 
 ```sh
-cargo install --git https://github.com/saugatkhadka/stud-finder --branch main ripple-cli
+cargo install --git https://github.com/saugatkhadka/stud-finder --branch ripple ripple-cli
 # or, in a checkout:
 cargo build --release -p ripple-cli     # target/release/ripple
 ```
@@ -383,7 +383,7 @@ Method and the replay: [docs/CONFIG.md](docs/CONFIG.md#calibration).
 
 stud-finder started as a Ruby gem that scores every file in one batch run
 (fan-in, fan-out, complexity, churn, coverage, temporal coupling) and
-prints a ranked table. ripple replaces it on `main`.
+prints a ranked table. ripple is its successor. It lives on the `ripple` branch of this repository; the gem is still on `main`.
 
 | | stud-finder gem | ripple |
 |---|---|---|
