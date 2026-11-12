@@ -36,6 +36,12 @@ pub fn classify(path: &str) -> Option<SourceKind> {
 
 /// A Ruby file in a test tree: a `spec/` or `test/` directory at the root or
 /// below (`ee/spec/features/x_spec.rb`).
+/// A Rails view helper module: under an `app/helpers/` directory (also
+/// `ee/app/helpers/`, engines). Rails includes them all in every view.
+pub fn is_view_helper(path: &str) -> bool {
+    path.ends_with(".rb") && (path.starts_with("app/helpers/") || path.contains("/app/helpers/"))
+}
+
 pub fn is_test_path(path: &str) -> bool {
     path.ends_with(".rb") && path.split('/').rev().skip(1).any(|seg| seg == "spec" || seg == "test")
 }

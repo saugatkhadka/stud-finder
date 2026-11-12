@@ -11,7 +11,9 @@ pub struct TemplateFacts {
     /// Constant paths as written (top-level lookup), with line.
     pub consts: Vec<(String, u32)>,
     pub renders: Vec<Render>,
-    /// Receiverless identifiers (candidate helper calls), first line each.
+    /// Receiverless identifiers (candidate helper calls), first line each;
+    /// names the template binds as locals (block / lambda parameters,
+    /// `x = ...`) are left out.
     pub idents: Vec<(String, u32)>,
     /// Method names the template's Ruby mentions (calls with or without a
     /// receiver, symbols, labels, identifier-like strings), first line each.
@@ -129,6 +131,10 @@ pub fn collect_with(source: &str, lang: TemplateLang, methods: bool) -> Template
     let mut facts = TemplateFacts::default();
     let mut seen_idents = std::collections::HashSet::new();
     let mut seen_mentions = std::collections::HashSet::new();
+    let mut locals = std::collections::HashSet::new();
+    for (code, _) in &fragments {
+        bound_locals(code, &mut locals);
+    }
     for (code, line) in fragments {
         let toks = lex::tokenize(&code, line);
         renders(&toks, &mut facts.renders);
@@ -141,7 +147,7 @@ pub fn collect_with(source: &str, lang: TemplateLang, methods: bool) -> Template
                 Tok::Ident {
                     name,
                     after_dot: false,
-                } if !is_keyword(name) && seen_idents.insert(name.clone()) => {
+                } if !is_keyword(name) && !locals.contains(name.as_str()) && seen_idents.insert(name.clone()) => {
                     facts.idents.push((name.clone(), t.line));
                 }
                 _ => {}
@@ -152,6 +158,56 @@ pub fn collect_with(source: &str, lang: TemplateLang, methods: bool) -> Template
         facts.crude = crude(source, lang);
     }
     facts
+}
+
+/// Names a Ruby fragment binds as local variables: block parameters
+/// (`|a, (b, c)|`), lambda parameters (`->(x)`), and assignments (`x = 1`,
+/// `x ||= 1`). A lexical over-approximation: it ignores scope.
+fn bound_locals(code: &str, out: &mut std::collections::HashSet<String>) {
+    let b = code.as_bytes();
+    let words = |s: &str, out: &mut std::collections::HashSet<String>| {
+        for w in s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if w.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+                out.insert(w.to_string());
+            }
+        }
+    };
+    let params = |s: &str| s.bytes().all(|c| c.is_ascii_alphanumeric() || b" _,*&()".contains(&c));
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            // `|params|` right after `do` or `{` (HAML drops a closing `|` that ends the line).
+            b'|' if code[..i].trim_end().ends_with("do") || code[..i].trim_end().ends_with('{') => {
+                let len = code[i + 1..].find('|').unwrap_or(code.len() - i - 1);
+                let inner = &code[i + 1..i + 1 + len];
+                if params(inner) {
+                    words(inner, out);
+                }
+                i += len + 2;
+                continue;
+            }
+            b'-' if b.get(i + 1) == Some(&b'>') => {
+                let rest = code[i + 2..].trim_start();
+                if let Some(inner) = rest.strip_prefix('(').and_then(|r| r.split_once(')')).map(|(p, _)| p)
+                    && params(inner)
+                {
+                    words(inner, out);
+                }
+            }
+            b'=' if !matches!(b.get(i + 1), Some(b'=' | b'~' | b'>')) && (i == 0 || !b"=!<>".contains(&b[i - 1])) => {
+                // `x = `, `x ||= `, `x += `: the identifier before the operator.
+                let head = code[..i].trim_end_matches(['|', '&', '+', '-', '*', '/']).trim_end();
+                let start = head.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |j| j + 1);
+                let name = &head[start..];
+                let before = head[..start].trim_end();
+                if name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') && !before.ends_with('.') && !before.ends_with(':') {
+                    out.insert(name.to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 fn is_keyword(w: &str) -> bool {
@@ -578,6 +634,18 @@ mod tests {
             .into_iter()
             .map(|(c, _)| c)
             .collect()
+    }
+
+    #[test]
+    fn idents_leave_out_bound_locals() {
+        let src = "- total = count_items\n- items.each do |item, (a, b)|\n  = format_item(item, a)\n= f.select :x, label_method: ->(contrast) { t(contrast) }\n- n ||= default_n\n- if total == other\n%p= helper_x\n";
+        let idents: Vec<String> = collect(src, TemplateLang::Haml).idents.into_iter().map(|(n, _)| n).collect();
+        for helper in ["count_items", "items", "format_item", "f", "default_n", "other", "helper_x"] {
+            assert!(idents.iter().any(|i| i == helper), "{helper} in {idents:?}");
+        }
+        for local in ["total", "item", "a", "b", "contrast", "n"] {
+            assert!(!idents.iter().any(|i| i == local), "{local} in {idents:?}");
+        }
     }
 
     #[test]
