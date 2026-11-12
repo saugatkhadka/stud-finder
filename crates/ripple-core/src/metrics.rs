@@ -12,7 +12,7 @@
 //!
 //! - Ruby (aimed at RuboCop `Metrics/CyclomaticComplexity`): `if`, `elsif`,
 //!   `unless`, ternary `?:` and their modifier forms; `while`, `until`
-//!   (also modifier / `begin..end while`); `for`; each `when` of a `case`;
+//!   (also modifier form); `for`; each `when` of a `case`;
 //!   each `in` of a `case ... in`; a `begin`/`def`/block body with `rescue`
 //!   clauses counts **once** however many clauses it has, and `x rescue y`
 //!   once; `&&`, `||`, `and`, `or`; `||=` and `&&=` (any target); every `&.`
@@ -23,7 +23,8 @@
 //!   RuboCop list in [`RUBY_ITERATING_METHODS`]), unless the block uses
 //!   numbered parameters or `it` (RuboCop does not count those); `x&.map { }`
 //!   counts twice. `while`/`until` in the `begin ... end while` form are not
-//!   counted (RuboCop's `while_post`).
+//!   counted (RuboCop's `while_post`). Only the method body is scored:
+//!   decisions in parameter defaults (`def f(a = b || c)`) are ignored.
 //!   Not counted: `case` itself, `else`, `ensure`, `loop`,
 //!   `retry`/`next`/`break`, pattern guards. Differences from RuboCop: a
 //!   `def` nested in another `def` and the body of a `define_method` block

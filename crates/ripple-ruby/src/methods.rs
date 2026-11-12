@@ -257,6 +257,9 @@ struct Collector<'s> {
     top_decisions: u32,
     /// Local variables `&.`-called so far in the current method.
     csend_seen: Vec<Vec<u8>>,
+    /// Byte range of the current method's parameters: RuboCop scores only
+    /// the body, so defaults like `a = b || c` are not decisions.
+    params: (u32, u32),
 }
 
 fn line(loc: &ruby_prism::Location) -> u32 {
@@ -429,6 +432,10 @@ impl Collector<'_> {
             let name = name.as_slice();
             self.csend_seen.retain(|n| n.as_slice() != name);
         }
+        let at = node.location().start();
+        if self.cur != NONE && at >= self.params.0 && at < self.params.1 {
+            return;
+        }
         let n = decisions(node) + self.csend(node);
         self.add_decisions(n);
     }
@@ -474,8 +481,10 @@ impl<'pr> Visit<'pr> for Collector<'_> {
             self.dynamic(true, line(&loc));
         }
         let outer_csends = std::mem::take(&mut self.csend_seen);
+        self.params = node.parameters().map_or((0, 0), |p| (p.location().start(), p.location().end()));
         ruby_prism::visit_def_node(self, node);
         self.csend_seen = outer_csends;
+        self.params = (0, 0);
         self.cur = NONE;
     }
 
@@ -774,7 +783,7 @@ mod tests {
     s&.c
     object&.ids&.map(&:to_s)
   end
-  def m15
+  def m15(a = b || c, d: e&.f)
     xs.map { _1 + 1 }
     xs.each { it }
     begin; x; end while y
