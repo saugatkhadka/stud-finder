@@ -186,6 +186,18 @@ pub fn summary(sel: &Selection, commits: &[CommitResult]) -> String {
         let empty = pct(cases.iter().filter(|c| c.size[2] == 0).count(), cases.len());
         let _ = writeln!(s, "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {empty} |", cases.len(), dist(0), dist(2), prec(0), prec(1), prec(2), any(0), any(2));
     }
+    // The same, for source-file seeds only (the table above mixes in docs/YAML seeds).
+    let _ = writeln!(s, "\nSource-file seeds only (Ruby, JS/TS, templates):\n\n| variant | seeds | empty ≤1 | empty ≤3 | size ≤1 p50/p90 | precision ≤1 | ≤3 |\n|---|---:|---:|---:|---:|---:|---:|");
+    for name in &names {
+        let cases: Vec<_> = of(commits, name).flat_map(|v| &v.single).filter(|c| crate::adapter::is_source(&c.file)).collect();
+        let (n, empty) = (cases.len(), |k: usize| pct(cases.iter().filter(|c| c.size[k] == 0).count(), cases.len()));
+        let prec = |k: usize| {
+            let (h, z): (u64, u64) = (cases.iter().map(|c| c.hits[k] as u64).sum(), cases.iter().map(|c| c.size[k] as u64).sum());
+            if z == 0 { "–".to_string() } else { format!("{:.2}%", 100.0 * h as f64 / z as f64) }
+        };
+        let v: Vec<u32> = cases.iter().map(|c| c.size[0]).collect();
+        let _ = writeln!(s, "| {name} | {n} | {} | {} | {}/{} | {} | {} |", empty(0), empty(2), percentile(&v, 50.0), percentile(&v, 90.0), prec(0), prec(2));
+    }
 
     // Tests.
     let _ = writeln!(s, "\n## Changed tests vs. tests reaching the change\n\nCommits that change both non-test files in the graph and test source files in the graph (fixtures excluded). Recall = changed test files that are among the tests reaching the changed sources.\n");
