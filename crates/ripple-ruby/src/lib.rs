@@ -22,6 +22,8 @@ mod scoped;
 mod shadow;
 mod templates;
 mod views;
+#[cfg(feature = "mem-profile")]
+pub mod memprof;
 
 use analyse::{Analysed, FileEntry};
 use inflector::Inflector;

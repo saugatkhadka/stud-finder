@@ -13,6 +13,15 @@ path = "src/lib.rs"
 name = "ripple"
 path = "src/main.rs"
 
+# Live-heap attribution of a cold index (see the file's docs).
+[[bin]]
+name = "ripple-memprof"
+path = "src/bin/ripple-memprof.rs"
+required-features = ["mem-profile"]
+
+[features]
+mem-profile = ["ripple-ruby/mem-profile", "ripple-js/mem-profile"]
+
 [dependencies]
 ripple-core.workspace = true
 ripple-ruby.workspace = true
