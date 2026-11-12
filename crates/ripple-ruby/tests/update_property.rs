@@ -18,11 +18,22 @@
 //! add more definers of an existing method name (crossing the by-name LIMIT),
 //! and remove a whole `def`. Edges compare with their scopes and `inherit`
 //! flag, and `Facts.scopes` must match too.
+//!
+//! Fast-path operations (the file keeps its fingerprint): a statement or a
+//! comment inside a method body, a template edit, a new method. Every tenth
+//! step is a batch of 20 operations (mostly body edits), and with
+//! `RIPPLE_RUBY_BIG=N` step 5 is a batch of N. Updates alternate (seeded)
+//! between `update` (all edges) and `update_rows` (only the changed files'
+//! edges, spliced into the previous edge set here as the engine does).
+//! Compared with a fresh build: edges, warnings, scopes, the mention table,
+//! the metrics table, HTTP requests and every stat that is not a timing or
+//! a per-run counter.
 
 #[path = "../examples/support/mod.rs"]
 mod support;
 
-use ripple_core::{ChangeSet, Extractor, Workspace};
+use ripple_core::{ChangeSet, Edge, ExtractOutput, Extractor};
+use std::collections::BTreeSet;
 use ripple_ruby::RubyExtractor;
 use std::path::{Path, PathBuf};
 
@@ -60,45 +71,41 @@ fn copy_repo(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn fmt_edges(
-    ws: &Workspace,
-    ex: &mut RubyExtractor,
-    changes: Option<&ChangeSet>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let out = match changes {
-        Some(c) => ex.update(ws, c),
-        None => ex.build(ws),
-    }
-    .expect("extract");
-    if out.stats.contains_key("ruby_update_fell_back_to_build") {
-        println!("  (update fell back to a full build)");
-    }
-    if let Some(n) = out
-        .stats
-        .get("ruby_shadow_docs_reindexed")
-        .filter(|n| **n > 0)
-    {
-        println!("  (shadowing repair re-indexed {n} documents)");
-    }
-    let mut edges: Vec<String> = out
-        .edges
-        .iter()
-        .map(|e| {
-            format!(
-                "{} -> {} {:?} {:?} :{} @{:?}/{:?}{} {}",
-                e.from,
-                e.to,
-                e.kind,
-                e.confidence,
-                e.line,
-                e.from_scope,
-                e.to_scope,
-                if e.inherit { " inherit" } else { "" },
-                e.detail.as_deref().unwrap_or("")
-            )
-        })
-        .collect();
-    edges.sort();
+fn fmt_edge(e: &Edge) -> String {
+    format!(
+        "{} -> {} {:?} {:?} :{} @{:?}/{:?}{} {}",
+        e.from,
+        e.to,
+        e.kind,
+        e.confidence,
+        e.line,
+        e.from_scope,
+        e.to_scope,
+        if e.inherit { " inherit" } else { "" },
+        e.detail.as_deref().unwrap_or("")
+    )
+}
+
+/// Stats that legitimately differ between an update and a build.
+fn per_run(k: &str) -> bool {
+    k.contains("_time_") || k.ends_with("_this_run") || k == "ruby_shadow_docs_reindexed" || k == "ruby_update_fell_back_to_build"
+}
+
+#[derive(PartialEq)]
+struct Snap {
+    edges: Vec<String>,
+    warnings: Vec<String>,
+    scopes: Vec<String>,
+    stats: Vec<String>,
+    mentions: String,
+    metrics: String,
+    requests: String,
+}
+
+/// `edges`: the complete edge set (`out.edges`, or the spliced rows).
+fn snap(out: &ExtractOutput, edges: &[Edge]) -> Snap {
+    let mut e: Vec<String> = edges.iter().map(fmt_edge).collect();
+    e.sort();
     let mut warnings: Vec<String> = out
         .warnings
         .iter()
@@ -114,7 +121,62 @@ fn fmt_edges(
             format!("{f} {}", r.join(" "))
         })
         .collect();
-    (edges, warnings, scopes)
+    let stats = out.stats.iter().filter(|(k, _)| !per_run(k)).map(|(k, v)| format!("{k}={v}")).collect();
+    let mentions = match &out.facts.mentions {
+        Some(m) => {
+            let mut files: Vec<String> = m.files.iter().map(|(p, f)| format!("{p} {f:?}")).collect();
+            files.sort();
+            format!("{files:?} {:?}", m.unmentioned)
+        }
+        None => "none".into(),
+    };
+    Snap {
+        edges: e,
+        warnings,
+        scopes,
+        stats,
+        mentions,
+        metrics: format!("{:?}", out.facts.metrics),
+        requests: format!("{:?}", out.facts.http_requests),
+    }
+}
+
+/// Splices `out` into the complete edge set `cur` (see `ExtractOutput::replaced`).
+fn splice(cur: &mut Vec<Edge>, out: &ExtractOutput) {
+    match &out.replaced {
+        None => *cur = out.edges.clone(),
+        Some(files) => {
+            let files: BTreeSet<&str> = files.iter().map(String::as_str).collect();
+            cur.retain(|e| !files.contains(e.from.as_str()));
+            cur.extend(out.edges.iter().cloned());
+        }
+    }
+}
+
+fn report(out: &ExtractOutput, totals: &mut (u64, u64, u64)) {
+    let get = |k: &str| out.stats.get(k).copied().unwrap_or(0);
+    totals.0 += get("ruby_fast_files_this_run");
+    totals.1 += get("ruby_slow_files_this_run");
+    totals.2 += get("ruby_slow_batch_rebuilt_this_run");
+    if out.stats.contains_key("ruby_update_fell_back_to_build") {
+        println!("  (update fell back to a full build)");
+    }
+    if get("ruby_slow_batch_rebuilt_this_run") > 0 {
+        println!("  (batch rebuilt from scratch)");
+    }
+    if let Some(n) = out.stats.get("ruby_shadow_docs_reindexed").filter(|n| **n > 0) {
+        println!("  (shadowing repair re-indexed {n} documents)");
+    }
+}
+
+fn diff(label: &str, a: &[String], b: &[String], n: usize) {
+    let (a, b): (BTreeSet<&String>, BTreeSet<&String>) = (a.iter().collect(), b.iter().collect());
+    for l in a.difference(&b).take(n) {
+        eprintln!("  {label} missing in update: {l}");
+    }
+    for l in b.difference(&a).take(n) {
+        eprintln!("  {label} extra in update:   {l}");
+    }
 }
 
 /// `def` lines of `lines` as (index, name, indent, end index).
@@ -198,9 +260,38 @@ impl Sim {
             .join("::")
     }
 
+    /// A fast-path edit: a statement or comment inside a method body, or a
+    /// comment at the end of the file.
+    fn body_edit(&mut self, step: usize, changes: &mut ChangeSet) -> String {
+        for _ in 0..20 {
+            let f = self.pick(&self.rb_files());
+            let s = self.read(&f);
+            let lines: Vec<&str> = s.lines().collect();
+            let d = defs(&lines);
+            let (text, what) = match (d.is_empty(), self.rng.below(3)) {
+                (false, 0 | 1) => {
+                    let (at, name, indent, end) = d[self.rng.below(d.len())].clone();
+                    if end == at {
+                        continue;
+                    }
+                    let pad = " ".repeat(indent + 2);
+                    let stmt = if self.rng.below(2) == 0 { format!("{pad}ripple_local_{step} = [1, 2].map {{ |x| x * 2 }}") } else { format!("{pad}# ripple comment {step}") };
+                    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                    out.insert(at + 1, stmt);
+                    (out.join("\n") + "\n", format!("body edit in {name}"))
+                }
+                _ => (format!("{s}\n# ripple trailing comment {step}\n"), "trailing comment".to_string()),
+            };
+            self.write(&f, &text);
+            changes.modified.push(f.clone());
+            return format!("{what} of {f}");
+        }
+        "noop".into()
+    }
+
     /// Applies one random operation and returns what changed.
     fn op(&mut self, step: usize, changes: &mut ChangeSet) -> String {
-        match self.rng.below(12) {
+        match self.rng.below(17) {
             0 | 1 => {
                 let f = self.pick(&self.rb_files());
                 let c = self.some_constant();
@@ -394,6 +485,18 @@ impl Sim {
                 }
                 "noop".into()
             }
+            13..=15 => self.body_edit(step, changes),
+            16 => {
+                let tpl: Vec<String> = self.files().into_iter().filter(|f| f.ends_with(".erb") || f.ends_with(".haml")).collect();
+                if tpl.is_empty() {
+                    return "noop".into();
+                }
+                let f = self.pick(&tpl);
+                let s = self.read(&f);
+                self.write(&f, &format!("{s}\n<%= ripple_prop_helper_{step} %>\n"));
+                changes.modified.push(f.clone());
+                format!("template edit {f}")
+            }
             _ => match self.deleted.pop() {
                 Some((f, s)) => {
                     self.write(&f, &s);
@@ -430,46 +533,56 @@ fn update_equals_build_on_real_repo() {
         added: 0,
         unmentioned: Vec::new(),
     };
+    let big: usize = std::env::var("RIPPLE_RUBY_BIG").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut ex = RubyExtractor::new();
-    fmt_edges(&support::workspace(&root), &mut ex, None);
+    let first = ex.build(&support::workspace(&root)).expect("build");
+    let mut cur = first.edges.clone();
+    let mut totals = (0u64, 0u64, 0u64);
 
     for step in 0..ops {
         let mut changes = ChangeSet::default();
-        // Every fourth step batches three operations into one update.
-        let n = if step % 4 == 3 { 3 } else { 1 };
+        // Every fourth step batches three operations into one update, every
+        // tenth twenty (mostly body edits).
+        let n = if big > 0 && step == 5 { big } else if step % 10 == 9 { 20 } else if step % 4 == 3 { 3 } else { 1 };
         let what: Vec<String> = (0..n)
-            .map(|k| sim.op(step * 10 + k, &mut changes))
+            .map(|k| if n >= 20 && k % 4 != 0 { sim.body_edit(step * 1000 + k, &mut changes) } else { sim.op(step * 1000 + k, &mut changes) })
             .collect();
+        changes.modified.sort();
+        changes.modified.dedup();
+        changes.removed.sort();
+        changes.removed.dedup();
+        changes.modified.retain(|f| !changes.removed.contains(f) || sim.root.join(f).exists());
+        changes.removed.retain(|f| !sim.root.join(f).exists());
         let ws = support::workspace(&root);
-        let updated = fmt_edges(&ws, &mut ex, Some(&changes));
-        let fresh = fmt_edges(&ws, &mut RubyExtractor::new(), None);
+        let rows = sim.rng.below(2) == 0;
+        let out = if rows { ex.update_rows(&ws, &changes) } else { ex.update(&ws, &changes) }.expect("update");
+        report(&out, &mut totals);
+        splice(&mut cur, &out);
+        let updated = snap(&out, &cur);
+        let fresh_out = RubyExtractor::new().build(&ws).expect("build");
+        let fresh = snap(&fresh_out, &fresh_out.edges);
         if updated != fresh {
-            let to_edge = |v: &[String]| {
-                v.iter()
-                    .map(|s| s.to_string())
-                    .collect::<std::collections::BTreeSet<_>>()
-            };
-            let (a, b) = (to_edge(&fresh.0), to_edge(&updated.0));
-            for l in a.difference(&b).take(20) {
-                eprintln!("  missing in update: {l}");
+            diff("edge", &fresh.edges, &updated.edges, 20);
+            diff("scope", &fresh.scopes, &updated.scopes, 10);
+            diff("warning", &fresh.warnings, &updated.warnings, 10);
+            diff("stat", &fresh.stats, &updated.stats, 20);
+            if fresh.mentions != updated.mentions {
+                eprintln!("  mention tables differ");
             }
-            for l in b.difference(&a).take(20) {
-                eprintln!("  extra in update:   {l}");
+            if fresh.metrics != updated.metrics {
+                eprintln!("  metrics tables differ");
             }
-            let (a, b) = (to_edge(&fresh.2), to_edge(&updated.2));
-            for l in a.difference(&b).take(10) {
-                eprintln!("  scopes missing in update: {l}");
+            if fresh.requests != updated.requests {
+                eprintln!("  http requests differ");
             }
-            for l in b.difference(&a).take(10) {
-                eprintln!("  scopes extra in update:   {l}");
-            }
-            panic!("step {step} ({what:?}): update != build");
+            let shown: Vec<&String> = what.iter().take(30).collect();
+            panic!("step {step} (rows={rows}, {shown:?}): update != build");
         }
-        println!(
-            "step {step:02} ok ({} edges): {}",
-            fresh.0.len(),
-            what.join("; ")
-        );
+        let shown = if what.len() > 3 { format!("{} ops: {} ...", what.len(), what[..3].join("; ")) } else { what.join("; ") };
+        println!("step {step:02} ok ({} edges, rows={rows}): {shown}", fresh.edges.len());
     }
-    println!("{ops} steps, {} new files added", sim.added);
+    println!(
+        "{ops} steps, {} new files added; files on the fast path {}, slow path {}, batches rebuilt {}",
+        sim.added, totals.0, totals.1, totals.2
+    );
 }

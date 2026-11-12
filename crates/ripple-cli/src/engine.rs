@@ -413,6 +413,7 @@ impl Engine {
     }
 
     fn run_linkers(&mut self, changes: Option<&ChangeSet>, timings: &mut BTreeMap<String, u64>) {
+        let t = Instant::now();
         let mut facts = Facts::default();
         for o in &self.outputs {
             facts.merge(o.facts.clone());
@@ -428,6 +429,7 @@ impl Engine {
             self.scopes = Arc::new(scopes.clone());
         }
         facts.scopes = scopes;
+        timings.insert("merge_facts_us".into(), us(t));
         for (i, linker) in self.pipeline.linkers.iter_mut().enumerate() {
             let t = Instant::now();
             let name = linker.name().to_string();
@@ -445,6 +447,7 @@ impl Engine {
         let t = Instant::now();
         let edges = self.outputs.iter().chain(&self.link_outputs).flat_map(|o| o.edges.iter()).chain(self.tombstones.values().flatten());
         let mut graph = Graph::build(edges, self.ws.files.iter().map(String::as_str));
+        timings.insert("graph_build_us".into(), us(t));
         if let Some(m) = self.outputs.iter().find_map(|o| o.facts.mentions.as_ref()) {
             graph.set_mentions(m);
         }

@@ -2,7 +2,7 @@
 //! Rails directory layout (controllers, mailers, components, views).
 
 /// The template languages whose embedded Ruby we scan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TemplateLang {
     Erb,
     Haml,
@@ -11,7 +11,7 @@ pub enum TemplateLang {
     Ruby,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     /// Indexed by Rubydex.
     Ruby,

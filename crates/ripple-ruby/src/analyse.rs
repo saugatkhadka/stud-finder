@@ -52,6 +52,9 @@ pub struct FileEntry {
     pub warnings: Vec<Warning>,
     /// The file could not be read; it contributes nothing.
     pub unreadable: bool,
+    /// [`crate::fingerprint::of`]: equal for two versions of the file that
+    /// differ only in what feeds the file's own output.
+    pub fp: u64,
 }
 
 pub struct Analysed {
@@ -74,6 +77,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             entry
                 .warnings
                 .push(Warning::new("ruby_read_error", format!("cannot read file: {e}")).file(rel));
+            entry.fp = crate::fingerprint::of(None, &entry);
             return Analysed {
                 path: rel.to_string(),
                 entry,
@@ -179,6 +183,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             }
         }
     }
+    entry.fp = crate::fingerprint::of(local_graph.as_ref(), &entry);
     Analysed {
         path: rel.to_string(),
         entry,

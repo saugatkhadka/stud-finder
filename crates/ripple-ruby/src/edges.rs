@@ -1,9 +1,11 @@
 //! Turns per-file facts plus the resolved Rubydex graph into file edges.
 //!
-//! This runs over every file on every build/update. It only does hash
-//! lookups (no parsing), so recomputing everything keeps `update` trivially
-//! equal to a fresh `build`: any file's edges can change when *another* file
-//! adds or removes a definition, and recomputing avoids tracking that.
+//! A slow-path update (the Rubydex graph changed) recomputes every file: it
+//! only does hash lookups (no parsing), and any file's edges can change when
+//! *another* file adds or removes a definition. A fast-path update (see
+//! [`crate::fingerprint`]) recomputes only the changed files: one file's
+//! edges and stats depend on its own entry plus global state the fast path
+//! leaves unchanged, so they are exactly that file's part of a full run.
 
 use crate::actions::{self, Action};
 use crate::analyse::FileEntry;
@@ -21,7 +23,7 @@ use std::rc::Rc;
 /// Rubydex's document for core classes; every other document is a repo file.
 const BUILTIN_URI: &str = "rubydex:built-in";
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EdgeStats {
     pub refs_total: u64,
     pub refs_resolved: u64,
@@ -49,12 +51,39 @@ pub struct EdgeStats {
     pub template_helper_ambiguous: u64,
 }
 
+macro_rules! additive {
+    ($($f:ident),*) => {
+        impl EdgeStats {
+            /// Adds (`sign` 1) or subtracts (-1) the per-file additive
+            /// counters of `o` (not the per-declaration namespace counts).
+            pub fn add(&mut self, o: &EdgeStats, sign: i64) {
+                $( self.$f = (self.$f as i64 + sign * o.$f as i64) as u64; )*
+            }
+        }
+    };
+}
+additive!(refs_total, refs_resolved, refs_unresolved, refs_external, refs_prefix_fallback, refs_top_level_fallback, refs_to_namespace_without_canonical, inferred_unresolved, serializer_model_unresolved, requires_unresolved, renders_unresolved, template_consts_unresolved, template_helper_calls, template_helper_ambiguous);
+
+/// Declarations over the namespace limit that some file's resolution looked
+/// up: declaration -> (number of such files, has a canonical file). Their
+/// count is `namespace_canonical` / `namespace_no_canonical`.
+pub type OverLimit = HashMap<DeclarationId, (u32, bool)>;
+
+/// Counts `namespace_canonical` / `namespace_no_canonical` from `over`.
+pub fn namespace_counts(over: &OverLimit) -> (u64, u64) {
+    let canonical = over.values().filter(|(n, c)| *n > 0 && *c).count() as u64;
+    let none = over.values().filter(|(n, c)| *n > 0 && !*c).count() as u64;
+    (canonical, none)
+}
+
 /// Resolution targets for one declaration, after the namespace policy.
 struct Targets<'g> {
     files: Vec<&'g str>,
     name: &'g str,
     /// Over the limit with no canonical file.
     dropped: bool,
+    /// Over the namespace limit.
+    over_limit: bool,
 }
 
 pub struct EdgeBuilder<'a> {
@@ -77,6 +106,9 @@ pub struct EdgeBuilder<'a> {
     method_level: bool,
     /// View helper method name -> helper files defining it.
     helpers: HashMap<&'a str, Vec<&'a str>>,
+    /// Over-limit declarations the current file looked up.
+    file_over: HashMap<DeclarationId, bool>,
+    over: OverLimit,
 }
 
 /// A template call to a name defined in more helper files than this is too
@@ -132,17 +164,32 @@ impl<'a> EdgeBuilder<'a> {
             actions: &[],
             method_level,
             helpers,
+            file_over: HashMap::new(),
+            over: HashMap::new(),
         }
     }
 
-    /// Edges and stats.
-    pub fn run(mut self) -> (Vec<Edge>, EdgeStats) {
+    /// Edges and stats of every file.
+    pub fn run(mut self) -> (Vec<Edge>, EdgeStats, OverLimit) {
         let files = self.files;
-        for (path, entry) in files.iter() {
+        self.run_entries(files.iter().map(|(p, e)| (p.as_str(), e)))
+    }
+
+    /// Edges and stats of `entries` (paths in increasing order), each
+    /// exactly as [`EdgeBuilder::run`] computes it; `namespace_*` stats are
+    /// left at 0 (see [`namespace_counts`]).
+    pub fn run_entries(&mut self, entries: impl Iterator<Item = (&'a str, &'a FileEntry)>) -> (Vec<Edge>, EdgeStats, OverLimit) {
+        for (from, entry) in entries {
+            self.one(from, entry);
+        }
+        (std::mem::take(&mut self.out), std::mem::take(&mut self.stats), std::mem::take(&mut self.over))
+    }
+
+    fn one(&mut self, from: &'a str, entry: &'a FileEntry) {
+        {
             self.seen.clear();
             self.actions = &entry.facts.actions;
             let first = self.out.len();
-            let from = path.as_str();
             match entry.kind {
                 Some(SourceKind::Ruby) => {
                     self.ruby_constants(from, entry);
@@ -158,8 +205,11 @@ impl<'a> EdgeBuilder<'a> {
             if !self.actions.is_empty() {
                 self.drop_scoped_twins(first);
             }
+            for (d, canonical) in self.file_over.drain() {
+                let e = self.over.entry(d).or_insert((0, canonical));
+                e.0 += 1;
+            }
         }
-        (self.out, self.stats)
     }
 
     /// Pushes an edge scoped to the action whose body contains `line`, if any.
@@ -249,11 +299,19 @@ impl<'a> EdgeBuilder<'a> {
 
     /// Defining files of a declaration, applying `namespace_definition_limit`.
     fn targets(&mut self, decl_id: DeclarationId) -> Option<Rc<Targets<'a>>> {
-        if let Some(t) = self.cache.get(&decl_id) {
-            return t.clone();
+        let t = match self.cache.get(&decl_id) {
+            Some(t) => t.clone(),
+            None => {
+                let t = self.compute_targets(decl_id).map(Rc::new);
+                self.cache.insert(decl_id, t.clone());
+                t
+            }
+        };
+        if let Some(t) = &t
+            && t.over_limit
+        {
+            self.file_over.insert(decl_id, !t.dropped);
         }
-        let t = self.compute_targets(decl_id).map(Rc::new);
-        self.cache.insert(decl_id, t.clone());
         t
     }
 
@@ -271,24 +329,21 @@ impl<'a> EdgeBuilder<'a> {
         files.sort_unstable();
         files.dedup();
         let mut dropped = false;
-        if files.len() > self.limit {
+        let over_limit = files.len() > self.limit;
+        if over_limit {
             let key = paths::normalize_const(decl.name());
             files.retain(|f| {
                 self.files
                     .get(*f)
                     .is_some_and(|e| e.zeitwerk_keys.contains(&key))
             });
-            if files.is_empty() {
-                self.stats.namespace_no_canonical += 1;
-                dropped = true;
-            } else {
-                self.stats.namespace_canonical += 1;
-            }
+            dropped = files.is_empty();
         }
         Some(Targets {
             files,
             name: decl.name(),
             dropped,
+            over_limit,
         })
     }
 
@@ -377,6 +432,7 @@ impl<'a> EdgeBuilder<'a> {
                 files,
                 name: t.name,
                 dropped: t.dropped,
+                over_limit: t.over_limit,
             }))
         }
     }
