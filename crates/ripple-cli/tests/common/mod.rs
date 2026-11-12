@@ -14,16 +14,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Each line `use <path>` in a file is an exact edge to `<path>`.
-/// `delay_ms` makes every build/update sleep (to test concurrency).
+/// Each line `use <path>` in a file is an exact edge to `<path>`; lines
+/// `def <name>` ... `end` are a scope. `delay_ms` makes every build/update
+/// sleep (to test concurrency).
 pub struct UseExtractor {
     pub delay_ms: Arc<AtomicU64>,
     cache: BTreeMap<String, Vec<Edge>>,
+    scopes: BTreeMap<String, Vec<ripple_core::model::ScopeRange>>,
 }
 
 impl UseExtractor {
     pub fn new(delay_ms: Arc<AtomicU64>) -> Self {
-        Self { delay_ms, cache: BTreeMap::new() }
+        Self { delay_ms, cache: BTreeMap::new(), scopes: BTreeMap::new() }
+    }
+    fn scan_scopes(ws: &Workspace, file: &str) -> Vec<ripple_core::model::ScopeRange> {
+        let text = std::fs::read_to_string(ws.abs(file)).unwrap_or_default();
+        let mut out = Vec::new();
+        let mut open: Option<(String, u32)> = None;
+        for (i, l) in text.lines().enumerate() {
+            let n = i as u32 + 1;
+            if let Some(name) = l.strip_prefix("def ") {
+                open = Some((name.trim().to_string(), n));
+            } else if l.trim() == "end"
+                && let Some((name, start)) = open.take()
+            {
+                out.push(ripple_core::model::ScopeRange { name, start, end: n });
+            }
+        }
+        out
     }
     fn scan(ws: &Workspace, file: &str) -> Vec<Edge> {
         let text = std::fs::read_to_string(ws.abs(file)).unwrap_or_default();
@@ -35,7 +53,8 @@ impl UseExtractor {
     fn output(&self, ws: &Workspace) -> ExtractOutput {
         let files: std::collections::HashSet<&str> = ws.files.iter().map(String::as_str).collect();
         let edges = self.cache.values().flatten().filter(|e| files.contains(e.to.as_str())).cloned().collect();
-        ExtractOutput { edges, ..Default::default() }
+        let scopes = self.scopes.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
+        ExtractOutput { edges, facts: ripple_core::Facts { scopes, ..Default::default() }, ..Default::default() }
     }
     fn sleep(&self) {
         let d = self.delay_ms.load(Ordering::SeqCst);
@@ -52,15 +71,18 @@ impl Extractor for UseExtractor {
     fn build(&mut self, ws: &Workspace) -> anyhow::Result<ExtractOutput> {
         self.sleep();
         self.cache = ws.files.iter().map(|f| (f.clone(), Self::scan(ws, f))).collect();
+        self.scopes = ws.files.iter().map(|f| (f.clone(), Self::scan_scopes(ws, f))).collect();
         Ok(self.output(ws))
     }
     fn update(&mut self, ws: &Workspace, changes: &ChangeSet) -> anyhow::Result<ExtractOutput> {
         self.sleep();
         for r in &changes.removed {
             self.cache.remove(r);
+            self.scopes.remove(r);
         }
         for m in &changes.modified {
             self.cache.insert(m.clone(), Self::scan(ws, m));
+            self.scopes.insert(m.clone(), Self::scan_scopes(ws, m));
         }
         Ok(self.output(ws))
     }
@@ -141,6 +163,12 @@ impl Daemon {
     }
     pub fn client(&self) -> Client {
         Client::connect(&self.paths).expect("connect")
+    }
+    /// The whole reply (freshness fields included) and the parsed result.
+    pub fn call_full(&self, method: &str, params: Value) -> (Value, ripple_cli::client::Reply) {
+        let r = self.client().call(method, &params).unwrap();
+        let body = r.result.clone().unwrap_or_else(|e| panic!("{method}: {} {}", e.code, e.message));
+        (serde_json::from_str(&body).unwrap(), r)
     }
     pub fn call(&self, method: &str, params: Value) -> (Value, u64) {
         let r = self.client().call(method, &params).unwrap();

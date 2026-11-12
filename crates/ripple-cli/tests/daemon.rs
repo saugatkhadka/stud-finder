@@ -124,23 +124,30 @@ fn freshness_loop_sync_unnamed() {
     }
 }
 
-#[test]
-fn concurrent_queries_during_rebuild() {
-    let repo = chain();
-    let d = Daemon::start(&repo.root);
-    d.delay.store(800, Ordering::SeqCst);
-    repo.write("app/d.txt", "use lib/a.txt\n");
-    // Wait until the indexer has picked up the change and is busy.
+/// Waits until the indexer is in a pass (`stats` never waits, so polling it
+/// cannot itself block on the pass).
+fn wait_indexing(d: &Daemon) {
     let t0 = Instant::now();
     loop {
         let (s, _) = d.call("stats", json!(null));
         if s["daemon"]["indexing"] == true {
-            break;
+            return;
         }
-        assert!(t0.elapsed() < Duration::from_secs(10), "indexer never started");
+        assert!(t0.elapsed() < Duration::from_secs(10), "indexer never started: {}", s["daemon"]);
         std::thread::sleep(Duration::from_millis(2));
     }
-    // Queries about other files are answered from the current snapshot without waiting.
+}
+
+/// While a long pass runs, queries wait at most `max_wait_ms`, then answer
+/// from the current snapshot marked stale, with the pending path.
+#[test]
+fn concurrent_queries_during_rebuild() {
+    let repo = chain();
+    let d = Daemon::start(&repo.root);
+    d.call("stats", json!({"sync": true}));
+    d.delay.store(800, Ordering::SeqCst);
+    repo.write("app/d.txt", "use lib/a.txt\n");
+    wait_indexing(&d);
     let started = Instant::now();
     let handles: Vec<_> = (0..8)
         .map(|_| {
@@ -148,23 +155,174 @@ fn concurrent_queries_during_rebuild() {
             std::thread::spawn(move || {
                 let mut c = ripple_cli::client::Client::connect(&p).unwrap();
                 let mut worst = Duration::ZERO;
+                let mut stale = 0;
                 for _ in 0..25 {
                     let t = Instant::now();
-                    let r = c.call("impact", &json!({"files": ["lib/b.txt"]})).unwrap();
+                    let r = c.call("impact", &json!({"files": ["lib/b.txt"], "max_wait_ms": 20})).unwrap();
                     assert!(r.result.is_ok());
+                    if r.fresh.stale {
+                        assert!(r.fresh.pending.contains(&"app/d.txt".to_string()), "{:?}", r.fresh);
+                        stale += 1;
+                    }
                     worst = worst.max(t.elapsed());
                 }
-                worst
+                (worst, stale)
             })
         })
         .collect();
-    let worst = handles.into_iter().map(|h| h.join().unwrap()).max().unwrap();
+    let results: Vec<(Duration, usize)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let worst = results.iter().map(|r| r.0).max().unwrap();
+    assert!(results.iter().map(|r| r.1).sum::<usize>() > 0, "no query saw the pass in progress");
     assert!(worst < Duration::from_millis(300), "a query blocked for {worst:?} during a rebuild");
     let fast = started.elapsed();
-    // A query naming the file being indexed waits for it and sees the change.
-    let (r, _) = d.call("dependencies", json!({"file": "app/d.txt"}));
+    // A synced query waits for the pass and sees the change.
+    let (r, reply) = d.call_full("dependencies", json!({"file": "app/d.txt", "sync": true}));
     assert_eq!(files_of(&r), vec!["lib/a.txt"]);
+    assert!(!reply.fresh.stale && reply.fresh.synced, "{:?}", reply.fresh);
     eprintln!("200 queries during an 800ms rebuild: {fast:?} total, worst {worst:?}");
+    d.delay.store(0, Ordering::SeqCst);
+}
+
+/// Regression (the stale answers of `freshness_loop_sync_unnamed`): a `sync`
+/// query used to be answered from the old snapshot when a pass was already
+/// running and none of the request's own files were pending, even though the
+/// running pass held the (unnamed) edit the answer depends on. Under load the
+/// 30 ms debounce expired before the request arrived, so the pass had started.
+#[test]
+fn sync_waits_for_running_pass_on_unnamed_file() {
+    let repo = Repo::new(&[("t/a.txt", ""), ("t/b.txt", "")]);
+    let d = Daemon::start(&repo.root);
+    d.call("stats", json!({"sync": true}));
+    d.delay.store(400, Ordering::SeqCst);
+    repo.write("t/b.txt", "use t/a.txt\n");
+    wait_indexing(&d);
+    let (v, reply) = d.call_full("dependents", json!({"file": "t/a.txt", "sync": true}));
+    assert_eq!(v["count"], 1, "a sync answer missed an edit made before it");
+    assert!(!reply.fresh.stale);
+    d.delay.store(0, Ordering::SeqCst);
+}
+
+/// Default policy: wait up to `max_wait_ms`, then answer stale with the
+/// pending paths; `sync` waits for them; `no_wait` does not wait at all.
+#[test]
+fn bounded_wait_stale_flag_sync_and_no_wait() {
+    let repo = chain();
+    let d = Daemon::start(&repo.root);
+    d.call("stats", json!({"sync": true}));
+    d.delay.store(700, Ordering::SeqCst);
+    repo.write("app/d.txt", "use lib/a.txt\n");
+    repo.write("lib/new.txt", "use lib/a.txt\n");
+    // Bounded: the edit was made before the request, so it is either in the
+    // answer or listed as pending.
+    let t = Instant::now();
+    let (v, reply) = d.call_full("dependents", json!({"file": "lib/a.txt", "max_wait_ms": 50}));
+    let took = t.elapsed();
+    assert!(took < Duration::from_millis(600), "bounded wait took {took:?}");
+    assert!(reply.fresh.stale, "{:?}", reply.fresh);
+    assert!(reply.fresh.synced);
+    assert_eq!(reply.fresh.pending, vec!["app/d.txt", "lib/new.txt"], "{:?}", reply.fresh);
+    assert_eq!(reply.fresh.pending_count, 2);
+    assert_eq!(files_of(&v), vec!["lib/b.txt", "spec/a_spec.txt"], "answered from the previous snapshot");
+    // no_wait: answers at once, also stale.
+    let t = Instant::now();
+    let (_, reply) = d.call_full("dependents", json!({"file": "lib/a.txt", "no_wait": true}));
+    assert!(t.elapsed() < Duration::from_millis(300), "{:?}", t.elapsed());
+    assert!(reply.fresh.stale && !reply.fresh.synced, "{:?}", reply.fresh);
+    // sync: waits, fresh, sees both edits.
+    let (v, reply) = d.call_full("dependents", json!({"file": "lib/a.txt", "sync": true}));
+    assert!(!reply.fresh.stale && reply.fresh.pending.is_empty() && reply.fresh.pending_count == 0, "{:?}", reply.fresh);
+    assert_eq!(files_of(&v), vec!["app/d.txt", "lib/b.txt", "lib/new.txt", "spec/a_spec.txt"]);
+    // Impact reports the pending count in the report too.
+    d.delay.store(0, Ordering::SeqCst);
+    let (r, reply) = d.call_full("impact", json!({"files": ["lib/a.txt"]}));
+    assert!(!reply.fresh.stale);
+    assert_eq!(r["index"]["pending_changes"], 0);
+    // A stale answer is never given when the index has caught up in time.
+    repo.write("app/d.txt", "nothing\n");
+    let (v, reply) = d.call_full("dependents", json!({"file": "lib/a.txt", "max_wait_ms": 5000}));
+    assert!(!reply.fresh.stale);
+    assert_eq!(files_of(&v), vec!["lib/b.txt", "lib/new.txt", "spec/a_spec.txt"]);
+}
+
+/// A stale `impact` does not map hunks of a pending file (new contents) onto
+/// method ranges indexed from its old contents: the file counts as wholly
+/// changed. Once indexed, the hunks map onto the new ranges.
+#[test]
+fn stale_impact_treats_pending_changed_file_as_whole() {
+    let repo = Repo::new(&[("lib/m.txt", "def foo\nx\nend\ndef bar\ny\nend\n"), ("lib/u.txt", "use lib/m.txt\n")]);
+    let d = Daemon::start(&repo.root);
+    d.call("stats", json!({"sync": true}));
+    let changed = json!([{"path": "lib/m.txt", "status": "modified", "hunks": [{"start": 5, "count": 1}]}]);
+    let (r, reply) = d.call_full("impact", json!({"changed": changed}));
+    assert!(!reply.fresh.stale);
+    assert_eq!(r["changed"][0]["scopes"], json!(["bar"]), "{}", r["changed"]);
+    // Insert a method on top: line 5 is now inside `foo2`... but the index still has the old ranges.
+    d.delay.store(600, Ordering::SeqCst);
+    repo.write("lib/m.txt", "def foo2\na\nend\ndef foo\nx\nend\ndef bar\ny\nend\n");
+    let (r, reply) = d.call_full("impact", json!({"changed": changed, "max_wait_ms": 30}));
+    assert!(reply.fresh.stale && reply.fresh.pending.contains(&"lib/m.txt".to_string()), "{:?}", reply.fresh);
+    assert!(r["changed"][0].get("scopes").is_none_or(|s| s.is_null()), "stale hunks mapped onto old ranges: {}", r["changed"]);
+    assert_eq!(r["index"]["pending_changes"], 1);
+    let (r, reply) = d.call_full("impact", json!({"changed": changed, "sync": true}));
+    assert!(!reply.fresh.stale);
+    assert_eq!(r["changed"][0]["scopes"], json!(["foo"]), "{}", r["changed"]);
+    d.delay.store(0, Ordering::SeqCst);
+}
+
+/// Many edits while a pass runs are indexed together in the next pass,
+/// not one pass each.
+#[test]
+fn edits_coalesce_into_one_pass() {
+    let repo = chain();
+    let d = Daemon::start(&repo.root);
+    d.call("stats", json!({"sync": true}));
+    let passes = |d: &Daemon| d.call("stats", json!(null)).0["daemon"]["indexer"]["passes"].as_u64().unwrap();
+    let p0 = passes(&d);
+    d.delay.store(300, Ordering::SeqCst);
+    repo.write("app/d.txt", "use lib/a.txt\n");
+    wait_indexing(&d);
+    // 4 "agents" x 10 edits each, while the pass runs; every edit followed by a query.
+    let handles: Vec<_> = (0..4)
+        .map(|k| {
+            let root = repo.root.clone();
+            let p = d.paths.clone();
+            std::thread::spawn(move || {
+                let mut c = ripple_cli::client::Client::connect(&p).unwrap();
+                for i in 0..10 {
+                    let f = format!("gen/f{k}_{i}.txt");
+                    std::fs::create_dir_all(root.join("gen")).unwrap();
+                    std::fs::write(root.join(&f), "use lib/a.txt\n").unwrap();
+                    assert!(c.call("dependents", &json!({"file": "lib/a.txt", "no_wait": true})).unwrap().result.is_ok());
+                }
+            })
+        })
+        .collect();
+    handles.into_iter().for_each(|h| h.join().unwrap());
+    let (v, _) = d.call("dependents", json!({"file": "lib/a.txt", "sync": true}));
+    assert_eq!(v["count"], 43, "{v}");
+    let n = passes(&d) - p0;
+    // The pass for d.txt, then one (rarely two, if it starts between edits) for the 40 files.
+    assert!(n <= 3, "{n} passes for 41 edits");
+    d.delay.store(0, Ordering::SeqCst);
+}
+
+/// `stats` never waits for the index, and reports the cookie round trips.
+#[test]
+fn stats_never_waits_and_reports_sync_latency() {
+    let repo = chain();
+    let d = Daemon::start(&repo.root);
+    for _ in 0..20 {
+        d.call("impact", json!({"files": ["lib/a.txt"]}));
+    }
+    d.delay.store(1000, Ordering::SeqCst);
+    repo.write("app/d.txt", "use lib/a.txt\n");
+    d.call("impact", json!({"files": ["lib/a.txt"], "no_wait": true}));
+    let t = Instant::now();
+    let (s, _) = d.call("stats", json!(null));
+    assert!(t.elapsed() < Duration::from_millis(500), "stats waited {:?}", t.elapsed());
+    let f = &s["daemon"]["freshness"];
+    assert!(f["cookies"].as_u64().unwrap() >= 20, "{f}");
+    eprintln!("cookie round trip: p50 {} us, p99 {} us", f["cookie_p50_us"], f["cookie_p99_us"]);
     d.delay.store(0, Ordering::SeqCst);
 }
 
