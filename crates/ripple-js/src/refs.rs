@@ -42,4 +42,10 @@ pub struct Parsed {
     pub error: Option<String>,
     /// The file could not be read at all (then `error` holds the I/O message).
     pub unreadable: bool,
+    /// Size and complexity; meaningful only when `has_metrics` (not an
+    /// `Option`, which would cost 8 more bytes per cached file).
+    pub metrics: ripple_core::FileMetrics,
+    /// `metrics` was computed: false when the file could not be read or the
+    /// parser panicked.
+    pub has_metrics: bool,
 }

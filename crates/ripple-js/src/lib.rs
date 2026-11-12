@@ -111,8 +111,12 @@ fn parse_file(root: &Path, rel: &str, cfg: &CallSiteConfig) -> Parsed {
 fn parse_text(rel: &str, text: &str, cfg: &CallSiteConfig) -> Parsed {
     let mut collected = parse::Collected::default();
     let mut error = None;
+    // `.vue`: code lines of the script blocks plus non-blank lines elsewhere.
+    let mut lines = 0u32;
     if rel.ends_with(".vue") {
+        lines = ripple_core::metrics::nonblank_lines(text.as_bytes());
         for block in vue::script_blocks(text) {
+            lines -= ripple_core::metrics::nonblank_lines(block.content.as_bytes()).min(lines);
             if let Some(src) = &block.src {
                 collected.refs.push(Ref { line: block.line_offset + 1, kind: RefKind::Import { specifier: src.clone(), dynamic: false, type_only: false } });
             }
@@ -122,7 +126,8 @@ fn parse_text(rel: &str, text: &str, cfg: &CallSiteConfig) -> Parsed {
     } else if let Some(st) = parse::source_type_for(rel) {
         error = parse::parse_block(text, st, 0, rel, cfg, &mut collected);
     }
-    Parsed { hash: 0, refs: collected.refs, calls: collected.calls, unclassified: collected.unclassified, error, unreadable: false }
+    let metrics = collected.complexity.file(lines + collected.lines);
+    Parsed { hash: 0, refs: collected.refs, calls: collected.calls, unclassified: collected.unclassified, error, unreadable: false, metrics, has_metrics: true }
 }
 
 impl State {
@@ -167,6 +172,10 @@ impl State {
         put("js_workspace_resolved", counts.workspace_resolved);
         put("js_globs", counts.globs);
         put("js_glob_matches", counts.glob_matches);
+        let t = Instant::now();
+        let table = ripple_core::MetricsTable::build(self.parsed.iter().filter(|(_, p)| p.has_metrics).map(|(f, p)| (f.as_str(), p.metrics, &[][..])), false);
+        out.facts.metrics.push(Arc::new(table));
+        put("js_us_metrics", micros(t) as u64);
         put("js_call_sites", out.facts.js_call_sites.len() as u64);
         put("js_call_sites_link", out.facts.js_call_sites.iter().filter(|c| c.link).count() as u64);
         put("js_call_sites_unclassified", unclassified);
@@ -326,4 +335,67 @@ impl Extractor for JsExtractor {
 fn resolve_all(pool: &rayon::ThreadPool, resolver: &ModuleResolver, parsed: &BTreeMap<String, Parsed>) -> BTreeMap<String, edges::FileResult> {
     let entries: Vec<(&String, &Parsed)> = parsed.iter().collect();
     pool.install(|| entries.par_iter().map(|(f, p)| ((*f).clone(), edges::file_result(resolver, f, p))).collect::<Vec<_>>()).into_iter().collect()
+}
+
+/// Debugging aid: `(start line, complexity)` of every function in `src`
+/// (parsed as `rel`), sorted, as counted for [`ripple_core::metrics`].
+#[doc(hidden)]
+pub fn function_complexities(rel: &str, src: &str) -> Vec<(u32, u32)> {
+    let cfg = CallSiteConfig { callees: Vec::new(), prefixes: Vec::new() };
+    let mut out = parse::Collected { trace: Some(Vec::new()), ..parse::Collected::default() };
+    if let Some(st) = parse::source_type_for(rel) {
+        parse::parse_block(src, st, 0, rel, &cfg, &mut out);
+    }
+    let mut v = out.trace.unwrap_or_default();
+    v.sort_unstable();
+    v
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use ripple_core::FileMetrics;
+
+    fn metrics(rel: &str, src: &str) -> FileMetrics {
+        let cfg = CallSiteConfig { callees: Vec::new(), prefixes: Vec::new() };
+        let p = parse_text(rel, src, &cfg);
+        assert!(p.has_metrics);
+        p.metrics
+    }
+
+    /// One function per case; expected values worked out by hand from
+    /// ESLint's `complexity` rule (classic): 1 + if / ?: / case-with-test /
+    /// for / for-in / for-of / while / do-while / catch / && / || / ?? /
+    /// logical assignment / optional member or call / default value.
+    #[test]
+    fn complexity_per_function_matches_eslint_rules() {
+        let cases: &[(&str, u32)] = &[
+            ("function a() { return 1; }", 1),
+            ("function b(x) { if (x) { return 1 } else if (y) { return 2 } else { return 3 } }", 3),
+            ("function c(a, b = 1) { return a ? b : 0 }", 3),
+            ("function d(x) { switch (x) { case 1: return a; case 2: case 3: return b; default: return c } }", 4),
+            ("function e() { return (a && b) || (c ?? d) }", 4),
+            ("function f() { x ||= 1; y &&= 2; z ??= 3; w += 1 }", 4),
+            ("function g(u) { return u?.name?.toUpperCase?.() }", 4),
+            ("function h(xs) { for (const x of xs) {} for (const k in o) {} for (let i = 0; i < 1; i++) {} while (a) {} do {} while (b) }", 6),
+            ("function i() { try { a() } catch (e) { b() } finally { c() } }", 2),
+            ("function j({ a = 1, b } = {}, [c = 2] = []) { ({ p = 1 } = q); [r = 2] = s; }", 7),
+            ("const k = async (x: number): Promise<number> => x > 1 ? await f(x) : 0;", 2),
+        ];
+        for (src, want) in cases {
+            let m = metrics("a.ts", src);
+            assert_eq!((m.complexity, m.methods, u32::from(m.max_method)), (*want, 1, *want), "{src}");
+        }
+    }
+
+    #[test]
+    fn nested_functions_top_level_and_lines() {
+        let src = "// header\nconst v = a || b;\n\nfunction k() {\n  /* inner\n     comment */\n  const f = (x) => x ? 1 : 2;\n  return f(1) || 0;\n}\nclass A {\n  m(x) { if (x) {} }\n  get g() { return this.a ?? 1 }\n}\n";
+        // k: 2, arrow: 2, m: 2, g: 2, plus `||` at top level.
+        assert_eq!(metrics("a.js", src), FileMetrics { lines: 9, complexity: 9, methods: 4, max_method: 2 });
+        let jsx = "export const C = ({ items }) => (\n  <ul>{items.map((i) => i.ok && <li key={i.id}>{i.name}</li>)}</ul>\n);\n";
+        assert_eq!(metrics("c.jsx", jsx), FileMetrics { lines: 3, complexity: 3, methods: 2, max_method: 2 });
+        let vue = "<template>\n  <div>\n\n  </div>\n</template>\n<script>\n// c\nexport default { m(x) { return x || 1 } }\n</script>\n";
+        assert_eq!(metrics("a.vue", vue), FileMetrics { lines: 7, complexity: 2, methods: 1, max_method: 2 });
+    }
 }

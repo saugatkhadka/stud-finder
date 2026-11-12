@@ -9,6 +9,7 @@ use crate::rails::{self, RubyFacts};
 use crate::methods::{self, MethodFacts};
 use crate::templates::{self, TemplateFacts};
 use ripple_core::Warning;
+use ripple_core::metrics::{self as cx, FileMetrics};
 use rubydex::diagnostic::Rule;
 use rubydex::indexing::local_graph::LocalGraph;
 use rubydex::indexing::{IndexerBackend, LanguageId, build_local_graph};
@@ -132,16 +133,22 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             // One prism parse for the Rails DSL facts, actions and methods.
             match catch_unwind(AssertUnwindSafe(|| {
                 if !method_level {
-                    return (rails::collect(&source, want), MethodFacts::default());
+                    return (rails::collect(&source, want), MethodFacts::default(), 0);
                 }
                 let result = ruby_prism::parse(source.as_bytes());
                 let root = result.node();
-                (rails::collect_root(&root, &source, want), methods::collect(&root, source.as_bytes(), controller))
+                let comments: Vec<(u32, u32)> = result.comments().map(|c| {
+                    let l = c.location();
+                    (l.start(), l.end())
+                }).collect();
+                let lines = cx::code_lines(source.as_bytes(), &comments);
+                (rails::collect_root(&root, &source, want), methods::collect(&root, source.as_bytes(), controller), lines)
             })) {
-                Ok((f, mut m)) => {
+                Ok((f, mut m, lines)) => {
                     entry.facts = f;
                     if method_level {
                         entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
+                        m.lines = lines;
                     }
                     entry.methods = m;
                 }
@@ -167,6 +174,7 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
             if method_level {
                 let mut m = methods::from_template(&entry.template);
                 entry.mentions = Some(std::sync::Arc::new(std::mem::take(&mut m.mentions)));
+                m.lines = cx::nonblank_lines(source.as_bytes());
                 entry.methods = m;
             }
         }
@@ -175,6 +183,26 @@ pub fn analyse(root: &Path, rel: &str, kind: SourceKind, extra_roots: &[String],
         path: rel.to_string(),
         entry,
         local_graph,
+    }
+}
+
+/// A Ruby file's metrics from its code lines and method facts.
+impl FileEntry {
+    /// Size and complexity; `None` when method facts were not computed
+    /// (`ruby.method_level` off, or the prism pass failed), which is exactly
+    /// when `mentions` is `None`. Templates have no defs: lines only.
+    pub fn metrics(&self) -> Option<FileMetrics> {
+        self.mentions.is_some().then(|| file_metrics(&self.methods))
+    }
+}
+
+fn file_metrics(m: &MethodFacts) -> FileMetrics {
+    let defs = m.defs.iter().map(|d| u32::from(d.complexity));
+    FileMetrics {
+        lines: m.lines,
+        complexity: m.top_decisions + defs.clone().sum::<u32>(),
+        methods: cx::sat16(m.defs.len() as u32),
+        max_method: cx::sat16(defs.max().unwrap_or(0)),
     }
 }
 

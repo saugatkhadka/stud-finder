@@ -448,6 +448,8 @@ impl Engine {
         if let Some(m) = self.outputs.iter().find_map(|o| o.facts.mentions.as_ref()) {
             graph.set_mentions(m);
         }
+        // Size/complexity tables (shared Arcs): `snap.graph.metrics(node)`.
+        graph.set_metrics(self.outputs.iter().flat_map(|o| o.facts.metrics.iter().cloned()));
         timings.insert("graph_us".into(), us(t));
         let t = Instant::now();
         let index = PolicyIndex::build(&self.policy, &graph);

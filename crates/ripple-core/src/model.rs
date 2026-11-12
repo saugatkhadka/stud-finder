@@ -180,6 +180,11 @@ pub struct Facts {
     /// serialised.
     #[serde(skip)]
     pub mentions: Option<std::sync::Arc<crate::mentions::MentionTable>>,
+    /// Size and complexity per file (and per method where known), one table
+    /// per extractor that reports them (see [`crate::metrics`]). Shared, not
+    /// serialised.
+    #[serde(skip)]
+    pub metrics: Vec<std::sync::Arc<crate::metrics::MetricsTable>>,
 }
 
 impl Facts {
@@ -190,6 +195,7 @@ impl Facts {
         if other.mentions.is_some() {
             self.mentions = other.mentions;
         }
+        self.metrics.extend(other.metrics);
     }
 }
 
