@@ -392,7 +392,7 @@ fn wrong_case_name_is_not_a_new_file() {
 fn idle_daemon(repo: &Repo, sock: &std::path::Path, timeout: Duration) -> (ripple_cli::paths::DaemonPaths, std::thread::JoinHandle<anyhow::Result<()>>) {
     let paths = paths_in(sock, &repo.root);
     let (r, p) = (repo.root.clone(), paths.clone());
-    let opts = ripple_cli::server::ServeOptions { signals: false, idle_timeout: Some(timeout) };
+    let opts = ripple_cli::server::ServeOptions { signals: false, idle_timeout: Some(timeout), ..Default::default() };
     let t = std::thread::spawn(move || ripple_cli::server::serve(&r, pipeline(Arc::new(AtomicU64::new(0))), p, opts));
     ripple_cli::client::wait_for_daemon(&paths, Duration::from_secs(10)).expect("daemon up");
     (paths, t)

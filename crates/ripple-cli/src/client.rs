@@ -25,6 +25,9 @@ pub struct Reply {
     /// [`crate::protocol`]). In-process answers are always fresh.
     pub fresh: Freshness,
     pub result: Result<String, ErrorBody>,
+    /// Git-history signals of an `impact` answer (see [`crate::historyd`]);
+    /// `None` for other methods and daemons that predate it.
+    pub history: Option<crate::historyd::HistoryInfo>,
 }
 
 pub struct Client {
@@ -62,7 +65,8 @@ impl Client {
             Err(resp.error.unwrap_or_else(|| ErrorBody::new("unknown", "error without details")))
         };
         let fresh = Freshness { stale: resp.stale, synced: resp.synced.unwrap_or(false), pending: resp.pending, pending_count: resp.pending_count };
-        Ok(Reply { protocol: resp.protocol, generation: resp.generation, server_us: resp.server_us, fresh, result })
+        let history = resp.history.and_then(|h| serde_json::from_str(h.get()).ok());
+        Ok(Reply { protocol: resp.protocol, generation: resp.generation, server_us: resp.server_us, fresh, result, history })
     }
 }
 
@@ -196,6 +200,7 @@ impl Backend {
             },
             Backend::Local(snap) => {
                 let root = snap.root.clone();
+                let mut history = None;
                 let (result, us) = query::timed(|| match method {
                     "impact" => serde_json::from_value::<ImpactParams>(params.clone())
                         .map_err(|e| ErrorBody::new("bad_params", e.to_string()))
@@ -204,14 +209,25 @@ impl Backend {
                             if let Some(d) = p.diff.take() {
                                 p.changed = crate::git::changed_files(&root, &d.spec()).map_err(|e| ErrorBody::new("git_failed", format!("{e:#}")))?;
                             }
-                            query::impact_result(snap, &p, 0, 0)
+                            let out = query::impact_result(snap, &p, 0, 0)?;
+                            // The sidecar only: one-shot mode never builds history.
+                            let mut changed: Vec<String> = p.changed.iter().map(|c| query::clean(&c.path)).chain(p.files.iter().map(|f| query::clean(f))).collect();
+                            changed.sort_unstable();
+                            changed.dedup();
+                            let view = crate::historyd::oneshot_view(&root, &snap.policy.config);
+                            history = Some(crate::historyd::impact_history(&view, snap, &changed));
+                            Ok(out)
                         }),
-                    "stats" => Ok(query::stats(snap).to_string()),
+                    "stats" => {
+                        let mut v = query::stats(snap);
+                        v["history"] = crate::historyd::oneshot_view(&root, &snap.policy.config).stats_json();
+                        Ok(v.to_string())
+                    }
                     "reload" | "shutdown" => Err(ErrorBody::new("no_daemon", "no daemon is running")),
                     m => query::execute(snap, m, params, 0),
                 });
                 let fresh = Freshness { synced: true, ..Freshness::default() };
-                Ok(Reply { protocol: PROTOCOL, generation: snap.generation, server_us: us, fresh, result })
+                Ok(Reply { protocol: PROTOCOL, generation: snap.generation, server_us: us, fresh, result, history })
             }
         }
     }

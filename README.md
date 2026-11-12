@@ -60,6 +60,7 @@ it. For CI, see [`examples/github-workflow.yml`](examples/github-workflow.yml).
 | `stats` | Index size, scope ranges (`files_with_scopes`, `scopes`), per-phase timings, extractor counters, warnings, daemon info. |
 | `init [--force]`, `config check` | Starter config; validation plus how many files each area matches. |
 | `daemon status\|start\|stop`, `serve [--foreground]` | Manage the daemon. |
+| `history build`, `history status` | Build or update the git-history sidecar now (one-shot mode only reads it); show its state, size, and whether co-change is on. See [Git history in the daemon](#git-history-in-the-daemon). |
 
 Global flags: `--root DIR` (or `RIPPLE_ROOT`; default is the enclosing git
 work tree) and `--no-daemon` (index in this process).
@@ -476,6 +477,59 @@ Warning codes include:
   addition. Both paths are seeds, and `touches` matches either one.
 - **Case-insensitive file systems** (macOS): a wrongly-cased name never
   becomes a second workspace file.
+
+### Git history in the daemon
+
+Churn ("how often, and how recently, did this file change") and co-change
+("usually changes with") come from `git log`, which takes from a fraction of
+a second to over ten seconds on a large repository. The daemon therefore
+loads them on a background thread. It runs at low priority (macOS QoS
+utility, `nice 10` on Linux, and `nice 10` for the `git` it starts) and
+never blocks a query. Until it is done, impact
+replies say `"state": "building"` and carry no history data.
+
+- **States.** `disabled` (`history.enabled: false`: no thread, no file),
+  `building`, `ready`, `unavailable` (not a git repository, no commits,
+  shallow clone, or git failed; the reason is given). Churn and co-change
+  are flagged separately (`churn_available`, `cochange` +
+  `cochange_reason`).
+- **Sidecar.** `<git common dir>/ripple/history.bin`, shared by linked
+  worktrees and written atomically (temporary file + rename). A daemon
+  starts from it at once. If it is behind HEAD, it is updated
+  incrementally (only the new commits are read) when the old head is an
+  ancestor, and rebuilt otherwise. An unreadable or corrupt file is
+  rebuilt.
+- **Updates.** HEAD moves are taken from the existing watcher (`HEAD`,
+  `refs/heads/*` and `packed-refs`) and from the diff cache's HEAD check.
+  They are debounced (500 ms), and deferred while a rebase, cherry-pick or
+  revert is in progress (up to 60 s). The answer in use stays until the new
+  one is ready (`updating: true` meanwhile). A newer HEAD move cancels an
+  update that is still running.
+- **Auto-off.** Co-change is switched off when the history is too short
+  (fewer than 300 commits below the sweep cap) or mostly sweeps (more than
+  25% of commits touch over `max_files_per_commit` files). In the `ripple-eval`
+  replay, a sweep-heavy history (GitLab, 41% sweeps) added about twice as
+  many wrong partners per right one as Mastodon (3% sweeps). Churn stays on.
+- **One-shot mode** (`--no-daemon`, CI) only reads the sidecar, even when it
+  is behind HEAD (`behind_head: true`), and never runs `git log`. Run
+  `ripple history build` to create or update it.
+
+Impact replies carry the result next to `result` (an additive field; old
+clients ignore it):
+
+```
+"history": {"state": "ready", "head": "…", "commits": 20000, "churn_available": true, "cochange": true,
+  "recent_days": 90,
+  "churn": {"app/models/user.rb": {"commits": 412, "recent_commits": 9, "last_changed": 1794400000}},
+  "usually_changes_with": [{"path": "spec/models/user_spec.rb", "via": "app/models/user.rb",
+    "together": 120, "of": 412, "score": 0.29, "lift": 6.1, "last_together": 1794400000, "seeds": 1}],
+  "lookup_us": 3}
+```
+
+`churn` lists every changed file. `usually_changes_with` leaves out the diff
+itself and the files directly connected to it in the graph, which the report
+already shows. `stats` has a `history` object with the state, build timings,
+sidecar size, memory and counters.
 
 ### Protocol
 

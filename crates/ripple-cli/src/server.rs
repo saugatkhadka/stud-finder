@@ -35,8 +35,9 @@
 
 use crate::engine::{Engine, Pipeline, Snapshot};
 use crate::gitd::GitTracker;
+use crate::historyd::{self, HistoryD};
 use crate::paths::DaemonPaths;
-use crate::protocol::{ErrorBody, FileParams, Freshness, ImpactParams, MAX_PENDING_LISTED, Request, WaitMode, WhyParams, err_line, ok_line, ok_line_fresh};
+use crate::protocol::{ErrorBody, FileParams, Freshness, ImpactParams, MAX_PENDING_LISTED, Request, WaitMode, WhyParams, err_line, ok_line, ok_line_fresh, ok_line_history};
 use crate::query;
 use anyhow::{Context, Result, bail};
 use ripple_core::RelPath;
@@ -146,6 +147,8 @@ pub struct Shared {
     cookie_stem: String,
     requests: AtomicU64,
     git: GitTracker,
+    /// Git-history signals, built in the background (see [`crate::historyd`]).
+    history: Arc<HistoryD>,
     /// Milliseconds after `started` of the last request.
     last_request_ms: AtomicU64,
     in_flight: AtomicUsize,
@@ -207,6 +210,8 @@ pub struct ServeOptions {
     pub signals: bool,
     /// Overrides `daemon.idle_timeout_minutes` (tests). `Some(ZERO)` = never.
     pub idle_timeout: Option<Duration>,
+    /// Holds every git-history build / update this long (tests).
+    pub history_hold: Duration,
 }
 
 /// Runs the daemon until a `shutdown` request. Fails fast if another daemon
@@ -232,6 +237,7 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     lock.set_len(0)?;
     (&lock).write_all(format!("{}\n", std::process::id()).as_bytes())?;
 
+    let history = HistoryD::start_with_hold(root, &ripple_policy::load_config(root).map(|l| l.config).unwrap_or_default(), opts.history_hold);
     let cookie_dir = if root.join(".git").is_dir() { root.join(".git") } else { root.to_path_buf() };
     let cookie_stem = format!("{COOKIE_PREFIX}{}-{}-", std::process::id(), DAEMON_SEQ.fetch_add(1, Ordering::Relaxed));
     let shared = Arc::new(Shared {
@@ -246,6 +252,7 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
         cookie_stem,
         requests: AtomicU64::new(0),
         git: GitTracker::new(root),
+        history,
         last_request_ms: AtomicU64::new(0),
         in_flight: AtomicUsize::new(0),
         conns: Mutex::new(0),
@@ -253,6 +260,10 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
         idle_timeout: opts.idle_timeout,
     });
 
+    {
+        let h = shared.history.clone();
+        shared.git.on_head_move(move || h.nudge());
+    }
     let _watcher = start_watcher(&shared).map_err(|e| eprintln!("ripple: file watching unavailable ({e:#}); only re-stat freshness applies")).ok();
     // Git results are only cached while the watcher reports changes.
     // (Also: whether there is a watcher to sync with.)
@@ -309,6 +320,8 @@ pub fn serve(root: &Path, pipeline: Pipeline, paths: DaemonPaths, opts: ServeOpt
     }
     let _ = std::fs::remove_file(&paths.socket);
     drop(lock);
+    // A running history build is cancelled between commits; wait for it.
+    shared.history.join();
     Ok(())
 }
 
@@ -351,12 +364,21 @@ fn start_watcher(shared: &Arc<Shared>) -> Result<notify::RecommendedWatcher> {
             }
             let rels = ev.paths.iter().filter_map(|p| relative(&roots, p)).filter(|r| !r.is_empty());
             // Cookies are passed on as bare names; only those a request waits for count.
+            // Git's own files are dropped, but HEAD / branch moves feed the history thread.
+            let mut head_moved = false;
             let rels: Vec<RelPath> = rels
                 .filter_map(|r| match r.rsplit('/').next() {
                     Some(name) if name.starts_with(COOKIE_PREFIX) => Some(name.to_string()),
-                    _ => (r != ".git" && !r.starts_with(".git/")).then_some(r),
+                    _ => {
+                        let git = r == ".git" || r.starts_with(".git/");
+                        head_moved |= git && historyd::is_head_event(&r);
+                        (!git).then_some(r)
+                    }
                 })
                 .collect();
+            if head_moved {
+                s.history.nudge();
+            }
             if debug {
                 eprintln!("ripple: event {:?} {:?} -> {rels:?}", ev.kind, ev.paths);
             }
@@ -668,6 +690,7 @@ fn idle_timer(shared: Arc<Shared>) {
 
 /// Marks the daemon as stopping and wakes the accept loop so it exits.
 fn begin_shutdown(shared: &Shared) {
+    shared.history.shutdown();
     let mut st = shared.lock();
     st.shutdown = true;
     shared.cv.notify_all();
@@ -728,6 +751,14 @@ fn whole_file_if_pending(p: &mut ImpactParams, pending: &BTreeSet<RelPath>) {
     }
 }
 
+/// The changed paths of an impact request (after `diff` was resolved).
+fn changed_paths(p: &ImpactParams) -> Vec<String> {
+    let mut v: Vec<String> = p.changed.iter().map(|c| query::clean(&c.path)).chain(p.files.iter().map(|f| query::clean(f))).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
     shared.requests.fetch_add(1, Ordering::Relaxed);
     let req: Request = match serde_json::from_str(line) {
@@ -735,6 +766,8 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
         Err(e) => return err_line(&Value::Null, shared.generation(), 0, &ErrorBody::new("bad_request", format!("invalid request JSON: {e}"))),
     };
     let default_wait = || shared.max_wait_ms();
+    // The `history` object of an impact reply (see [`crate::historyd`]).
+    let mut history: Option<String> = None;
     let result: Result<(String, u64, Option<Freshness>), ErrorBody> = (|| match req.method.as_str() {
         "impact" => {
             let mut p: ImpactParams = params(&req.params)?;
@@ -761,7 +794,10 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
             }
             let f = refresh(shared, &p.named_files(), mode, synced)?;
             whole_file_if_pending(&mut p, &f.pending);
-            Ok((query::impact_result(&f.snap, &p, f.info.pending_count, f.refresh_us)?, f.snap.generation, Some(f.info)))
+            let body = query::impact_result(&f.snap, &p, f.info.pending_count, f.refresh_us)?;
+            let changed = changed_paths(&p);
+            history = serde_json::to_string(&historyd::impact_history(&shared.history.view(), &f.snap, &changed)).ok();
+            Ok((body, f.snap.generation, Some(f.info)))
         }
         "dependents" | "dependencies" | "areas" => {
             let p: FileParams = params(&req.params)?;
@@ -780,6 +816,7 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
             let sync = req.params.get("sync").and_then(Value::as_bool).unwrap_or(false);
             let f = refresh(shared, &[], if sync { WaitMode::Full } else { WaitMode::NoWait }, None)?;
             let mut v = query::stats(&f.snap);
+            v["history"] = shared.history.stats_json();
             let st = shared.lock();
             let c = &st.counters;
             v["daemon"] = json!({
@@ -826,6 +863,9 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
             shared.cv.notify_all();
             let st = wait_for(shared, st, |s| s.reload_done >= want)?;
             drop(st);
+            if let Some(s) = shared.current() {
+                shared.history.configure(s.policy.config.history.enabled);
+            }
             let g = shared.generation();
             Ok((json!({"generation": g}).to_string(), g, None))
         }
@@ -837,7 +877,10 @@ fn handle_line(shared: &Arc<Shared>, line: &str, start: Instant) -> String {
     })();
     let us = start.elapsed().as_micros() as u64;
     match result {
-        Ok((body, generation, Some(fresh))) => ok_line_fresh(&req.id, generation, us, Some(&fresh), &body),
+        Ok((body, generation, Some(fresh))) => match &history {
+            Some(h) => ok_line_history(&req.id, generation, us, Some(&fresh), Some(h), &body),
+            None => ok_line_fresh(&req.id, generation, us, Some(&fresh), &body),
+        },
         Ok((body, generation, None)) => ok_line(&req.id, generation, us, &body),
         Err(e) => err_line(&req.id, shared.generation(), us, &e),
     }

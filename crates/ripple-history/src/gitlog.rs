@@ -40,10 +40,32 @@ impl std::fmt::Display for Cancelled {
 }
 impl std::error::Error for Cancelled {}
 
+thread_local! {
+    static LOW_PRIORITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs every `git` started from the calling thread from now on at nice 10.
+/// A thread's own priority (macOS QoS, Linux per-thread nice) is not passed
+/// on to the processes it starts, so the daemon's history thread calls this.
+pub fn lower_child_priority() {
+    LOW_PRIORITY.with(|l| l.set(true));
+}
+
 fn git_cmd(repo: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(repo).args(["-c", "core.quotepath=off", "-c", "log.showSignature=false"]);
     c.stdin(Stdio::null());
+    #[cfg(unix)]
+    if LOW_PRIORITY.with(|l| l.get()) {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setpriority is async-signal-safe and only affects the child.
+        unsafe {
+            c.pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                Ok(())
+            });
+        }
+    }
     c
 }
 
@@ -63,7 +85,7 @@ pub fn resolve_rev(repo: &Path, rev: &str) -> Result<String> {
 }
 
 /// Is `a` an ancestor of (or equal to) `b`?
-pub(crate) fn is_ancestor(repo: &Path, a: &str, b: &str) -> Result<bool> {
+pub fn is_ancestor(repo: &Path, a: &str, b: &str) -> Result<bool> {
     let st = git_cmd(repo).args(["merge-base", "--is-ancestor", a, b]).stdout(Stdio::null()).stderr(Stdio::null()).status().context("running git")?;
     match st.code() {
         Some(0) => Ok(true),
