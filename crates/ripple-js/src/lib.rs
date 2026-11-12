@@ -17,6 +17,7 @@
 //! (`index.ts` re-exporting a directory) makes every importer of the barrel
 //! depend on every re-exported file's changes. Not solved here.
 
+mod bundler;
 mod callsites;
 mod edges;
 mod linkctx;
@@ -170,6 +171,7 @@ impl State {
         put("js_edges", out.edges.len() as u64);
         put("js_workspace_packages", self.resolver.workspaces.packages.len() as u64);
         put("js_tsconfigs", self.resolver.config_count() as u64);
+        put("js_bundler_aliases", self.resolver.discovered_count() as u64);
         for (name, us) in phase_us {
             put(&format!("js_us_{name}"), *us as u64);
         }
@@ -258,13 +260,13 @@ impl Extractor for JsExtractor {
                     state.parsed.remove(r);
                     state.results.remove(r);
                 }
-                config_touched |= paths::is_config_name(r) || state.config_deps.contains(r);
+                config_touched |= paths::is_config_name(r) || bundler::is_bundler_config(r) || state.config_deps.contains(r);
             }
             for m in &changes.modified {
                 if set.insert(m) {
                     structural = true;
                 }
-                config_touched |= paths::is_config_name(m) || state.config_deps.contains(m);
+                config_touched |= paths::is_config_name(m) || bundler::is_bundler_config(m) || state.config_deps.contains(m);
                 if paths::is_code(m) {
                     to_parse.push(m);
                 }
