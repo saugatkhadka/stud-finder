@@ -5,8 +5,11 @@
 //! order, on the same connection (open several connections for parallelism).
 //!
 //! Request:  `{"id": <any>, "method": "<name>", "params": {...}}`
-//! Response: `{"id": <same>, "ok": true,  "generation": N, "server_us": N, "result": ...}`
-//!       or  `{"id": <same>, "ok": false, "generation": N, "server_us": N, "error": {"code": "...", "message": "..."}}`
+//! Response: `{"id": <same>, "ok": true,  "protocol": 2, "generation": N, "server_us": N, "result": ...}`
+//!       or  `{"id": <same>, "ok": false, "protocol": 2, "generation": N, "server_us": N, "error": {"code": "...", "message": "..."}}`
+//!
+//! `protocol` is [`PROTOCOL`]; daemons from before it existed omit it
+//! (read as 0) and ignore `impact`'s `diff` parameter.
 //!
 //! `generation` is the index generation the answer was computed from (0
 //! before the first index is ready). `server_us` is the time from reading
@@ -14,10 +17,13 @@
 //! check, the query, policy evaluation and rendering.
 //!
 //! Methods and params:
-//! * `impact {files?: [path], changed?: [ChangedFile], scopes?: [name], file_level?, max_depth?, min_confidence?, format?: json|text|markdown, color?, limit?, max_listed?, sync?}`
+//! * `impact {files?: [path], changed?: [ChangedFile], diff?: {base?: ref, staged?: bool}, scopes?: [name], file_level?, max_depth?, min_confidence?, format?: json|text|markdown, color?, limit?, max_listed?, sync?}`
 //!   → the [`ripple_policy::Report`] for `format: json` (default), else a string.
-//!   A `changed` entry may carry `hunks` (new-side `git diff -U0` hunks,
-//!   computed by the client); the daemon maps them onto the file's method
+//!   `diff` asks the daemon to find the changed files itself, exactly as
+//!   `ripple impact [--base REF | --staged]` would (`{}` = working tree vs
+//!   HEAD); it excludes `files` and `changed`, and implies `sync`.
+//!   A `changed` entry may carry `hunks` (new-side `git diff -U0` hunks);
+//!   the daemon maps them onto the file's method
 //!   scopes from its own index, so line numbers always match what it indexed.
 //!   `scopes` limits the bare `files` (exactly one) to those methods / actions.
 //!   `file_level: true` ignores every scope (seeds and edges).
@@ -39,6 +45,7 @@
 //! watcher to report it, which guarantees that *every* change made before
 //! the request (not just to the named files) is indexed.
 
+use crate::git::DiffSpec;
 use ripple_core::Confidence;
 use ripple_policy::ChangedFile;
 use serde::{Deserialize, Serialize};
@@ -74,6 +81,36 @@ pub enum Format {
     Markdown,
 }
 
+/// Version of this protocol, sent in every response.
+pub const PROTOCOL: u32 = 2;
+
+/// Which git diff an `impact` request means (see [`DiffSpec`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub staged: bool,
+}
+
+impl DiffRequest {
+    pub fn from_spec(spec: &DiffSpec) -> Self {
+        match spec {
+            DiffSpec::WorkingTree => Self::default(),
+            DiffSpec::Staged => Self { base: None, staged: true },
+            DiffSpec::Base(b) => Self { base: Some(b.clone()), staged: false },
+        }
+    }
+    pub fn spec(&self) -> DiffSpec {
+        match (&self.base, self.staged) {
+            (Some(b), _) => DiffSpec::Base(b.clone()),
+            (None, true) => DiffSpec::Staged,
+            (None, false) => DiffSpec::WorkingTree,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImpactParams {
@@ -81,6 +118,9 @@ pub struct ImpactParams {
     pub files: Vec<String>,
     /// Changed files with status / line counts / hunks.
     pub changed: Vec<ChangedFile>,
+    /// Let the daemon compute `changed` from git.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffRequest>,
     /// Only these methods / actions of the (single) file in `files` changed.
     pub scopes: Vec<String>,
     /// Ignore method / action scopes on seeds and edges.
@@ -135,14 +175,14 @@ pub fn ok_line(id: &Value, generation: u64, server_us: u64, result: &str) -> Str
     let mut s = String::with_capacity(result.len() + 96);
     s.push_str("{\"id\":");
     s.push_str(&id);
-    s.push_str(&format!(",\"ok\":true,\"generation\":{generation},\"server_us\":{server_us},\"result\":"));
+    s.push_str(&format!(",\"ok\":true,\"protocol\":{PROTOCOL},\"generation\":{generation},\"server_us\":{server_us},\"result\":"));
     s.push_str(result);
     s.push('}');
     s
 }
 
 pub fn err_line(id: &Value, generation: u64, server_us: u64, err: &ErrorBody) -> String {
-    serde_json::json!({"id": id, "ok": false, "generation": generation, "server_us": server_us, "error": err}).to_string()
+    serde_json::json!({"id": id, "ok": false, "protocol": PROTOCOL, "generation": generation, "server_us": server_us, "error": err}).to_string()
 }
 
 /// A parsed response; `result` is kept as raw JSON text so large reports are
@@ -152,6 +192,8 @@ pub struct Response<'a> {
     #[serde(default)]
     pub id: Value,
     pub ok: bool,
+    #[serde(default)]
+    pub protocol: u32,
     #[serde(default)]
     pub generation: u64,
     #[serde(default)]

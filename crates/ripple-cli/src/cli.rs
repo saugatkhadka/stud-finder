@@ -5,7 +5,7 @@ use crate::engine::Pipeline;
 use crate::files;
 use crate::git::{self, DiffSpec};
 use crate::paths::DaemonPaths;
-use crate::protocol::{Format, ImpactParams};
+use crate::protocol::{DiffRequest, Format, ImpactParams, PROTOCOL};
 use crate::server::{self, ServeOptions};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -329,7 +329,9 @@ fn print_value(raw: &str, format: OutFormat, text: fn(&Value) -> String) -> Resu
     Ok(0)
 }
 
-fn diff_params(root: &Path, d: &DiffArgs) -> Result<ImpactParams> {
+/// The changed files of a request. With a daemon, a git diff is left to
+/// the daemon (`diff`), which caches it; in-process it is computed here.
+fn diff_params(root: &Path, d: &DiffArgs, backend: &Backend) -> Result<ImpactParams> {
     let mut p = ImpactParams::default();
     let explicit: Vec<String> = d.files_csv.iter().chain(&d.files).filter(|f| !f.is_empty()).map(|f| to_rel(root, f)).collect();
     if !explicit.is_empty() {
@@ -343,13 +345,35 @@ fn diff_params(root: &Path, d: &DiffArgs) -> Result<ImpactParams> {
         if !files::in_git_repo(root) {
             bail!("not a git repository: pass the changed files explicitly (ripple impact FILE...)");
         }
-        p.changed = git::changed_files(root, &spec)?;
+        if backend.is_daemon() {
+            p.diff = Some(DiffRequest::from_spec(&spec));
+        } else {
+            p.changed = git::changed_files(root, &spec)?;
+        }
     }
     Ok(p)
 }
 
+/// Sends `impact`. A daemon older than [`PROTOCOL`] 2 ignores `diff`; then
+/// the diff is computed here and the request repeated.
+fn call_impact(root: &Path, backend: &mut Backend, p: &mut ImpactParams) -> Result<Reply> {
+    let reply = backend.call("impact", &serde_json::to_value(&*p)?)?;
+    match p.diff.take() {
+        Some(d) if reply.protocol < PROTOCOL => {
+            eprintln!("ripple: the running daemon is older than this ripple; restart it with `ripple daemon stop`");
+            p.changed = git::changed_files(root, &d.spec())?;
+            backend.call("impact", &serde_json::to_value(&*p)?)
+        }
+        Some(d) => {
+            p.diff = Some(d);
+            Ok(reply)
+        }
+        None => Ok(reply),
+    }
+}
+
 fn impact(root: &Path, a: ImpactArgs, mut backend: Backend) -> Result<u8> {
-    let mut p = diff_params(root, &a.diff)?;
+    let mut p = diff_params(root, &a.diff, &backend)?;
     if !a.scopes.is_empty() {
         if p.files.len() != 1 {
             bail!("--scope needs exactly one changed file given explicitly (ripple impact --files FILE --scope NAME)");
@@ -363,7 +387,7 @@ fn impact(root: &Path, a: ImpactArgs, mut backend: Backend) -> Result<u8> {
     p.color = a.format == Format::Text && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     p.limit = a.limit;
     p.sync = a.sync;
-    let reply = backend.call("impact", &serde_json::to_value(&p)?)?;
+    let reply = call_impact(root, &mut backend, &mut p)?;
     let out = result_of(reply)?;
     match a.format {
         Format::Json => stdout_write(&out)?,
@@ -392,14 +416,14 @@ fn check(root: &Path, a: CheckArgs, no_daemon: bool) -> Result<u8> {
         None => loaded.config.ci.fail_on,
     };
     let diff = DiffArgs { base: Some(a.base.clone()), staged: false, files_csv: Vec::new(), files: Vec::new() };
-    let mut p = diff_params(root, &diff)?;
+    // CI never autostarts a daemon, but uses one that is already running.
+    let mut backend = Backend::open(root, no_daemon, false)?;
+    let mut p = diff_params(root, &diff, &backend)?;
     p.max_depth = a.query.depth;
     p.min_confidence = a.query.min_confidence.map(Into::into);
     p.file_level = a.query.file_level;
     p.format = Format::Json;
-    // CI never autostarts a daemon, but uses one that is already running.
-    let mut backend = Backend::open(root, no_daemon, false)?;
-    let raw = result_of(backend.call("impact", &serde_json::to_value(&p)?)?)?;
+    let raw = result_of(call_impact(root, &mut backend, &mut p)?)?;
     let report: Report = serde_json::from_str(&raw).context("decoding the impact report")?;
     let max_listed = loaded.config.ci.max_listed;
 
@@ -549,7 +573,7 @@ fn daemon_cmd(root: &Path, cmd: DaemonCmd) -> Result<u8> {
 fn serve(root: &Path, foreground: bool) -> Result<u8> {
     let paths = DaemonPaths::for_root(root)?;
     if foreground {
-        server::serve(root, Pipeline::standard(), paths, ServeOptions { signals: true })?;
+        server::serve(root, Pipeline::standard(), paths, ServeOptions { signals: true, ..Default::default() })?;
         return Ok(0);
     }
     if Client::connect(&paths).is_some() {

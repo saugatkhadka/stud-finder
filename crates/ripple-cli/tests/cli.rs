@@ -498,3 +498,23 @@ fn deleted_js_file_lists_importers_in_a_cold_run() {
     assert_eq!(w.len(), 1, "{}", r["warnings"]);
     assert!(w[0]["message"].as_str().unwrap().contains("app/javascript/a.ts"), "{}", w[0]);
 }
+
+/// After a daemon exits on its idle timeout, the next command autostarts a
+/// new one; `daemon.idle_timeout_minutes` is accepted by `config check`.
+#[test]
+fn autostart_after_idle_exit() {
+    let env = billing();
+    env.repo.write("ripple.yml", &format!("{CONFIG}daemon:\n  idle_timeout_minutes: 0\n"));
+    let o = env.run(&["config", "check"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let paths = env.paths();
+    let (r, p) = (env.repo.root.clone(), paths.clone());
+    let opts = ripple_cli::server::ServeOptions { signals: false, idle_timeout: Some(Duration::from_millis(200)) };
+    let t = std::thread::spawn(move || ripple_cli::server::serve(&r, pipeline(Default::default()), p, opts));
+    wait_socket(&paths.socket);
+    t.join().unwrap().unwrap();
+    assert!(ripple_cli::client::Client::connect(&paths).is_none());
+    let r = env.json(&["impact", "--files", "billing/invoice.txt", "--format", "json"]);
+    assert_eq!(r["risk"], "critical");
+    assert!(env.paths().recorded_pid().is_some_and(|p| p as u32 != std::process::id()), "a new daemon process answered");
+}

@@ -25,6 +25,7 @@ pub struct Config {
     pub rules: Vec<Rule>,
     pub query: QueryConfig,
     pub ci: CiConfig,
+    pub daemon: DaemonConfig,
 }
 
 impl Default for Config {
@@ -59,6 +60,7 @@ impl Default for Config {
             rules: Vec::new(),
             query: QueryConfig::default(),
             ci: CiConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
 }
@@ -248,5 +250,19 @@ pub struct CiConfig {
 impl Default for CiConfig {
     fn default() -> Self {
         Self { fail_on: None, github: true, max_listed: 50 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// The daemon exits after this many minutes without a request (the next
+    /// command starts a new one). 0 = never.
+    pub idle_timeout_minutes: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self { idle_timeout_minutes: 30 }
     }
 }

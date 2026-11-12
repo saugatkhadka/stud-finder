@@ -135,7 +135,7 @@ impl Daemon {
         let paths = paths_in(sock.path(), root);
         let delay = Arc::new(AtomicU64::new(0));
         let (r, p, d) = (root.to_path_buf(), paths.clone(), delay.clone());
-        let thread = std::thread::spawn(move || server::serve(&r, pipeline(d), p, ServeOptions { signals: false }));
+        let thread = std::thread::spawn(move || server::serve(&r, pipeline(d), p, ServeOptions { signals: false, ..Default::default() }));
         wait_for_daemon(&paths, Duration::from_secs(10)).expect("daemon up");
         Self { paths, delay, thread: Some(thread), _sock: sock }
     }

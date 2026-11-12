@@ -2,7 +2,7 @@
 
 use crate::engine::{Engine, Pipeline, Snapshot};
 use crate::paths::DaemonPaths;
-use crate::protocol::{ErrorBody, ImpactParams, Response};
+use crate::protocol::{ErrorBody, ImpactParams, PROTOCOL, Response};
 use crate::query;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 /// A response with its `result` still as raw JSON text.
 #[derive(Debug)]
 pub struct Reply {
+    /// The daemon's [`PROTOCOL`] version (0 for daemons that predate it).
+    pub protocol: u32,
     pub generation: u64,
     pub server_us: u64,
     pub result: Result<String, ErrorBody>,
@@ -56,7 +58,7 @@ impl Client {
         } else {
             Err(resp.error.unwrap_or_else(|| ErrorBody::new("unknown", "error without details")))
         };
-        Ok(Reply { generation: resp.generation, server_us: resp.server_us, result })
+        Ok(Reply { protocol: resp.protocol, generation: resp.generation, server_us: resp.server_us, result })
     }
 }
 
@@ -102,15 +104,33 @@ pub fn wait_for_daemon(paths: &DaemonPaths, timeout: Duration) -> Option<Client>
 
 /// Where requests go.
 pub enum Backend {
-    Daemon(Client),
+    Daemon(DaemonBackend),
     /// Indexed in this process (`--no-daemon`, CI, or autostart unavailable).
     Local(Arc<Snapshot>),
+}
+
+pub struct DaemonBackend {
+    client: Client,
+    root: std::path::PathBuf,
+    autostart: bool,
+    /// A request has been answered on this connection.
+    answered: bool,
 }
 
 impl Backend {
     /// Connects to a running daemon, else (if `autostart`) starts one and
     /// waits for it, else indexes in-process.
     pub fn open(root: &Path, no_daemon: bool, autostart: bool) -> Result<Self> {
+        Ok(match Self::open_client(root, no_daemon, autostart) {
+            Some(client) => Backend::Daemon(DaemonBackend { client, root: root.to_path_buf(), autostart, answered: false }),
+            None => {
+                let (_, snap) = Engine::open(root, Pipeline::standard())?;
+                Backend::Local(snap)
+            }
+        })
+    }
+
+    fn open_client(root: &Path, no_daemon: bool, autostart: bool) -> Option<Client> {
         let paths = if no_daemon {
             None
         } else {
@@ -122,24 +142,22 @@ impl Backend {
                 }
             }
         };
-        if let Some(paths) = paths {
-            if let Some(c) = Client::connect(&paths) {
-                return Ok(Backend::Daemon(c));
-            }
-            if autostart && autostart_allowed() {
-                match spawn_daemon(root, &paths) {
-                    Ok(()) => {
-                        if let Some(c) = wait_for_daemon(&paths, Duration::from_secs(10)) {
-                            return Ok(Backend::Daemon(c));
-                        }
-                        eprintln!("ripple: daemon did not start (see {}); running in-process", paths.log.display());
+        let paths = paths?;
+        if let Some(c) = Client::connect(&paths) {
+            return Some(c);
+        }
+        if autostart && autostart_allowed() {
+            match spawn_daemon(root, &paths) {
+                Ok(()) => {
+                    if let Some(c) = wait_for_daemon(&paths, Duration::from_secs(10)) {
+                        return Some(c);
                     }
-                    Err(e) => eprintln!("ripple: could not start daemon ({e:#}); running in-process"),
+                    eprintln!("ripple: daemon did not start (see {}); running in-process", paths.log.display());
                 }
+                Err(e) => eprintln!("ripple: could not start daemon ({e:#}); running in-process"),
             }
         }
-        let (_, snap) = Engine::open(root, Pipeline::standard())?;
-        Ok(Backend::Local(snap))
+        None
     }
 
     pub fn is_daemon(&self) -> bool {
@@ -148,17 +166,47 @@ impl Backend {
 
     pub fn call(&mut self, method: &str, params: &Value) -> Result<Reply> {
         match self {
-            Backend::Daemon(c) => c.call(method, params),
+            Backend::Daemon(d) => match d.client.call(method, params) {
+                Ok(r) => {
+                    d.answered = true;
+                    Ok(r)
+                }
+                // A daemon that exits (idle timeout, `daemon stop`) can close a
+                // connection it already accepted: reconnect (or start a new
+                // daemon) and retry once. Only the first request on a
+                // connection is retried, so a request that crashed the daemon
+                // is not sent twice.
+                Err(e) if !d.answered && method != "shutdown" => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    match Self::open_client(&d.root, false, d.autostart) {
+                        Some(c) => {
+                            d.client = c;
+                            let r = d.client.call(method, params)?;
+                            d.answered = true;
+                            Ok(r)
+                        }
+                        None => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            },
             Backend::Local(snap) => {
+                let root = snap.root.clone();
                 let (result, us) = query::timed(|| match method {
                     "impact" => serde_json::from_value::<ImpactParams>(params.clone())
                         .map_err(|e| ErrorBody::new("bad_params", e.to_string()))
-                        .and_then(|p| query::impact_result(snap, &p, 0, 0)),
+                        .and_then(|mut p| {
+                            // In-process: the reference git implementation.
+                            if let Some(d) = p.diff.take() {
+                                p.changed = crate::git::changed_files(&root, &d.spec()).map_err(|e| ErrorBody::new("git_failed", format!("{e:#}")))?;
+                            }
+                            query::impact_result(snap, &p, 0, 0)
+                        }),
                     "stats" => Ok(query::stats(snap).to_string()),
                     "reload" | "shutdown" => Err(ErrorBody::new("no_daemon", "no daemon is running")),
                     m => query::execute(snap, m, params, 0),
                 });
-                Ok(Reply { generation: snap.generation, server_us: us, result })
+                Ok(Reply { protocol: PROTOCOL, generation: snap.generation, server_us: us, result })
             }
         }
     }
