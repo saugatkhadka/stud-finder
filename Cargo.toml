@@ -13,6 +13,7 @@ ripple-ruby = { path = "crates/ripple-ruby" }
 ripple-js = { path = "crates/ripple-js" }
 ripple-boundary = { path = "crates/ripple-boundary" }
 ripple-policy = { path = "crates/ripple-policy" }
+ripple-coverage = { path = "crates/ripple-coverage" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
