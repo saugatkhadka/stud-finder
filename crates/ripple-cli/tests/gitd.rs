@@ -260,9 +260,9 @@ fn daemon_diff_requests_match_client_side_diff() {
     let compare = |what: &str| {
         for spec in &specs {
             let req = ripple_cli::protocol::DiffRequest::from_spec(spec);
-            let (via_daemon, _) = d.call("impact", json!({"diff": req}));
+            let (via_daemon, _) = d.call("impact", json!({"all": true, "diff": req}));
             let changed = git::changed_files(&repo.root, spec).unwrap();
-            let (via_client, _) = d.call("impact", json!({"changed": changed}));
+            let (via_client, _) = d.call("impact", json!({"all": true, "changed": changed}));
             assert_eq!(via_daemon["changed"], via_client["changed"], "{what} {spec:?}");
             assert_eq!(impacted_of(&via_daemon), impacted_of(&via_client), "{what} {spec:?}");
         }
@@ -294,13 +294,13 @@ fn daemon_diff_requests_match_client_side_diff() {
 fn diff_excludes_files() {
     let repo = Repo::new(&[("a.txt", "a\n")]);
     let d = Daemon::start(&repo.root);
-    let r = d.client().call("impact", &json!({"diff": {}, "files": ["a.txt"]})).unwrap();
+    let r = d.client().call("impact", &json!({"all": true, "diff": {}, "files": ["a.txt"]})).unwrap();
     assert_eq!(r.result.unwrap_err().code, "bad_params");
-    let r = d.client().call("impact", &json!({"diff": {"base": "no-such-ref"}})).unwrap();
+    let r = d.client().call("impact", &json!({"all": true, "diff": {"base": "no-such-ref"}})).unwrap();
     let e = r.result.unwrap_err();
     assert_eq!(e.code, "git_failed");
     assert!(e.message.contains("merge base of `no-such-ref`"), "{}", e.message);
     // The daemon still answers afterwards.
-    let (r, _) = d.call("impact", json!({"diff": {}}));
+    let (r, _) = d.call("impact", json!({"all": true, "diff": {}}));
     assert_eq!(r["changed"].as_array().unwrap().len(), 0);
 }

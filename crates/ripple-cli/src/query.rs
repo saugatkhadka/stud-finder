@@ -4,7 +4,7 @@
 use crate::engine::Snapshot;
 use crate::protocol::{ErrorBody, FileParams, Format, ImpactParams, WhyParams};
 use ripple_core::{Confidence, QueryOpts, Warning};
-use ripple_policy::{ChangedFile, EvalOptions, FileStatus, Report, evaluate_with, path_hops, render, scopes_for_hunks};
+use ripple_policy::{ChangedFile, EvalOptions, FileStatus, Incomplete, Language, Report, classify_change, def_names, evaluate_with, path_hops, render, scopes_for_hunks, summary_line};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -35,7 +35,7 @@ pub fn execute(snap: &Snapshot, method: &str, params: &Value, pending: usize) ->
             let p: ImpactParams = parse(params)?;
             impact_result(snap, &p, pending, 0)
         }
-        "dependents" => neighbours(snap, &parse(params)?, false),
+        "dependents" => dependents(snap, &parse(params)?),
         "dependencies" => neighbours(snap, &parse(params)?, true),
         "why" => why(snap, &parse(params)?),
         "areas" => areas(snap, &parse::<FileParams>(params)?.file),
@@ -82,7 +82,24 @@ pub fn changed_list(snap: &Snapshot, p: &ImpactParams) -> Vec<ChangedFile> {
             c.scopes = None;
         }
     }
+    for c in &mut out {
+        if c.change.is_none() {
+            c.change = Some(change_of(snap, c));
+        }
+    }
     out
+}
+
+/// What kind of change `c` is, from its hunks, `def` lines and this
+/// snapshot's method ranges. The new file's own `def`s are read from disk so
+/// a method moved within the file is not taken for a removed one.
+fn change_of(snap: &Snapshot, c: &ChangedFile) -> ripple_policy::Change {
+    let ruby = Language::of(&c.path) == Language::Ruby;
+    let new_defs = (ruby && !c.def_lines.is_empty() && c.status != FileStatus::Deleted)
+        .then(|| std::fs::read_to_string(snap.root.join(&c.path)).ok())
+        .flatten()
+        .map(|t| def_names(&t));
+    classify_change(c, snap.scopes_of(&c.path), new_defs.as_deref())
 }
 
 /// Requested scope names a file's scope table does not know (only checked
@@ -133,10 +150,38 @@ fn still_importing(snap: &Snapshot, deleted: &str) -> Vec<String> {
 
 pub fn impact_report(snap: &Snapshot, p: &ImpactParams, pending: usize, refresh_us: u64) -> Report {
     let changed = changed_list(snap, p);
-    let opts = EvalOptions { max_depth: p.max_depth, min_confidence: p.min_confidence, generation: snap.generation, limit: p.limit, file_level: p.file_level };
+    let opts = EvalOptions {
+        max_depth: p.max_depth,
+        min_confidence: p.min_confidence,
+        generation: snap.generation,
+        limit: p.limit,
+        all: p.all,
+        policy: p.policy,
+        file_level: p.file_level,
+        root: Some(snap.root.clone()),
+    };
     let mut report = evaluate_with(&snap.policy, &snap.graph, &snap.index, &changed, &opts);
     report.timing.refresh_us = refresh_us;
     report.index.pending_changes = pending;
+    // Reasons the answer may be incomplete that only the index knows.
+    for c in &changed {
+        let unresolved = snap.warnings.iter().filter(|w| w.file.as_deref() == Some(c.path.as_str()) && w.code.contains("unresolved")).count();
+        if unresolved > 0 {
+            report.incomplete.push(Incomplete {
+                reason: "unresolved_references".into(),
+                file: Some(c.path.clone()),
+                message: format!("{unresolved} reference{} in this file could not be resolved (see warnings); what it relies on may be missing", if unresolved == 1 { "" } else { "s" }),
+            });
+        }
+    }
+    if pending > 0 {
+        report.incomplete.push(Incomplete {
+            reason: "stale_index".into(),
+            file: None,
+            message: format!("answered from an index {pending} file change{} behind the work tree (re-run with --sync to wait)", if pending == 1 { "" } else { "s" }),
+        });
+    }
+    report.summary = summary_line(&report);
     // Extractor warnings about the changed files themselves are relevant here.
     let names: std::collections::HashSet<&str> = changed.iter().map(|c| c.path.as_str()).collect();
     let mut extra: Vec<_> = snap.warnings.iter().filter(|w| w.file.as_deref().is_some_and(|f| names.contains(f)) || w.code == "config_invalid").cloned().collect();
@@ -165,19 +210,12 @@ pub fn impact_report(snap: &Snapshot, p: &ImpactParams, pending: usize, refresh_
 }
 
 pub fn impact_result(snap: &Snapshot, p: &ImpactParams, pending: usize, refresh_us: u64) -> QueryResult {
-    let max_listed = p.max_listed.unwrap_or(snap.policy.config.ci.max_listed);
-    // Text and markdown never list more than `max_listed`; don't build the rest.
-    let report = if p.format == Format::Json {
-        impact_report(snap, p, pending, refresh_us)
-    } else {
-        let mut q = p.clone();
-        q.limit = Some(q.limit.map_or(max_listed, |l| l.min(max_listed)));
-        impact_report(snap, &q, pending, refresh_us)
-    };
+    let report = impact_report(snap, p, pending, refresh_us);
     match p.format {
         Format::Json => Ok(render::json::render(&report, false)),
-        Format::Text => to_json(&render::text::render(&report, max_listed, p.color)),
-        Format::Markdown => to_json(&render::markdown::render(&report, max_listed)),
+        // The report is already cut to its budget (or `limit`), unless `all`.
+        Format::Text => to_json(&render::text::render(&report, p.max_listed.unwrap_or(usize::MAX), p.color)),
+        Format::Markdown => to_json(&render::markdown::render(&report, p.max_listed.unwrap_or(snap.policy.config.ci.max_listed))),
     }
 }
 
@@ -204,6 +242,23 @@ struct Neighbour {
 fn not_found(snap: &Snapshot, file: &str) -> ErrorBody {
     let hint = if snap.root.join(file).exists() { "it exists but is not part of the workspace (ignored?)" } else { "no such file" };
     ErrorBody::new("not_in_graph", format!("`{file}` is not in the index ({hint})"))
+}
+
+/// `dependents`: the impact report of one file (or some of its methods /
+/// actions) as if it had changed, so it reads exactly like `impact`.
+fn dependents(snap: &Snapshot, p: &FileParams) -> QueryResult {
+    let file = clean(&p.file);
+    snap.graph.id(&file).ok_or_else(|| not_found(snap, &file))?;
+    let ip = ImpactParams {
+        files: vec![file],
+        scopes: p.scopes.clone(),
+        max_depth: p.depth,
+        min_confidence: p.min_confidence,
+        all: p.all,
+        limit: p.limit,
+        ..Default::default()
+    };
+    impact_result(snap, &ip, 0, 0)
 }
 
 fn neighbours(snap: &Snapshot, p: &FileParams, forward: bool) -> QueryResult {
@@ -304,7 +359,6 @@ fn areas(snap: &Snapshot, file: &str) -> QueryResult {
         "is_ignored": pol.is_ignored(&file),
         "in_graph": node.is_some(),
         "dependents": node.map(|n| snap.graph.fan_in(n)).unwrap_or(0),
-        "dependencies": node.map(|n| snap.graph.fan_out(n)).unwrap_or(0),
     }))
 }
 

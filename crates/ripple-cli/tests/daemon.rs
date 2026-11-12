@@ -35,16 +35,20 @@ fn edges_of(engine_snap: &ripple_cli::engine::Snapshot) -> BTreeSet<(String, Str
 fn build_then_query() {
     let repo = chain();
     let d = Daemon::start(&repo.root);
-    let (r, g) = d.call("impact", json!({"files": ["lib/a.txt"]}));
+    let (r, g) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"]}));
     assert_eq!(g, 1);
-    assert_eq!(r["schema_version"], 1);
+    assert_eq!(r["schema_version"], 2);
+    assert_schema(&r);
     assert_eq!(impacted_of(&r), vec!["lib/b.txt", "lib/c.txt"]);
-    assert_eq!(r["tests_to_run"][0]["file"], "spec/a_spec.txt");
-    assert_eq!(r["tests_to_run"].as_array().unwrap().len(), 1);
+    assert_eq!(r["tests"][0]["file"], "spec/a_spec.txt");
+    assert_eq!(r["tests"].as_array().unwrap().len(), 1);
     // reaches critical area `core` at depth 2 -> medium (default rule), not high (that needs 1 hop).
-    assert_eq!(r["risk"], "medium");
+    assert_eq!(risk_of(&r), "medium");
     let (deps, _) = d.call("dependents", json!({"file": "lib/a.txt"}));
-    assert_eq!(files_of(&deps), vec!["lib/b.txt", "spec/a_spec.txt"]);
+    assert_schema(&deps);
+    let direct: Vec<&str> = deps["dependents"].as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap()).collect();
+    assert_eq!(direct, vec!["lib/b.txt"]);
+    assert_eq!(tests_of(&deps), vec!["spec/a_spec.txt"]);
     let (why, _) = d.call("why", json!({"from": "lib/c.txt", "to": "lib/a.txt"}));
     assert_eq!(why["found"], true);
     assert_eq!(why["path"].as_array().unwrap().len(), 3);
@@ -61,11 +65,11 @@ fn edit_then_query_reflects_edit() {
     let d = Daemon::start(&repo.root);
     // Let the initial index finish first: a write it already sees would not
     // need a second generation.
-    let (r, _) = d.call("impact", json!({"files": ["lib/a.txt"]}));
+    let (r, _) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"]}));
     assert_eq!(impacted_of(&r), vec!["lib/b.txt", "lib/c.txt"]);
     // d now depends on c: impact of a grows by one, without naming d in the request (sync drains the watcher).
     repo.write("app/d.txt", "use lib/c.txt\n");
-    let (r, g) = d.call("impact", json!({"files": ["lib/a.txt"], "sync": true}));
+    let (r, g) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"], "sync": true}));
     assert!(g >= 2, "generation {g}");
     assert_eq!(impacted_of(&r), vec!["app/d.txt", "lib/b.txt", "lib/c.txt"]);
     // Naming the edited file is enough even without sync.
@@ -78,7 +82,7 @@ fn edit_then_query_reflects_edit() {
     assert_eq!(files_of(&r), vec!["lib/a.txt"]);
     // Deleted file named in the request: reported, and its former dependents are kept (tombstone).
     repo.remove("lib/a.txt");
-    let (r, _) = d.call("impact", json!({"files": ["lib/a.txt"]}));
+    let (r, _) = d.call("impact", json!({"all": true, "files": ["lib/a.txt"]}));
     let changed = &r["changed"][0];
     assert_eq!(changed["path"], "lib/a.txt");
     assert_eq!(changed["status"], "deleted");
@@ -120,7 +124,7 @@ fn freshness_loop_sync_unnamed() {
         repo.write("t/b.txt", if on { "use t/a.txt\n" } else { "\n" });
         let r = c.call("dependents", &json!({"file": "t/a.txt", "sync": true})).unwrap();
         let v: serde_json::Value = serde_json::from_str(&r.result.unwrap()).unwrap();
-        assert_eq!(v["count"], if on { 1 } else { 0 }, "iteration {i}");
+        assert_eq!(v["counts"]["dependents"], if on { 1 } else { 0 }, "iteration {i}");
     }
 }
 
@@ -150,7 +154,7 @@ fn concurrent_queries_during_rebuild() {
                 let mut worst = Duration::ZERO;
                 for _ in 0..25 {
                     let t = Instant::now();
-                    let r = c.call("impact", &json!({"files": ["lib/b.txt"]})).unwrap();
+                    let r = c.call("impact", &json!({"all": true, "files": ["lib/b.txt"]})).unwrap();
                     assert!(r.result.is_ok());
                     worst = worst.max(t.elapsed());
                 }
@@ -214,7 +218,7 @@ fn incremental_matches_cold_build() {
 fn wrong_case_name_is_not_a_new_file() {
     let repo = chain();
     let d = Daemon::start(&repo.root);
-    let r = d.client().call("impact", &json!({"files": ["LIB/A.TXT", "lib/A.txt"]})).unwrap();
+    let r = d.client().call("impact", &json!({"all": true, "files": ["LIB/A.TXT", "lib/A.txt"]})).unwrap();
     assert!(r.result.is_ok());
     let (s, _) = d.call("stats", json!(null));
     assert_eq!(s["files"], 6, "{s}");

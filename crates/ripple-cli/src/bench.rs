@@ -220,7 +220,7 @@ fn server(root: &Path, edges: &Path, queries: usize, limit: usize) -> Result<u8>
             let body = r.result.map_err(|e| anyhow::anyhow!(e.message))?;
             if i < seeds.len() {
                 let v: serde_json::Value = serde_json::from_str(&body)?;
-                impacted.push(v["impacted"]["total"].as_u64().unwrap_or(0));
+                impacted.push(v["counts"]["impacted"].as_u64().unwrap_or(0));
             }
         }
         impacted.sort_unstable();
