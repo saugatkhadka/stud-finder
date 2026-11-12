@@ -213,20 +213,25 @@ pub struct When {
     pub impacted_files_over: Option<usize>,
     /// Number of changed files is greater than this.
     pub changed_files_over: Option<usize>,
-    /// Added + deleted lines is greater than this (only when a diff is available).
+    /// Added + deleted lines is greater than this (only when a diff is
+    /// available). Next to a per-file signal condition or `untested: true`:
+    /// the lines of the same changed file that satisfies them.
     pub changed_lines_over: Option<usize>,
     /// The change is in one language and the blast radius reaches the other
     /// (Ruby change impacting JS/TS or the reverse).
     pub crosses_boundary: Option<bool>,
     /// A changed file matches `global_files`.
     pub touches_global: Option<bool>,
-    /// A changed non-test source file has no test file among its dependents.
+    /// A changed non-test source file has no test file among its dependents
+    /// (with `true` next to a per-file condition: the same file).
     pub untested: Option<bool>,
     /// Only consider edges of at least this confidence when evaluating
     /// `reaches*` / `impacted_files_over` / `crosses_boundary` for this rule.
     pub min_confidence: Option<crate::model::Confidence>,
     // Signal conditions. Each looks at the changed, non-deleted, non-test
     // source files; a rule whose signal is not ready never fires (and says so).
+    // All the per-file ones of a rule (and `untested: true`,
+    // `changed_lines_over` next to them) must hold on the same file.
     /// A changed file was changed in more than this many commits in the
     /// last 90 days of the history window (git history).
     pub churn_over: Option<u32>,

@@ -162,10 +162,10 @@ All the conditions in a rule must hold for it to fire. A rule with an empty
 | `within: N` | Limits `reaches` and `reaches_tier` to N hops. The default is `query.max_depth`. |
 | `impacted_files_over: N` | There are more than N impacted non-test files. Changed files are not counted. |
 | `changed_files_over: N` | There are more than N changed files, not counting ignored ones. |
-| `changed_lines_over: N` | There are more than N added plus deleted lines. Never fires without a diff (for example with `impact FILES`). |
+| `changed_lines_over: N` | There are more than N added plus deleted lines. Never fires without a diff (for example with `impact FILES`). Next to a per-file condition (below) or `untested: true`, it counts the lines of that same file: `{complexity_over: 300, changed_lines_over: 20}` skips a one-line edit to a huge file. |
 | `crosses_boundary: true\|false` | An impacted file is on the other side of the Ruby/JS boundary from the changed file it traces back to. Ruby files and templates are the server side; JS/TS files are the client side. |
 | `touches_global: true\|false` | A changed file matches `global_files`. |
-| `untested: true\|false` | A changed, non-deleted source file has no test among its transitive dependents. |
+| `untested: true\|false` | A changed, non-deleted source file has no test among its transitive dependents. With `true` next to a per-file condition or `changed_lines_over`, it must be that same file (`{untested: true, changed_lines_over: 50}`: a source file with no tests got more than 50 changed lines). |
 | `min_confidence: C` | For this rule, ignores edges below C in `reaches*`, `impacted_files_over`, `crosses_boundary` and `untested`. |
 | `churn_over: N` | A changed source file (not a test, not deleted) changed in more than N commits in the last 90 days of the history window. |
 | `complexity_over: N` | A changed source file's complexity (sum of its methods' plus decisions outside methods) is above N. |
@@ -175,6 +175,17 @@ All the conditions in a rule must hold for it to fire. A rule with an empty
 | `uncovered: true\|false` | A changed source file has known 0% coverage. With `uncovered_includes_unknown: true`, a file in no report counts too. |
 | `hotspot: true\|false` | A changed source file is in the top `rank.hotspot_percent` of `ripple rank`. |
 | `missing_cochange: true\|false` | A file outside the diff changed together with a changed file in at least `cochange_min_confidence` (0–1, default `0.5`) of that file's commits (from git history; graph neighbours count too). |
+
+**Per-file conditions.** `churn_over`, `complexity_over`,
+`max_method_complexity_over`, `coverage_under`, `changed_lines_coverage_under`,
+`uncovered: true` and `hotspot: true` (and, next to any of them,
+`untested: true` and `changed_lines_over`) must all hold on **the same**
+changed file: a churny file plus a different complex file does not satisfy
+`{churn_over: 20, complexity_over: 300}`. The reason names the files that
+satisfy all of them, for example
+`complexity above 300 and more than 20 changed lines in the same file: \`app/models/purchase.rb\` (complexity 433, 57 lines changed)`.
+`uncovered: false` and `hotspot: false` hold when no changed file is
+uncovered / a hotspot.
 
 The last eight read **signals** besides the graph: complexity (from the
 index), churn and co-change (git history), coverage (existing reports) and
